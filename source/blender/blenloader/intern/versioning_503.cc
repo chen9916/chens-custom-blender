@@ -671,6 +671,21 @@ void blo_do_versions_503(FileData * /*fd*/, Library * /*lib*/, Main *bmain)
     }
   }
 
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 503, 27)) {
+    for (bScreen &screen : bmain->screens) {
+      for (ScrArea &area : screen.areabase) {
+        for (SpaceLink &space : area.spacedata) {
+          if (space.spacetype == SPACE_VIEW3D) {
+            View3D *view = reinterpret_cast<View3D *>(&space);
+            view->overlay.flag &= ~(V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET |
+                                    V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET_REVERSE);
+            view->overlay.mesh_onion_skin_screen_offset_spacing = 24.0f;
+          }
+        }
+      }
+    }
+  }
+
   /**
    * Always bump subversion in BKE_blender_version.h when adding versioning
    * code here, and wrap it inside a MAIN_VERSION_FILE_ATLEAST check.

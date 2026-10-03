@@ -78,6 +78,7 @@ set(SRC_GLSL_VERT
   overlay_fullscreen_vert.glsl
   overlay_grid_vert.glsl
   overlay_image_vert.glsl
+  overlay_mesh_onion_skin_screen_vert.glsl
   overlay_motion_path_line_vert.glsl
   overlay_motion_path_point_vert.glsl
   overlay_outline_prepass_curves_vert.glsl

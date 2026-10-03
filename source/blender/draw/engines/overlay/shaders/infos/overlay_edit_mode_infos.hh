@@ -894,4 +894,23 @@ GPU_SHADER_CREATE_END()
 
 CREATE_INFO_VARIANT(overlay_uniform_color_clipped, overlay_uniform_color, drw_clipped)
 
+GPU_SHADER_CREATE_INFO(overlay_mesh_onion_skin_screen)
+DO_STATIC_COMPILATION()
+VERTEX_IN(0, float3, pos)
+PUSH_CONSTANT(float4, ucolor)
+PUSH_CONSTANT(float, screen_offset)
+DEFINE("LINE_OUTPUT")
+FRAGMENT_OUT(0, float4, frag_color)
+FRAGMENT_OUT(1, float4, line_output)
+VERTEX_SOURCE("overlay_mesh_onion_skin_screen_vert.glsl")
+FRAGMENT_SOURCE("overlay_uniform_color_frag.glsl")
+ADDITIONAL_INFO(draw_view)
+ADDITIONAL_INFO(draw_globals)
+ADDITIONAL_INFO(draw_modelmat)
+GPU_SHADER_CREATE_END()
+
+CREATE_INFO_VARIANT(overlay_mesh_onion_skin_screen_clipped,
+                    overlay_mesh_onion_skin_screen,
+                    drw_clipped)
+
 /** \} */

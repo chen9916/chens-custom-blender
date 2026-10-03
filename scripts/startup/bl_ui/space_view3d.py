@@ -7782,6 +7782,11 @@ class VIEW3D_PT_overlay_mesh_onion_skin(Panel):
         sub = col.column()
         sub.active = overlay.mesh_onion_skin_distance_fade
         sub.prop(overlay, "mesh_onion_skin_fade_strength", slider=True)
+        col.prop(overlay, "mesh_onion_skin_screen_offset")
+        sub = col.column()
+        sub.active = overlay.mesh_onion_skin_screen_offset
+        sub.prop(overlay, "mesh_onion_skin_screen_offset_spacing")
+        sub.prop(overlay, "mesh_onion_skin_screen_offset_reverse")
         col.prop(overlay, "mesh_onion_skin_in_front")
 
 

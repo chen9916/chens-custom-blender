@@ -515,6 +515,7 @@ class ShaderModule {
   StaticShader sculpt_curves_cage = shader_clippable("overlay_sculpt_curves_cage");
   StaticShader sculpt_mesh = shader_clippable("overlay_sculpt_mask");
   StaticShader uniform_color = shader_clippable("overlay_uniform_color");
+  StaticShader mesh_onion_skin_screen = shader_clippable("overlay_mesh_onion_skin_screen");
   StaticShader uv_analysis_stretch_angle = {"overlay_edit_uv_stretching_angle"};
   StaticShader uv_analysis_stretch_area = {"overlay_edit_uv_stretching_area"};
   StaticShader uv_brush_stencil = {"overlay_edit_uv_stencil_image"};
@@ -768,6 +769,7 @@ struct Resources : public select::SelectMap {
     shaders->particle_shape.ensure_compile_async();
     shaders->pointcloud_points.ensure_compile_async();
     shaders->uniform_color.ensure_compile_async();
+    shaders->mesh_onion_skin_screen.ensure_compile_async();
     shaders->wireframe_curve.ensure_compile_async();
     shaders->wireframe_mesh.ensure_compile_async();
     shaders->wireframe_points.ensure_compile_async();

@@ -709,6 +709,7 @@ set(GLSL_SRC
   engines/overlay/shaders/overlay_gsplat.bsl.hh
   engines/overlay/shaders/overlay_image_frag.glsl
   engines/overlay/shaders/overlay_image_vert.glsl
+  engines/overlay/shaders/overlay_mesh_onion_skin_screen_vert.glsl
   engines/overlay/shaders/overlay_motion_path_line_frag.glsl
   engines/overlay/shaders/overlay_motion_path_line_vert.glsl
   engines/overlay/shaders/overlay_motion_path_point_vert.glsl

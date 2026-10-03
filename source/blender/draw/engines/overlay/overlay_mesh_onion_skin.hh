@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include "BLI_fileops.hh"
 #include "BLI_map.hh"
@@ -21,6 +22,7 @@
 #include "BLI_time.hh"
 
 #include "BKE_modifier.hh"
+#include "BKE_scene.hh"
 
 #include "DEG_depsgraph_query.hh"
 
@@ -56,6 +58,11 @@ class MeshOnionSkin : Overlay {
   bool diagnostics_pending_ = false;
   int visible_samples_ = 0;
   bool geometry_dump_enabled_ = false;
+  bool screen_offset_enabled_ = false;
+  bool screen_offset_reversed_ = false;
+  float screen_offset_spacing_ = 0.0f;
+  float playhead_frame_ = 0.0f;
+  float loop_period_ = 0.0f;
   Map<SessionUID, std::string> dump_mesh_names_;
   Vector<int> dump_sample_indices_;
   std::string dumped_phase_;
@@ -91,13 +98,22 @@ class MeshOnionSkin : Overlay {
     }
 
     rig_ = const_cast<Object *>(DEG_get_original(state.object_active));
+    screen_offset_enabled_ = state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET;
+    screen_offset_reversed_ = state.overlay.flag &
+                              V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET_REVERSE;
+    screen_offset_spacing_ = state.overlay.mesh_onion_skin_screen_offset_spacing;
     DRWState draw_state = DRW_STATE_WRITE_COLOR | DRW_STATE_BLEND_ALPHA;
     if (!(state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_IN_FRONT)) {
       draw_state |= DRW_STATE_DEPTH_LESS_EQUAL;
     }
     /* Ghosts never write depth and never participate in selection or depth picking. */
     ps_.state_set(draw_state, state.clipping_plane_count);
-    ps_.shader_set(res.shaders->uniform_color.get());
+    ps_.shader_set(screen_offset_enabled_ ? res.shaders->mesh_onion_skin_screen.get() :
+                                            res.shaders->uniform_color.get());
+    if (screen_offset_enabled_) {
+      ps_.bind_ubo(OVERLAY_GLOBALS_SLOT, &res.globals_buf);
+      ps_.bind_ubo(DRW_CLIPPING_UBO_SLOT, &res.clip_planes_buf);
+    }
   }
 
   void object_sync(Manager & /*manager*/,
@@ -128,6 +144,11 @@ class MeshOnionSkin : Overlay {
       return;
     }
     const DRWContext *ctx = DRW_context_get();
+    const Scene &scene = *DEG_get_input_scene(state.depsgraph);
+    playhead_frame_ = BKE_scene_frame_get(&scene);
+    loop_period_ = (state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_LOOP_FRAME_RANGE) ?
+                       std::max(1.0f, float(scene.r.efra) - float(scene.r.sfra) + 1.0f) :
+                       0.0f;
     const ed::mesh_onion_skin::Settings settings = {
         state.overlay.mesh_onion_skin_before,
         state.overlay.mesh_onion_skin_after,
@@ -198,9 +219,12 @@ class MeshOnionSkin : Overlay {
     float farthest_distance = 0.0f;
     const bool distance_fade = state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_DISTANCE_FADE;
     if (distance_fade && !bundle_->samples.is_empty()) {
-      nearest_distance = std::abs(bundle_->samples.first().temporal_offset);
+      nearest_distance = std::numeric_limits<float>::max();
       for (const ed::mesh_onion_skin::Sample &sample : bundle_->samples) {
-        const float distance = std::abs(sample.temporal_offset);
+        const float distance = std::abs(displayed_temporal_offset(sample));
+        if (screen_offset_enabled_ && distance < 1e-5f) {
+          continue;
+        }
         nearest_distance = std::min(nearest_distance, distance);
         farthest_distance = std::max(farthest_distance, distance);
       }
@@ -213,10 +237,16 @@ class MeshOnionSkin : Overlay {
       {
         continue;
       }
-      const bool before = sample.temporal_offset < 0.0f;
+      const float temporal_offset = displayed_temporal_offset(sample);
+      /* Held asynchronous bundles scroll with the playhead. A sample that has become the
+       * current pose must not duplicate the live rig while the next bundle is being evaluated. */
+      if (screen_offset_enabled_ && std::abs(temporal_offset) < 1e-5f) {
+        continue;
+      }
+      const bool before = temporal_offset < 0.0f;
       float opacity = state.overlay.mesh_onion_skin_opacity;
       if (distance_fade && farthest_distance > nearest_distance) {
-        const float distance = std::abs(sample.temporal_offset);
+        const float distance = std::abs(temporal_offset);
         const float t = std::clamp(
             (distance - nearest_distance) / (farthest_distance - nearest_distance), 0.0f, 1.0f);
         const float smooth_distance = t * t * (3.0f - 2.0f * t);
@@ -229,6 +259,9 @@ class MeshOnionSkin : Overlay {
                                     float4(1.0f, 0.25f, 0.14f, opacity);
       PassMain::Sub &sub = ps_.sub(before ? "Before" : "After");
       sub.push_constant("ucolor", color);
+      if (screen_offset_enabled_) {
+        sub.push_constant("screen_offset", screen_pixel_offset(sample));
+      }
       const ResourceID handle = manager.resource_handle(sample.object_to_world);
       sub.draw(batches_[i].get(), ResourceIDRange(handle));
       visible_samples_++;
@@ -299,12 +332,84 @@ class MeshOnionSkin : Overlay {
       fflush(stdout);
     }
     diagnostics_pending_ = false;
+    if (bundle_ && visible_samples_ > 0 &&
+        std::getenv("BLENDER_MESH_ONION_SKIN_GEOMETRY_DIAGNOSTICS"))
+    {
+      /* Includes redraws of held bundles: validation can observe scrolling without adding
+       * diagnostics or allocations to normal playback. Values match the submitted constants. */
+      printf(
+          "mesh_onion_skin_screen generation=%llu playhead=%.9g enabled=%d reverse=%d "
+          "spacing=%.9g "
+          "frames=",
+          static_cast<unsigned long long>(bundle_->generation),
+          double(playhead_frame_),
+          int(screen_offset_enabled_),
+          int(screen_offset_reversed_),
+          double(screen_offset_spacing_));
+      bool first = true;
+      for (const int i : bundle_->samples.index_range()) {
+        if (screen_sample_submitted(i)) {
+          printf("%s%.9g", first ? "" : ",", double(bundle_->samples[i].frame));
+          first = false;
+        }
+      }
+      printf(" offsets=");
+      first = true;
+      for (const int i : bundle_->samples.index_range()) {
+        if (screen_sample_submitted(i)) {
+          printf(
+              "%s%.9g", first ? "" : ",", double(displayed_temporal_offset(bundle_->samples[i])));
+          first = false;
+        }
+      }
+      printf(" pixels=");
+      first = true;
+      for (const int i : bundle_->samples.index_range()) {
+        if (screen_sample_submitted(i)) {
+          printf("%s%.9g", first ? "" : ",", double(screen_pixel_offset(bundle_->samples[i])));
+          first = false;
+        }
+      }
+      printf("\n");
+      fflush(stdout);
+    }
     if (geometry_dump_enabled_ && bundle_ && visible_samples_ > 0) {
       dump_geometry();
     }
   }
 
  private:
+  float displayed_temporal_offset(const ed::mesh_onion_skin::Sample &sample) const
+  {
+    if (!screen_offset_enabled_) {
+      return sample.temporal_offset;
+    }
+    /* Wrapped sample frames retain their signed temporal offset from the bundle's center.
+     * The nearest equivalent center avoids an end/start discontinuity during looping. */
+    const float bundle_frame = sample.frame - sample.temporal_offset;
+    float playhead_delta = playhead_frame_ - bundle_frame;
+    if (loop_period_ > 0.0f) {
+      playhead_delta = std::remainder(playhead_delta, loop_period_);
+    }
+    return sample.temporal_offset - playhead_delta;
+  }
+
+  float screen_pixel_offset(const ed::mesh_onion_skin::Sample &sample) const
+  {
+    if (!screen_offset_enabled_) {
+      return 0.0f;
+    }
+    return displayed_temporal_offset(sample) * screen_offset_spacing_ *
+           (screen_offset_reversed_ ? -1.0f : 1.0f);
+  }
+
+  bool screen_sample_submitted(const int index) const
+  {
+    return batches_[index] && visible_meshes_.contains(bundle_->samples[index].object_uid) &&
+           (!screen_offset_enabled_ ||
+            std::abs(displayed_temporal_offset(bundle_->samples[index])) >= 1e-5f);
+  }
+
   void dump_geometry()
   {
     /* BLI_getenv observes Python's environment updates on Windows too, even across CRTs. */

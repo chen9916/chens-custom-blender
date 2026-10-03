@@ -349,3 +349,30 @@ before and after rendering to reject the preference-level CPU fallback. Cycles
 does not expose a Python query for the render session's actual device; retain
 the debug log as additional native kernel evidence. This checks backend startup
 and rendering, and supplies no new onion-skin performance claim.
+
+Screen-space ghost offsets
+--------------------------
+
+The Pose Mode onion-skin popover has a viewport-local ``Screen Space Offset``
+toggle, a separate ``Reverse Direction`` toggle, and ``Pixels per Frame``.
+By default, past ghosts move left and future ghosts move right. Reversing swaps
+their screen sides while retaining the past/future colors. Spacing defaults to
+24 pixels per frame and uses the actual temporal distance, including sparse keys
+and inclusive scene-range looping.
+
+Translation occurs after projection, so camera rotation and zoom do not change
+the pixel spacing. Mesh snapshots, animation and the shared evaluation cache
+remain unchanged. Displayed displacement follows the current playhead during
+playback, including held asynchronous bundles; current-frame duplicates are
+suppressed until the next bundle arrives. Disabling the toggle restores the
+ordinary overlay. These appearance controls are stored independently per view.
+
+The focused GUI check uses the disposable Mixamo fixture, observes native draw
+constants and framebuffer colors, and checks reversal, spacing, playback and
+loop boundaries without modifying the original asset::
+
+  blender.exe --factory-startup --disable-autoexec mixamo_running.blend --python tests/onion_skin/run_screen_offset_test.py -- --output <directory> --log <redirected-stdout.log>
+
+Launch with ``BLENDER_MESH_ONION_SKIN_GEOMETRY_DIAGNOSTICS=1`` and redirect stdout
+to the supplied log path. ``check_settings.py`` covers factory defaults,
+save/reopen migration and viewport-local persistence.
