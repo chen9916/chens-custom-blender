@@ -307,6 +307,8 @@ enum eView3DOverlay_Flag : int {
   V3D_OVERLAY_SHOW_LIGHT_COLORS = (1 << 17),
   V3D_OVERLAY_VIEWER_ATTRIBUTE_TEXT = (1 << 18),
   V3D_OVERLAY_PERFORMANCE = (1 << 19),
+  V3D_OVERLAY_MESH_ONION_SKIN = (1 << 20),
+  V3D_OVERLAY_MESH_ONION_SKIN_IN_FRONT = (1 << 21),
 };
 ENUM_OPERATORS(eView3DOverlay_Flag)
 
@@ -675,6 +677,12 @@ struct View3DOverlay {
   /** Armature edit/pose mode settings. */
   float xray_alpha_bone = 0.5f;
   float bone_wire_alpha = 1.0f;
+
+  /** Mesh onion skin samples around the current frame, in pose mode. */
+  int mesh_onion_skin_before = 2;
+  int mesh_onion_skin_after = 2;
+  int mesh_onion_skin_step = 1;
+  float mesh_onion_skin_opacity = 0.15f;
 
   /** Darken Inactive. */
   float fade_alpha = 0.40f;

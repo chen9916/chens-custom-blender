@@ -265,6 +265,9 @@ bool is_autokey_mode(const Scene *scene, eAutokey_Mode mode);
  */
 bool autokeyframe_cfra_can_key(const Scene *scene, ID *id);
 
+/** Native auto-key insertion policy, captured on the main thread for temporary previews. */
+eInsertKeyFlags get_autokey_flags(const Scene *scene);
+
 /**
  * Insert keyframes on the given object `ob` based on the auto-keying settings.
  *

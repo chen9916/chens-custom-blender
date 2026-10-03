@@ -58,6 +58,8 @@ set(SRC
   ../include/ED_mask.hh
   ../include/ED_mball.hh
   ../include/ED_mesh.hh
+  ../include/ED_mesh_onion_skin.hh
+  ../include/ED_mesh_onion_skin_preview.hh
   ../include/ED_node.hh
   ../include/ED_node_c.hh
   ../include/ED_node_preview.hh

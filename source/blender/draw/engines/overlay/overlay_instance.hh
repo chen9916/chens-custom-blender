@@ -32,6 +32,7 @@
 #include "overlay_light.hh"
 #include "overlay_lightprobe.hh"
 #include "overlay_mesh.hh"
+#include "overlay_mesh_onion_skin.hh"
 #include "overlay_metaball.hh"
 #include "overlay_mode_transfer.hh"
 #include "overlay_motion_path.hh"
@@ -72,6 +73,7 @@ class Instance : public DrawEngine {
   Origins origins = {selection_type_};
   Outline outline;
   MotionPath motion_paths;
+  MeshOnionSkin mesh_onion_skin;
   Cursor cursor;
 
   struct OverlayLayer {

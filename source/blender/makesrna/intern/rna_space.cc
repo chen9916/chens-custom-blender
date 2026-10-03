@@ -756,6 +756,7 @@ static const EnumPropertyItem spreadsheet_table_id_type_items[] = {
 #  include "ED_clip.hh"
 #  include "ED_fileselect.hh"
 #  include "ED_image.hh"
+#  include "ED_mesh_onion_skin.hh"
 #  include "ED_node.hh"
 #  include "ED_render.hh"
 #  include "ED_screen.hh"
@@ -1984,6 +1985,125 @@ static std::optional<std::string> rna_View3DShading_path(const PointerRNA *ptr)
 static PointerRNA rna_SpaceView3D_overlay_get(PointerRNA *ptr)
 {
   return RNA_pointer_create_with_parent(*ptr, RNA_View3DOverlay, ptr->data);
+}
+
+/** Sampling is shared by active pose viewports for a scene/rig; appearance stays local. */
+static void rna_View3D_mesh_onion_skin_sync(bContext *C, PointerRNA *ptr, const bool join)
+{
+  if (!C) {
+    return;
+  }
+  wmWindowManager *wm = CTX_wm_manager(C);
+  Main *bmain = CTX_data_main(C);
+  View3D &source_view = *static_cast<View3D *>(ptr->data);
+  if (!wm || !bmain || (source_view.flag2 & V3D_HIDE_OVERLAYS) ||
+      !(source_view.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN))
+  {
+    return;
+  }
+
+  /* Resolve the property owner's window, including edits made to another screen through RNA. */
+  Scene *scene = nullptr;
+  Object *rig = nullptr;
+  for (wmWindow &window : wm->windows) {
+    bScreen *screen = WM_window_get_active_screen(&window);
+    if (!screen || (ptr->owner_id && ptr->owner_id != &screen->id)) {
+      continue;
+    }
+    bool owns_view = false;
+    for (ScrArea &area : screen->areabase) {
+      if (area.spacetype == SPACE_VIEW3D &&
+          area.spacedata.first() == reinterpret_cast<SpaceLink *>(&source_view))
+      {
+        owns_view = true;
+        break;
+      }
+    }
+    if (!owns_view) {
+      continue;
+    }
+    scene = WM_window_get_active_scene(&window);
+    ViewLayer *view_layer = WM_window_get_active_view_layer(&window);
+    if (!scene || !view_layer) {
+      continue;
+    }
+    BKE_view_layer_synced_ensure(*bmain, scene, view_layer);
+    rig = BKE_view_layer_active_object_get(view_layer);
+    break;
+  }
+  if (!scene || !rig || rig->type != OB_ARMATURE || !(rig->mode & OB_MODE_POSE)) {
+    return;
+  }
+
+  Vector<View3D *> subscribers;
+  for (wmWindow &window : wm->windows) {
+    if (WM_window_get_active_scene(&window) != scene) {
+      continue;
+    }
+    ViewLayer *view_layer = WM_window_get_active_view_layer(&window);
+    if (!view_layer) {
+      continue;
+    }
+    BKE_view_layer_synced_ensure(*bmain, scene, view_layer);
+    if (BKE_view_layer_active_object_get(view_layer) != rig) {
+      continue;
+    }
+    bScreen *screen = WM_window_get_active_screen(&window);
+    if (!screen) {
+      continue;
+    }
+    for (ScrArea &area : screen->areabase) {
+      if (area.spacetype != SPACE_VIEW3D) {
+        continue;
+      }
+      View3D *view = reinterpret_cast<View3D *>(area.spacedata.first());
+      if (!(view->flag2 & V3D_HIDE_OVERLAYS) &&
+          (view->overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN))
+      {
+        subscribers.append_non_duplicates(view);
+      }
+    }
+  }
+
+  ed::mesh_onion_skin::Settings settings = {source_view.overlay.mesh_onion_skin_before,
+                                           source_view.overlay.mesh_onion_skin_after,
+                                           source_view.overlay.mesh_onion_skin_step};
+  if (join && !ed::mesh_onion_skin::settings_get(*scene, *rig, settings)) {
+    for (const View3D *view : subscribers) {
+      if (view != &source_view) {
+        settings = {view->overlay.mesh_onion_skin_before,
+                    view->overlay.mesh_onion_skin_after,
+                    view->overlay.mesh_onion_skin_step};
+        break;
+      }
+    }
+  }
+  ed::mesh_onion_skin::settings_update(*scene, *rig, settings);
+  for (View3D *view : subscribers) {
+    view->overlay.mesh_onion_skin_before = settings.before;
+    view->overlay.mesh_onion_skin_after = settings.after;
+    view->overlay.mesh_onion_skin_step = settings.step;
+  }
+  WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+}
+
+static void rna_View3D_overlay_visibility_update(bContext *C, PointerRNA *ptr)
+{
+  if (!C) {
+    return;
+  }
+  rna_SpaceView3D_show_overlay_update(CTX_data_main(C), CTX_data_scene(C), ptr);
+  rna_View3D_mesh_onion_skin_sync(C, ptr, true);
+}
+
+static void rna_View3D_mesh_onion_skin_samples_update(bContext *C, PointerRNA *ptr)
+{
+  rna_View3D_mesh_onion_skin_sync(C, ptr, false);
+}
+
+static void rna_View3D_mesh_onion_skin_toggle_update(bContext *C, PointerRNA *ptr)
+{
+  rna_View3D_mesh_onion_skin_sync(C, ptr, true);
 }
 
 static std::optional<std::string> rna_View3DOverlay_path(const PointerRNA *ptr)
@@ -5206,7 +5326,8 @@ static void rna_def_space_view3d_overlay(BlenderRNA *brna)
   prop = RNA_def_property(srna, "show_overlays", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_negative_sdna(prop, nullptr, "flag2", V3D_HIDE_OVERLAYS);
   RNA_def_property_ui_text(prop, "Show Overlays", "Display overlays like gizmos and outlines");
-  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_SpaceView3D_show_overlay_update");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_overlay_visibility_update");
 
   prop = RNA_def_property(srna, "show_ortho_grid", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "gridflag", V3D_SHOW_ORTHO_GRID);
@@ -5387,6 +5508,51 @@ static void rna_def_space_view3d_overlay(BlenderRNA *brna)
       prop, nullptr, "overlay.flag", V3D_OVERLAY_HIDE_MOTION_PATHS);
   RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
   RNA_def_property_ui_text(prop, "Motion Paths", "Show the Motion Paths Overlay");
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
+  prop = RNA_def_property(srna, "show_mesh_onion_skin", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "overlay.flag", V3D_OVERLAY_MESH_ONION_SKIN);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop, "Mesh Onion Skins", "Show animated mesh poses around the current frame");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_mesh_onion_skin_toggle_update");
+
+  prop = RNA_def_property(srna, "mesh_onion_skin_in_front", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(
+      prop, nullptr, "overlay.flag", V3D_OVERLAY_MESH_ONION_SKIN_IN_FRONT);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop, "In Front", "Draw mesh onion skins through scene geometry");
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
+  prop = RNA_def_property(srna, "mesh_onion_skin_before", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "overlay.mesh_onion_skin_before");
+  RNA_def_property_range(prop, 0, 4);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop, "Before", "Number of mesh onion skin samples before the current frame");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_mesh_onion_skin_samples_update");
+
+  prop = RNA_def_property(srna, "mesh_onion_skin_after", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "overlay.mesh_onion_skin_after");
+  RNA_def_property_range(prop, 0, 4);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop, "After", "Number of mesh onion skin samples after the current frame");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_mesh_onion_skin_samples_update");
+
+  prop = RNA_def_property(srna, "mesh_onion_skin_step", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "overlay.mesh_onion_skin_step");
+  RNA_def_property_range(prop, 1, 100);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop, "Frame Step", "Distance in frames between mesh onion skin samples");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_mesh_onion_skin_samples_update");
+
+  prop = RNA_def_property(srna, "mesh_onion_skin_opacity", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "overlay.mesh_onion_skin_opacity");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop, "Opacity", "Opacity of mesh onion skin samples");
   RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
 
   prop = RNA_def_property(srna, "show_onion_skins", PROP_BOOLEAN, PROP_NONE);

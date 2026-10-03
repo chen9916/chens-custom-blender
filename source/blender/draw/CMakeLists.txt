@@ -270,6 +270,7 @@ set(SRC
   engines/overlay/overlay_light.hh
   engines/overlay/overlay_lightprobe.hh
   engines/overlay/overlay_mesh.hh
+  engines/overlay/overlay_mesh_onion_skin.hh
   engines/overlay/overlay_metaball.hh
   engines/overlay/overlay_mode_transfer.hh
   engines/overlay/overlay_motion_path.hh

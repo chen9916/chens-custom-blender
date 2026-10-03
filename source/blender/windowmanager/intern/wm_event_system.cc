@@ -59,6 +59,7 @@
 #include "ED_geometry.hh"
 #include "ED_info.hh"
 #include "ED_markers.hh"
+#include "ED_mesh_onion_skin.hh"
 #include "ED_render.hh"
 #include "ED_screen.hh"
 #include "ED_undo.hh"
@@ -446,6 +447,7 @@ void WM_main_remove_notifier_reference(const void *reference)
 void WM_main_remap_editor_id_reference(const bke::id::IDRemapper &mappings)
 {
   Main *bmain = G_MAIN;
+  ed::mesh_onion_skin::tag_ids_remapped(mappings);
 
   for (bScreen &screen : bmain->screens) {
     for (ScrArea &area : screen.areabase) {

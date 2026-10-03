@@ -1138,6 +1138,15 @@ class VIEW3D_HT_header(Header):
         elif obj is not None and obj.type == 'GREASEPENCIL':
             sub.popover(panel="VIEW3D_PT_overlay_grease_pencil_options", text="", icon='OUTLINER_DATA_GREASEPENCIL')
 
+        if mode_string == 'POSE':
+            row = layout.row(align=True)
+            row.active = overlay.show_overlays
+            row.prop(
+                overlay, "show_mesh_onion_skin", text="",
+                icon='ONIONSKIN_ON' if overlay.show_mesh_onion_skin else 'ONIONSKIN_OFF',
+            )
+            row.popover(panel="VIEW3D_PT_overlay_mesh_onion_skin", text="")
+
         # Separate from `elif` chain because it may coexist with weight-paint.
         if (
             has_pose_mode or
@@ -7742,6 +7751,32 @@ class VIEW3D_PT_overlay_sculpt_curves(Panel):
         subrow.prop(overlay, "sculpt_curves_cage_opacity", text="Cage Opacity")
 
 
+class VIEW3D_PT_overlay_mesh_onion_skin(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'HEADER'
+    bl_label = "Mesh Onion Skins"
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'POSE'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        overlay = context.space_data.overlay
+        layout.prop(overlay, "show_mesh_onion_skin")
+        col = layout.column()
+        col.active = overlay.show_overlays and overlay.show_mesh_onion_skin
+        col.label(text="Sampling is shared between viewports", icon='INFO')
+        col.label(text="Geometry: Deformation Cage")
+        col.prop(overlay, "mesh_onion_skin_before")
+        col.prop(overlay, "mesh_onion_skin_after")
+        col.prop(overlay, "mesh_onion_skin_step")
+        col.prop(overlay, "mesh_onion_skin_opacity")
+        col.prop(overlay, "mesh_onion_skin_in_front")
+
+
 class VIEW3D_PT_overlay_bones(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'HEADER'
@@ -9599,6 +9634,7 @@ classes = (
     VIEW3D_PT_overlay_texture_paint,
     VIEW3D_PT_overlay_vertex_paint,
     VIEW3D_PT_overlay_weight_paint,
+    VIEW3D_PT_overlay_mesh_onion_skin,
     VIEW3D_PT_overlay_bones,
     VIEW3D_PT_overlay_sculpt,
     VIEW3D_PT_overlay_sculpt_curves,

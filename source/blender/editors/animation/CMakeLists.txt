@@ -26,6 +26,8 @@ set(SRC
   anim_ipo_utils.cc
   anim_markers.cc
   anim_motion_paths.cc
+  anim_mesh_onion_skin.cc
+  anim_mesh_onion_skin_preview.cc
   anim_ops.cc
   drivers.cc
   fmodifier_ui.cc
@@ -68,7 +70,10 @@ blender_add_lib(bf_editor_animation "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
 add_dependencies(bf_editor_animation bf_rna)
 
 if(WITH_GTESTS)
+  target_compile_definitions(bf_editor_animation PRIVATE WITH_GTESTS)
   set(TEST_SRC
+    anim_mesh_onion_skin_test.cc
+    anim_mesh_onion_skin_preview_test.cc
     anim_draw_test.cc
     anim_filter_test.cc
     keyframes_general_test.cc
@@ -78,6 +83,7 @@ if(WITH_GTESTS)
   set(TEST_INC
   )
   set(TEST_LIB
+    PRIVATE bf::bmesh
   )
   blender_add_test_suite_lib(editor_animation "${TEST_SRC}" "${INC};${TEST_INC}" "${INC_SYS}" "${LIB};${TEST_LIB}")
 endif()

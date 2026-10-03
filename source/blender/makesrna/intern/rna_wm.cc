@@ -219,6 +219,7 @@ const EnumPropertyItem rna_enum_wm_job_type_items[] = {
     {WM_JOB_TYPE_OBJECT_BAKE, "OBJECT_BAKE", 0, "Object Baking", ""},
     {WM_JOB_TYPE_COMPOSITE, "COMPOSITE", 0, "Compositing", ""},
     {WM_JOB_TYPE_SHADER_COMPILATION, "SHADER_COMPILATION", 0, "Shader compilation", ""},
+    {WM_JOB_TYPE_MESH_ONION_SKIN, "MESH_ONION_SKIN", 0, "Mesh Onion Skin", ""},
     {0, nullptr, 0, nullptr, nullptr},
 };
 

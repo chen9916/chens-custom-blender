@@ -472,6 +472,7 @@ void Instance::begin_sync()
   cursor.begin_sync(resources, state);
   image_prepass.begin_sync(resources, state);
   motion_paths.begin_sync(resources, state);
+  mesh_onion_skin.begin_sync(resources, state);
   origins.begin_sync(resources, state);
   outline.begin_sync(resources, state);
 
@@ -530,6 +531,7 @@ void Instance::object_sync(ObjectRef &ob_ref, Manager &manager)
   OverlayLayer &layer = object_is_in_front(ob_ref.object, state) ? infront : regular;
 
   layer.mode_transfer.object_sync(manager, ob_ref, resources, state);
+  mesh_onion_skin.object_sync(manager, ob_ref, resources, state);
 
   if (needs_prepass) {
     layer.prepass.object_sync(manager, ob_ref, resources, state);
@@ -692,6 +694,7 @@ void Instance::object_sync(ObjectRef &ob_ref, Manager &manager)
 void Instance::end_sync()
 {
   origins.end_sync(resources, state);
+  mesh_onion_skin.end_sync(resources, state);
   resources.end_sync();
 
   auto end_sync_layer = [&](OverlayLayer &layer) {
@@ -794,6 +797,7 @@ void Instance::draw(Manager &manager)
     pre_draw(infront);
 
     outline.pre_draw(manager, view);
+    mesh_onion_skin.pre_draw(manager, view);
   }
 
   resources.acquire(DRW_context_get(), this->state);
@@ -970,6 +974,7 @@ void Instance::draw_v3d(Manager &manager, View &view)
   {
     /* Overlay (+Line) pass. */
     draw(regular, resources.overlay_fb);
+    mesh_onion_skin.draw(resources.overlay_fb, manager, view);
     draw_line(regular, resources.overlay_line_fb);
 
     /* Here as it does depth+blending, and should draw after most overlay line passes.. */

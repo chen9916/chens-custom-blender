@@ -25,7 +25,7 @@
 
 namespace blender::animrig {
 
-static eInsertKeyFlags get_autokey_flags(const Scene *scene)
+eInsertKeyFlags get_autokey_flags(const Scene *scene)
 {
   eInsertKeyFlags flag = INSERTKEY_NOFLAGS;
 

@@ -2170,6 +2170,15 @@ SingleKeyingResult StripKeyframeData::keyframe_insert(Main *bmain,
   const SingleKeyingResult insert_vert_result = insert_vert_fcurve(
       fcurve, time_value, settings, insert_key_flags);
 
+  if (insert_vert_result == SingleKeyingResult::NO_KEY_NEEDED) {
+    CLOG_DEBUG(&LOG,
+               "Skipped unnecessary key in FCurve %s[%d] for slot %s",
+               fcurve_descriptor.rna_path.c_str(),
+               fcurve_descriptor.array_index,
+               slot.identifier);
+    return insert_vert_result;
+  }
+
   if (insert_vert_result != SingleKeyingResult::SUCCESS) {
     CLOG_WARN(&LOG,
               "Could not insert key into FCurve %s[%d] for slot %s.\n",

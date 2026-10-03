@@ -16,6 +16,7 @@
 
 #include "BLT_translation.hh"
 
+#include "BKE_callbacks.hh"
 #include "BKE_collection.hh"
 #include "BKE_global.hh"
 #include "BKE_layer.hh"
@@ -39,6 +40,7 @@
 #include "ED_gpencil_legacy.hh"
 #include "ED_image.hh"
 #include "ED_mesh.hh"
+#include "ED_mesh_onion_skin.hh"
 #include "ED_object.hh"
 #include "ED_paint.hh"
 #include "ED_screen.hh"
@@ -58,6 +60,31 @@
 #include "WM_types.hh"
 
 namespace blender {
+
+namespace {
+
+void mesh_onion_skin_reset(Main *bmain, PointerRNA **, int, void *)
+{
+  ed::mesh_onion_skin::invalidate_all(bmain ? bmain->wm.first() : nullptr);
+}
+
+void mesh_onion_skin_callbacks_ensure()
+{
+  static bool registered = false;
+  static bCallbackFuncStore stores[4] = {};
+  if (registered) {
+    return;
+  }
+  const eCbEvent events[] = {
+      BKE_CB_EVT_LOAD_PRE, BKE_CB_EVT_UNDO_PRE, BKE_CB_EVT_REDO_PRE, BKE_CB_EVT_EXIT_PRE};
+  for (int i = 0; i < 4; i++) {
+    stores[i].func = mesh_onion_skin_reset;
+    BKE_callback_add(&stores[i], events[i]);
+  }
+  registered = true;
+}
+
+}  // namespace
 
 /* ********* general editor util functions, not BKE stuff please! ********* */
 
@@ -103,6 +130,7 @@ void ED_editors_init_for_undo(Main *bmain)
 void ED_editors_init(bContext *C)
 {
   using namespace blender::ed;
+  mesh_onion_skin_callbacks_ensure();
   Depsgraph *depsgraph = CTX_data_expect_evaluated_depsgraph(C);
   Main *bmain = CTX_data_main(C);
   Scene *scene = CTX_data_scene(C);
@@ -233,6 +261,8 @@ void ED_editors_exit(Main *bmain, bool do_undo_system)
   if (!bmain) {
     return;
   }
+
+  mesh_onion_skin::invalidate_all(bmain->wm.first());
 
   /* Frees all edit-mode undo-steps. */
   if (do_undo_system && G_MAIN->wm.first_) {

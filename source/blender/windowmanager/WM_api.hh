@@ -2025,6 +2025,7 @@ enum eWM_JobType {
   WM_JOB_TYPE_UV_PACK,
   WM_JOB_TYPE_GENERATE_TEXTURE_CACHE,
   WM_JOB_TYPE_SOUND_MIXDOWN,
+  WM_JOB_TYPE_MESH_ONION_SKIN,
   /* Add as needed, bake, seq proxy build
    * if having hard coded values is a problem. */
 };

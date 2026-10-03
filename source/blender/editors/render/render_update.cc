@@ -49,6 +49,7 @@
 #include "SEQ_relations.hh"
 #include "SEQ_sequencer.hh"
 
+#include "ED_mesh_onion_skin.hh"
 #include "ED_node.hh"
 #include "ED_node_preview.hh"
 #include "ED_paint.hh"
@@ -408,6 +409,7 @@ void ED_render_id_flush_update(const DEGEditorUpdateContext *update_ctx, ID *id)
     return;
   }
   Main *bmain = update_ctx->bmain;
+  ed::mesh_onion_skin::tag_id_changed(*bmain, *id);
   /* Internal ID update handlers. */
   switch (id->id_type()) {
     case ID_MA:

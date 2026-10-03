@@ -27,11 +27,14 @@
 #include "BKE_context.hh"
 #include "BKE_pose.hh"
 #include "BKE_report.hh"
+#include "BKE_scene.hh"
 
 #include "BIK_api.h"
 
 #include "ED_anim_api.hh"
 #include "ED_armature.hh"
+#include "ED_mesh_onion_skin.hh"
+#include "ED_mesh_onion_skin_preview.hh"
 
 #include "DEG_depsgraph.hh"
 #include "DEG_depsgraph_build.hh"
@@ -1391,6 +1394,34 @@ static Vector<RNAPath> get_affected_rna_paths_from_transform_mode(
   return rna_paths;
 }
 
+static bool pose_channel_is_transformed(const Object &ob,
+                                        const bPoseChannel &pchan,
+                                        const Bone &bone)
+{
+  return (pchan.runtime.flag & POSE_RUNTIME_TRANSFORM) ||
+         ((ob.pose->flag & POSE_MIRROR_EDIT) && (bone.flag & BONE_TRANSFORM_MIRROR));
+}
+
+static Vector<RNAPath> pose_channel_autokey_paths(Scene &scene,
+                                                  const bPoseChannel &pchan,
+                                                  const Bone &bone,
+                                                  const eTfmMode mode,
+                                                  const bool targetless_ik,
+                                                  const bool multiple_bones)
+{
+  const StringRefNull rotation_path = animrig::get_rotation_mode_path(
+      eRotationModes(pchan.rotmode));
+  if (animrig::is_keying_flag(&scene, AUTOKEY_FLAG_INSERTNEEDED)) {
+    return get_affected_rna_paths_from_transform_mode(mode,
+                                                      scene.toolsettings,
+                                                      rotation_path,
+                                                      targetless_ik,
+                                                      bone.parent && (bone.flag & BONE_CONNECTED),
+                                                      multiple_bones);
+  }
+  return {{"location"}, {rotation_path}, {"scale"}};
+}
+
 static void autokeyframe_pose(bContext *C,
                               Scene *scene,
                               Object *ob,
@@ -1402,32 +1433,76 @@ static void autokeyframe_pose(bContext *C,
   bPose *pose = ob->pose;
   for (bPoseChannel &pchan : pose->chanbase) {
     Bone *pchan_bone = pchan.bone_get(*ob);
-    if ((pchan.runtime.flag & POSE_RUNTIME_TRANSFORM) == 0 &&
-        !((pose->flag & POSE_MIRROR_EDIT) && (pchan_bone->flag & BONE_TRANSFORM_MIRROR)))
-    {
+    if (!pose_channel_is_transformed(*ob, pchan, *pchan_bone)) {
       continue;
     }
-
-    Vector<RNAPath> rna_paths;
-    const StringRefNull rotation_path = animrig::get_rotation_mode_path(
-        eRotationModes(pchan.rotmode));
-
-    if (animrig::is_keying_flag(scene, AUTOKEY_FLAG_INSERTNEEDED)) {
-      const bool is_connected = pchan_bone->parent != nullptr &&
-                                (pchan_bone->flag & BONE_CONNECTED);
-      rna_paths = get_affected_rna_paths_from_transform_mode(tmode,
-                                                             scene->toolsettings,
-                                                             rotation_path,
-                                                             targetless_ik,
-                                                             is_connected,
-                                                             transforming_more_than_one_bone);
-    }
-    else {
-      rna_paths = {{"location"}, {rotation_path}, {"scale"}};
-    }
+    Vector<RNAPath> rna_paths = pose_channel_autokey_paths(
+        *scene, pchan, *pchan_bone, tmode, targetless_ik, transforming_more_than_one_bone);
 
     animrig::autokeyframe_pose_channel(C, scene, ob, &pchan, rna_paths.as_span(), targetless_ik);
   }
+}
+
+/** Capture precisely the controls and key paths used by native pose auto-keying. This mailbox
+ * does not evaluate animation or insert keys, so mouse events cannot build an evaluation queue. */
+static void mesh_onion_skin_capture_pose(TransInfo *t, Object &ob)
+{
+  using namespace ed::mesh_onion_skin;
+  if (!t->context || !ob.pose || !preview_enabled_for_rig(*t->context, *t->scene, ob)) {
+    return;
+  }
+  auto input = std::make_shared<PosePreviewInput>();
+  input->object_uid = SessionUID{ob.id.session_uid};
+  /* Main-thread transaction identity only; it is never dereferenced by the evaluator. */
+  input->transaction_id = uint64_t(reinterpret_cast<uintptr_t>(t));
+  input->frame = BKE_scene_frame_get(t->scene);
+  input->insert_keys = animrig::autokeyframe_cfra_can_key(t->scene, &ob.id);
+  input->key_flags = animrig::get_autokey_flags(t->scene);
+  input->keyframe_type = t->scene->toolsettings->keyframe_type;
+  /* The evaluator currently applies one rig's authored channels. A second transformed rig can
+   * also drive its constraints, so showing only the active rig's proposal would be misleading.
+   * Multiple selected bones and mirrored controls in a single rig remain supported. */
+  Object *transformed_rig = nullptr;
+  bool multiple_rigs = false;
+  for (int i = 0; i < t->data_container_len; i++) {
+    const TransDataContainer &container = t->data_container[i];
+    if (container.data_len == 0 || !container.poseobj) {
+      continue;
+    }
+    if (transformed_rig && transformed_rig != container.poseobj) {
+      multiple_rigs = true;
+      break;
+    }
+    transformed_rig = container.poseobj;
+  }
+  input->supported = !multiple_rigs && transformed_rig == &ob && !(t->flag & T_AUTOIK) &&
+                     !animrig::is_keying_flag(t->scene, AUTOKEY_FLAG_ONLYKEYINGSET) &&
+                     !(input->key_flags & INSERTKEY_MATRIX) &&
+                     ELEM(t->mode, TFM_TRANSLATION, TFM_ROTATION, TFM_TRACKBALL, TFM_RESIZE);
+
+  for (bPoseChannel &pchan : ob.pose->chanbase) {
+    Bone *bone = pchan.bone_get(ob);
+    if (!pose_channel_is_transformed(ob, pchan, *bone)) {
+      continue;
+    }
+    const bKinematicConstraint *ik = has_targetless_ik(&pchan);
+    if (ik && (ik->flag & CONSTRAINT_IK_AUTO)) {
+      input->supported = false;
+    }
+    PoseBoneInput value;
+    value.name = pchan.name;
+    copy_v3_v3(value.location, pchan.loc);
+    copy_v3_v3(value.euler, pchan.eul);
+    copy_v4_v4(value.quaternion, pchan.quat);
+    copy_v3_v3(value.axis, pchan.rotAxis);
+    value.angle = pchan.rotAngle;
+    copy_v3_v3(value.scale, pchan.scale);
+    value.rotation_mode = pchan.rotmode;
+    value.key_paths = pose_channel_autokey_paths(
+        *t->scene, pchan, *bone, t->mode, false, t->data_len_all > 1);
+    input->bones.append(std::move(value));
+  }
+  preview_input_update(*t->context, std::move(input));
 }
 
 static void recalcData_pose(TransInfo *t)
@@ -1455,6 +1530,11 @@ static void recalcData_pose(TransInfo *t)
         bPose *pose = ob->pose;
         if (arm->flag & ARM_MIRROR_EDIT || pose->flag & POSE_MIRROR_EDIT) {
           pose_transform_mirror_update(t, tc, ob);
+        }
+        if (t->state != TRANS_CANCEL) {
+          /* Bone Size has no authored-channel preview yet. Capture its unsupported mode so
+           * cached ordinary pose ghosts cannot remain visible during this interaction. */
+          mesh_onion_skin_capture_pose(t, *ob);
         }
       }
     }
@@ -1492,6 +1572,9 @@ static void recalcData_pose(TransInfo *t)
       }
 
       DEG_id_tag_update(&ob->id, ID_RECALC_GEOMETRY);
+      if (t->state != TRANS_CANCEL) {
+        mesh_onion_skin_capture_pose(t, *ob);
+      }
     }
   }
 }
@@ -1756,6 +1839,10 @@ static void special_aftertrans_update__pose(bContext *C, TransInfo *t)
       }
     }
   }
+  /* Revoke provisional packets after native confirm/cancel has completed. The next request
+   * captures committed animation, including any keys inserted by native auto-keying above. */
+  ed::mesh_onion_skin::preview_finish(
+      *C, uint64_t(reinterpret_cast<uintptr_t>(t)), t->state == TRANS_CANCEL);
 }
 
 /** \} */
