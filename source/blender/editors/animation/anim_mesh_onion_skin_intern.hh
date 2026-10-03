@@ -13,6 +13,23 @@ namespace ed::mesh_onion_skin {
 struct PreparedPreview;
 struct ArmatureRestDefinition;
 
+struct EvaluationRequestForTest {
+  float frame;
+  uint64_t geometry_revision = 1;
+  std::shared_ptr<const PreparedPreview> preview;
+};
+
+/** Exercise a persistent production capsule/cache with both sampling policies subscribed. */
+Vector<std::shared_ptr<const Bundle>> evaluate_sequence_for_test(
+    Main &bmain,
+    Scene &scene,
+    ViewLayer &view_layer,
+    Object &rig,
+    Span<Object *> meshes,
+    const Settings &settings,
+    Span<EvaluationRequestForTest> requests,
+    std::string &r_error);
+
 /** Production membership mailbox: true only when a source layer replacement or new mesh
  * requires rebuilding the private capsule. */
 bool source_membership_update_for_test(const Scene &scene,

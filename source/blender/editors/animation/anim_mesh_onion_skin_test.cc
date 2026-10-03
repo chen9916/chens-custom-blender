@@ -214,27 +214,90 @@ class MeshOnionEvaluationTest : public bke::BlenderGTestBase {
     return curve->driver;
   }
 
-  void expect_native_geometry(const Bundle &bundle)
+  void expect_native_geometry(const Bundle &bundle, const bool timeline = false)
   {
     std::unique_ptr<Depsgraph, decltype(&DEG_graph_free)> graph(
         DEG_graph_new(bmain, scene, view_layer, DAG_EVAL_VIEWPORT), DEG_graph_free);
     ID *targets[] = {&rig->id, &object->id};
     DEG_graph_build_from_ids(graph.get(), Span<ID *>(targets, 2));
-    for (const Sample &sample : bundle.samples) {
+    for (const Sample &sample : timeline ? bundle.timeline_samples : bundle.samples) {
       BKE_scene_frame_set(scene, sample.frame);
       DEG_evaluate_on_framechange(graph.get(), sample.frame);
       const Mesh *evaluated = BKE_object_get_evaluated_mesh_no_subsurf(
           DEG_get_evaluated(graph.get(), object));
       ASSERT_NE(evaluated, nullptr);
-      ASSERT_EQ(evaluated->verts_num, sample.positions.size());
-      for (const int vertex : sample.positions.index_range()) {
-        EXPECT_LT(math::distance(sample.positions[vertex], evaluated->vert_positions()[vertex]),
+      ASSERT_EQ(evaluated->verts_num, sample.geometry->positions.size());
+      for (const int vertex : sample.geometry->positions.index_range()) {
+        EXPECT_LT(math::distance(sample.geometry->positions[vertex],
+                                 evaluated->vert_positions()[vertex]),
                   1.0e-5f);
       }
-      EXPECT_EQ(sample.triangles.size(), evaluated->corner_tris().size());
+      EXPECT_EQ(sample.geometry->triangles.size(), evaluated->corner_tris().size());
     }
   }
 };
+
+TEST_F(MeshOnionEvaluationTest, TimelineCenterAndOverlappingWindowsShareExactNativeGeometry)
+{
+  const EvaluationRequestForTest requests[] = {{5.0f}, {7.0f}};
+  std::string error;
+  const auto bundles = evaluate_sequence_for_test(
+      *bmain, *scene, *view_layer, *rig, {&object, 1}, {2, 2, 2}, requests, error);
+  ASSERT_EQ(bundles.size(), 2) << error;
+  EXPECT_FLOAT_EQ(bundles[0]->frame, 5.0f);
+  ASSERT_EQ(bundles[0]->samples.size(), 4);
+  ASSERT_EQ(bundles[0]->timeline_samples.size(), 7);
+  EXPECT_EQ(bundles[0]->bytes, size_t(7 * (3 * sizeof(float3) + sizeof(int3))));
+  bool found_center = false;
+  for (const Sample &first : bundles[0]->timeline_samples) {
+    found_center |= first.frame == 5.0f && first.temporal_offset == 0.0f;
+    for (const Sample &second : bundles[1]->timeline_samples) {
+      if (first.frame == second.frame) {
+        EXPECT_EQ(first.geometry, second.geometry);
+        EXPECT_FLOAT_EQ(first.rank, second.rank);
+      }
+    }
+    for (const Sample &relative : bundles[0]->samples) {
+      if (first.frame == relative.frame) {
+        EXPECT_EQ(first.geometry, relative.geometry);
+      }
+    }
+  }
+  EXPECT_TRUE(found_center);
+  for (const Sample &relative : bundles[0]->samples) {
+    EXPECT_NE(relative.frame, 5.0f);
+  }
+  expect_native_geometry(*bundles[0], true);
+  expect_native_geometry(*bundles[1], true);
+}
+
+TEST_F(MeshOnionEvaluationTest, PreviewGeometryRevisionInvalidatesEveryCachedPose)
+{
+  const EvaluationRequestForTest requests[] = {
+      {5.0f, 1, nullptr}, {7.0f, 1, nullptr}, {5.0f, 2, proposal(0.8f)}};
+  const int users = rig->id.us;
+  std::string error;
+  const auto bundles = evaluate_sequence_for_test(
+      *bmain, *scene, *view_layer, *rig, {&object, 1}, {2, 2, 2}, requests, error);
+  ASSERT_EQ(bundles.size(), 3) << error;
+  EXPECT_EQ(bundles[2]->geometry_revision, 2);
+  bool compared_center = false;
+  for (const Sample &first : bundles[0]->timeline_samples) {
+    for (const Sample &edited : bundles[2]->timeline_samples) {
+      if (first.frame != edited.frame) {
+        continue;
+      }
+      EXPECT_NE(first.geometry, edited.geometry);
+      if (first.frame == 5.0f) {
+        compared_center = true;
+        EXPECT_GT(math::distance(first.geometry->positions[2], edited.geometry->positions[2]),
+                  0.05f);
+      }
+    }
+  }
+  EXPECT_TRUE(compared_center);
+  EXPECT_EQ(rig->id.us, users);
+}
 
 TEST_F(MeshOnionEvaluationTest, SelfPropertyNativeDriverMatchesNativeGeometryAndPreservesSource)
 {
@@ -250,7 +313,8 @@ TEST_F(MeshOnionEvaluationTest, SelfPropertyNativeDriverMatchesNativeGeometryAnd
   EXPECT_EQ(driver->expr_comp, nullptr);
   EXPECT_FLOAT_EQ(driver->curval, 0.0f);
   EXPECT_EQ(rig->id.us, users);
-  EXPECT_GT(math::distance(bundle->samples[0].positions[2], mesh->vert_positions()[2]), 0.05f);
+  EXPECT_GT(math::distance(bundle->samples[0].geometry->positions[2], mesh->vert_positions()[2]),
+            0.05f);
   expect_native_geometry(*bundle);
 }
 
@@ -279,7 +343,8 @@ TEST_F(MeshOnionEvaluationTest, ExternalAnimatedObjectDriverUsesCopiedAction)
   ASSERT_NE(bundle, nullptr) << error;
   EXPECT_EQ(target->id.us, users);
   EXPECT_FLOAT_EQ(target->loc[0], source_x);
-  EXPECT_GT(math::distance(bundle->samples[0].positions[2], bundle->samples[1].positions[2]),
+  EXPECT_GT(math::distance(bundle->samples[0].geometry->positions[2],
+                           bundle->samples[1].geometry->positions[2]),
             0.01f);
   expect_native_geometry(*bundle);
 }
@@ -329,7 +394,7 @@ TEST_F(MeshOnionEvaluationTest, MirrorAndSolidifyRetainNativeGeometry)
   std::string error;
   const auto bundle = evaluate_preview(nullptr, error);
   ASSERT_NE(bundle, nullptr) << error;
-  EXPECT_GT(bundle->samples[0].positions.size(), mesh->verts_num);
+  EXPECT_GT(bundle->samples[0].geometry->positions.size(), mesh->verts_num);
   EXPECT_EQ(BLI_listbase_count(&object->modifiers), 3);
   expect_native_geometry(*bundle);
 }
@@ -567,9 +632,10 @@ TEST_F(MeshOnionEvaluationTest, AuthoredIKSnapshotsMatchCommittedNativeEvaluatio
   /* Parity alone could accidentally pass for a disabled modifier or IK fixture. Require both
    * real deformation away from the rest mesh and different neighboring animation samples. */
   for (const Sample &sample : bundle->samples) {
-    EXPECT_GT(math::distance(sample.positions[2], mesh->vert_positions()[2]), 0.05f);
+    EXPECT_GT(math::distance(sample.geometry->positions[2], mesh->vert_positions()[2]), 0.05f);
   }
-  EXPECT_GT(math::distance(bundle->samples[0].positions[2], bundle->samples[1].positions[2]),
+  EXPECT_GT(math::distance(bundle->samples[0].geometry->positions[2],
+                           bundle->samples[1].geometry->positions[2]),
             1.0e-4f);
   EXPECT_EQ(rig->id.us, rig_users);
   EXPECT_EQ(mesh->id.us, mesh_users);
@@ -597,16 +663,16 @@ TEST_F(MeshOnionEvaluationTest, AuthoredIKSnapshotsMatchCommittedNativeEvaluatio
     const Object *evaluated_object = DEG_get_evaluated(graph, object);
     const Mesh *evaluated_mesh = BKE_object_get_evaluated_mesh_no_subsurf(evaluated_object);
     ASSERT_NE(evaluated_mesh, nullptr);
-    ASSERT_EQ(sample.positions.size(), evaluated_mesh->verts_num);
-    for (int vertex = 0; vertex < sample.positions.size(); vertex++) {
+    ASSERT_EQ(sample.geometry->positions.size(), evaluated_mesh->verts_num);
+    for (int vertex = 0; vertex < sample.geometry->positions.size(); vertex++) {
       for (int axis = 0; axis < 3; axis++) {
-        EXPECT_NEAR(sample.positions[vertex][axis],
+        EXPECT_NEAR(sample.geometry->positions[vertex][axis],
                     evaluated_mesh->vert_positions()[vertex][axis],
                     1.0e-5f);
       }
     }
-    EXPECT_EQ(sample.triangles.size(), 1);
-    EXPECT_EQ(sample.triangles[0], int3(0, 1, 2));
+    EXPECT_EQ(sample.geometry->triangles.size(), 1);
+    EXPECT_EQ(sample.geometry->triangles[0], int3(0, 1, 2));
   }
   DEG_graph_free(graph);
 }
@@ -622,8 +688,8 @@ TEST_F(MeshOnionEvaluationTest, TerminalSubdivisionUsesCageWithoutSourceChanges)
   ASSERT_NE(bundle, nullptr) << error;
   EXPECT_EQ(subdivision->mode, source_mode);
   for (const Sample &sample : bundle->samples) {
-    EXPECT_EQ(sample.positions.size(), 3);
-    EXPECT_EQ(sample.triangles.size(), 1);
+    EXPECT_EQ(sample.geometry->positions.size(), 3);
+    EXPECT_EQ(sample.geometry->triangles.size(), 1);
   }
 }
 
@@ -658,8 +724,8 @@ TEST_F(MeshOnionEvaluationTest, FractionalFramesAndHistoricalMatricesPreserveSou
   EXPECT_FLOAT_EQ(bundle->samples[0].frame, 4.5f);
   EXPECT_FLOAT_EQ(bundle->samples[1].frame, 6.5f);
   EXPECT_FLOAT_EQ(object->loc[0], 2.0f);
-  EXPECT_GT(math::abs(bundle->samples[0].object_to_world[3][0] -
-                      bundle->samples[1].object_to_world[3][0]),
+  EXPECT_GT(math::abs(bundle->samples[0].geometry->object_to_world[3][0] -
+                      bundle->samples[1].geometry->object_to_world[3][0]),
             0.1f);
 
   insert_control(5.0f, 0.6f);
@@ -673,13 +739,14 @@ TEST_F(MeshOnionEvaluationTest, FractionalFramesAndHistoricalMatricesPreserveSou
     const Object *evaluated_object = DEG_get_evaluated(graph.get(), object);
     const Mesh *evaluated_mesh = BKE_object_get_evaluated_mesh_no_subsurf(evaluated_object);
     ASSERT_NE(evaluated_mesh, nullptr);
-    for (int vertex = 0; vertex < sample.positions.size(); vertex++) {
-      EXPECT_LT(math::distance(sample.positions[vertex], evaluated_mesh->vert_positions()[vertex]),
+    for (int vertex = 0; vertex < sample.geometry->positions.size(); vertex++) {
+      EXPECT_LT(math::distance(sample.geometry->positions[vertex],
+                               evaluated_mesh->vert_positions()[vertex]),
                 1.0e-5f);
     }
     for (int column = 0; column < 4; column++) {
       for (int row = 0; row < 4; row++) {
-        EXPECT_NEAR(sample.object_to_world[column][row],
+        EXPECT_NEAR(sample.geometry->object_to_world[column][row],
                     evaluated_object->object_to_world()[column][row],
                     1.0e-6f);
       }

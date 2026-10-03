@@ -21,16 +21,22 @@
 #include "BLI_path_utils.hh"
 #include "BLI_time.hh"
 
+#include "DNA_screen_types.h"
+
+#include "BKE_context.hh"
 #include "BKE_modifier.hh"
 #include "BKE_scene.hh"
 
 #include "DEG_depsgraph_query.hh"
 
 #include "ED_mesh_onion_skin.hh"
+#include "ED_screen_types.hh"
 
 #include "GPU_batch.hh"
 #include "GPU_index_buffer.hh"
 #include "GPU_vertex_buffer.hh"
+
+#include "WM_types.hh"
 
 #include "draw_manager_text.hh"
 
@@ -49,12 +55,25 @@ class MeshOnionSkin : Overlay {
   };
   using BatchPtr = std::unique_ptr<gpu::Batch, BatchDeleter>;
 
+  struct BatchSlot {
+    SessionUID object_uid;
+    float frame = 0.0f;
+    std::shared_ptr<const ed::mesh_onion_skin::SampleGeometry> geometry;
+    BatchPtr batch;
+  };
+
   PassMain ps_ = {"MeshOnionSkin"};
   Vector<Object *> meshes_;
   Vector<SessionUID> visible_meshes_;
   Object *rig_ = nullptr;
   std::shared_ptr<const ed::mesh_onion_skin::Bundle> bundle_;
-  Vector<BatchPtr> batches_;
+  Vector<BatchSlot> batches_;
+  Vector<float> sample_opacities_;
+  Vector<bool> sample_submitted_;
+  uint64_t batch_epoch_ = 0;
+  uint64_t batch_creates_ = 0;
+  uint64_t vbo_uploads_ = 0;
+  bool batches_screen_offset_ = false;
   bool diagnostics_pending_ = false;
   int visible_samples_ = 0;
   bool geometry_dump_enabled_ = false;
@@ -62,7 +81,20 @@ class MeshOnionSkin : Overlay {
   bool screen_offset_reversed_ = false;
   float screen_offset_spacing_ = 0.0f;
   float playhead_frame_ = 0.0f;
+  float native_frame_ = 0.0f;
+  float playhead_rank_ = 0.0f;
+  float before_count_ = 0.0f;
+  float after_count_ = 0.0f;
+  float bundle_playhead_delta_ = 0.0f;
   float loop_period_ = 0.0f;
+  const wmTimer *scroll_timer_ = nullptr;
+  SessionUID scroll_scene_uid_ = {};
+  double scroll_time_ = 0.0;
+  double native_unwrapped_frame_ = 0.0;
+  double bundle_scroll_origin_ = 0.0;
+  float previous_native_frame_ = 0.0f;
+  float previous_loop_period_ = 0.0f;
+  bool scroll_initialized_ = false;
   Map<SessionUID, std::string> dump_mesh_names_;
   Vector<int> dump_sample_indices_;
   std::string dumped_phase_;
@@ -84,6 +116,7 @@ class MeshOnionSkin : Overlay {
     if (!enabled_) {
       bundle_.reset();
       batches_.clear();
+      scroll_initialized_ = false;
       return;
     }
     /* Read the opt-in once, before the first enabled draw. Normal and timing runs do not
@@ -145,50 +178,83 @@ class MeshOnionSkin : Overlay {
     }
     const DRWContext *ctx = DRW_context_get();
     const Scene &scene = *DEG_get_input_scene(state.depsgraph);
-    playhead_frame_ = BKE_scene_frame_get(&scene);
+    native_frame_ = BKE_scene_frame_get(&scene);
+    playhead_frame_ = native_frame_;
+    const double now = BLI_time_now_seconds();
+    const wmTimer *animation_timer = nullptr;
+    bool reverse_playback = false;
+    if (screen_offset_enabled_) {
+      /* The animation operator owns scene time. Only interpolate the presentation between
+       * its native timer ticks; no additional dependency graph evaluation is needed. */
+      const bScreen *screen = CTX_wm_screen(ctx->evil_C);
+      const wmTimer *timer = screen ? screen->animtimer : nullptr;
+      const ScreenAnimData *playback = timer ? static_cast<ScreenAnimData *>(timer->customdata) :
+                                               nullptr;
+      if (playback && playback->scene == &scene && !timer->sleep &&
+          !(timer->flags & WM_TIMER_TAGGED_FOR_REMOVAL))
+      {
+        animation_timer = timer;
+        reverse_playback = playback->flag & ANIMPLAY_FLAG_REVERSE;
+        const double elapsed = std::max(0.0, now - timer->time_last);
+        const float fraction = std::clamp(float(elapsed * scene.frames_per_second()), 0.0f, 1.0f);
+        playhead_frame_ += reverse_playback ? -fraction : fraction;
+      }
+    }
     loop_period_ = (state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_LOOP_FRAME_RANGE) ?
                        std::max(1.0f, float(scene.r.efra) - float(scene.r.sfra) + 1.0f) :
                        0.0f;
+    if (loop_period_ == 1.0f) {
+      /* A one-frame loop contains only the current pose, with no neighboring identities. */
+      playhead_frame_ = native_frame_;
+    }
+    bool reset_scroll = !scroll_initialized_ || scroll_timer_ != animation_timer ||
+                        scroll_scene_uid_ != SessionUID{uint64_t(scene.id.session_uid)} ||
+                        previous_loop_period_ != loop_period_;
+    float native_delta = native_frame_ - previous_native_frame_;
+    if (animation_timer && loop_period_ > 0.0f) {
+      native_delta = std::remainder(native_delta, loop_period_);
+    }
+    if (!reset_scroll && native_delta != 0.0f) {
+      const double expected_steps = std::max(0.0, now - scroll_time_) * scene.frames_per_second();
+      /* Explicit seeks or playback direction changes establish a new presentation origin.
+       * Regular wraps accumulate monotonically, including bundles held for multiple laps. */
+      reset_scroll = !animation_timer ||
+                     (reverse_playback ? native_delta > 0.0f : native_delta < 0.0f) ||
+                     std::abs(native_delta) > std::ceil(expected_steps) + 2.0;
+    }
+    native_unwrapped_frame_ = reset_scroll ? double(native_frame_) :
+                                             native_unwrapped_frame_ + native_delta;
+    previous_native_frame_ = native_frame_;
+    previous_loop_period_ = loop_period_;
+    scroll_timer_ = animation_timer;
+    scroll_scene_uid_ = SessionUID{uint64_t(scene.id.session_uid)};
+    scroll_time_ = now;
+    scroll_initialized_ = screen_offset_enabled_;
     const ed::mesh_onion_skin::Settings settings = {
         state.overlay.mesh_onion_skin_before,
         state.overlay.mesh_onion_skin_after,
         state.overlay.mesh_onion_skin_step,
         bool(state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_KEYED_FRAMES_ONLY),
         bool(state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_LOOP_FRAME_RANGE)};
+    before_count_ = float(settings.before);
+    after_count_ = float(settings.after);
     /* Only queues a request. Workspace preparation and evaluation run outside drawing. */
-    ed::mesh_onion_skin::request(
-        *const_cast<bContext *>(ctx->evil_C), *state.depsgraph, *rig_, meshes_, settings);
+    ed::mesh_onion_skin::request(*const_cast<bContext *>(ctx->evil_C),
+                                 *state.depsgraph,
+                                 *rig_,
+                                 meshes_,
+                                 settings,
+                                 screen_offset_enabled_ ?
+                                     ed::mesh_onion_skin::SamplingMode::Timeline :
+                                     ed::mesh_onion_skin::SamplingMode::Relative);
     std::shared_ptr<const ed::mesh_onion_skin::Bundle> bundle = ed::mesh_onion_skin::get(
         *DEG_get_input_scene(state.depsgraph), *rig_);
+    const bool bundle_changed = bundle != bundle_;
     if (bundle != bundle_) {
-      const std::shared_ptr<const ed::mesh_onion_skin::Bundle> previous = std::move(bundle_);
       bundle_ = std::move(bundle);
       diagnostics_pending_ = bool(bundle_);
       if (!bundle_) {
         batches_.clear();
-      }
-      else {
-        batches_.resize(bundle_->samples.size());
-        for (const int i : bundle_->samples.index_range()) {
-          const ed::mesh_onion_skin::Sample &sample = bundle_->samples[i];
-          if (sample.positions.is_empty() || sample.triangles.is_empty()) {
-            batches_[i].reset();
-          }
-          else if (!batches_[i] || batches_[i]->verts[0]->vertex_len != sample.positions.size()) {
-            batches_[i] = create_batch(sample);
-          }
-          else {
-            /* Keep dynamic VBO allocations across pose revisions. */
-            gpu::VertBuf *vbo = batches_[i]->verts[0];
-            vbo->data<float3>().copy_from(sample.positions);
-            GPU_vertbuf_tag_dirty(vbo);
-            if (!previous || i >= previous->samples.size() ||
-                previous->samples[i].triangles.as_span() != sample.triangles.as_span())
-            {
-              GPU_batch_elembuf_set(batches_[i].get(), create_index_buffer(sample), true);
-            }
-          }
-        }
       }
     }
     if (!bundle_) {
@@ -213,39 +279,76 @@ class MeshOnionSkin : Overlay {
       return;
     }
 
+    if (bundle_changed || batches_screen_offset_ != screen_offset_enabled_) {
+      sync_batches();
+    }
+    if (bundle_changed || reset_scroll) {
+      float center_delta = native_frame_ - bundle_->frame;
+      if (loop_period_ > 0.0f) {
+        center_delta = std::remainder(center_delta, loop_period_);
+      }
+      bundle_scroll_origin_ = native_unwrapped_frame_ - center_delta;
+    }
+    bundle_playhead_delta_ = float(native_unwrapped_frame_ - bundle_scroll_origin_) +
+                             (playhead_frame_ - native_frame_);
+    playhead_rank_ = interpolated_playhead_rank(bundle_playhead_delta_, settings.step);
+    sample_opacities_.resize(samples().size());
+    sample_submitted_.resize(samples().size());
+    sample_opacities_.fill(0.0f);
+    sample_submitted_.fill(false);
+
     /* Temporal distances are shared across meshes and both directions, including unevenly
      * spaced authored keys. Equal-distance samples keep the full configured opacity. */
     float nearest_distance = 0.0f;
     float farthest_distance = 0.0f;
     const bool distance_fade = state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_DISTANCE_FADE;
-    if (distance_fade && !bundle_->samples.is_empty()) {
+    if (distance_fade && !screen_offset_enabled_ && !samples().is_empty()) {
       nearest_distance = std::numeric_limits<float>::max();
-      for (const ed::mesh_onion_skin::Sample &sample : bundle_->samples) {
+      for (const ed::mesh_onion_skin::Sample &sample : samples()) {
         const float distance = std::abs(displayed_temporal_offset(sample));
-        if (screen_offset_enabled_ && distance < 1e-5f) {
-          continue;
-        }
         nearest_distance = std::min(nearest_distance, distance);
         farthest_distance = std::max(farthest_distance, distance);
       }
     }
     Manager &manager = *DRW_manager_get();
-    for (const int i : bundle_->samples.index_range()) {
-      const ed::mesh_onion_skin::Sample &sample = bundle_->samples[i];
-      if (!batches_[i] || !visible_meshes_.contains(sample.object_uid) ||
+    for (const int i : samples().index_range()) {
+      const ed::mesh_onion_skin::Sample &sample = samples()[i];
+      if (!batches_[i].batch || !visible_meshes_.contains(sample.object_uid) ||
           state.overlay.mesh_onion_skin_opacity <= 0.0f)
       {
         continue;
       }
       const float temporal_offset = displayed_temporal_offset(sample);
-      /* Held asynchronous bundles scroll with the playhead. A sample that has become the
-       * current pose must not duplicate the live rig while the next bundle is being evaluated. */
-      if (screen_offset_enabled_ && std::abs(temporal_offset) < 1e-5f) {
-        continue;
-      }
       const bool before = temporal_offset < 0.0f;
       float opacity = state.overlay.mesh_onion_skin_opacity;
-      if (distance_fade && farthest_distance > nearest_distance) {
+      if (screen_offset_enabled_) {
+        const float rank = sample.rank - playhead_rank_;
+        opacity *= timeline_opacity(rank);
+        const bool both_sides = before_count_ > 0.0f && after_count_ > 0.0f;
+        const float center_width = loop_period_ > 0.0f ? std::min(1.0f, loop_period_) : 1.0f;
+        if (!both_sides) {
+          /* The hidden side cannot retain a center ghost. Fade its visible neighbor in
+           * from zero as it crosses the current pose, just like the outer hand-off. */
+          opacity *= smoothstep(std::clamp(std::abs(temporal_offset) / center_width, 0.0f, 1.0f));
+        }
+        if (loop_period_ > 0.0f) {
+          /* Short loops can choose a different occurrence of the same cached frame. Make
+           * that alias hand-off invisible, instead of moving an opaque ghost across the view.
+           * A both-sided strip uses the nearest lap; a one-sided strip uses its full lap. */
+          const float reach = both_sides ? loop_period_ * 0.5f : loop_period_;
+          const float edge_width = std::min(1.0f, reach);
+          opacity *= smoothstep(
+              std::clamp((reach - std::abs(temporal_offset)) / edge_width, 0.0f, 1.0f));
+        }
+        if (distance_fade) {
+          const float boundary = std::max(1.0f, rank < 0.0f ? before_count_ : after_count_);
+          const float t = std::clamp(std::abs(rank) / boundary, 0.0f, 1.0f);
+          opacity *= 1.0f -
+                     0.85f * std::clamp(state.overlay.mesh_onion_skin_fade_strength, 0.0f, 1.0f) *
+                         smoothstep(t);
+        }
+      }
+      else if (distance_fade && farthest_distance > nearest_distance) {
         const float distance = std::abs(temporal_offset);
         const float t = std::clamp(
             (distance - nearest_distance) / (farthest_distance - nearest_distance), 0.0f, 1.0f);
@@ -255,15 +358,25 @@ class MeshOnionSkin : Overlay {
                               std::clamp(state.overlay.mesh_onion_skin_fade_strength, 0.0f, 1.0f) *
                               smooth_distance;
       }
-      const float4 color = before ? float4(0.16f, 0.55f, 1.0f, opacity) :
-                                    float4(1.0f, 0.25f, 0.14f, opacity);
+      sample_opacities_[i] = opacity;
+      if (opacity <= 0.0f) {
+        continue;
+      }
+      const float4 past_color(0.16f, 0.55f, 1.0f, opacity);
+      const float4 future_color(1.0f, 0.25f, 0.14f, opacity);
+      const float transition = screen_offset_enabled_ ?
+                                   smoothstep(std::clamp(
+                                       sample.rank - playhead_rank_ + 0.5f, 0.0f, 1.0f)) :
+                                   float(!before);
+      const float4 color = past_color * (1.0f - transition) + future_color * transition;
       PassMain::Sub &sub = ps_.sub(before ? "Before" : "After");
       sub.push_constant("ucolor", color);
       if (screen_offset_enabled_) {
         sub.push_constant("screen_offset", screen_pixel_offset(sample));
       }
-      const ResourceID handle = manager.resource_handle(sample.object_to_world);
-      sub.draw(batches_[i].get(), ResourceIDRange(handle));
+      const ResourceID handle = manager.resource_handle(sample.geometry->object_to_world);
+      sub.draw(batches_[i].batch.get(), ResourceIDRange(handle));
+      sample_submitted_[i] = true;
       visible_samples_++;
       if (geometry_dump_enabled_) {
         dump_sample_indices_.append(i);
@@ -296,7 +409,7 @@ class MeshOnionSkin : Overlay {
           "visible_samples=%d\n",
           static_cast<unsigned long long>(bundle_->generation),
           (BLI_time_now_seconds() - bundle_->input_time) * 1000.0,
-          int(bundle_->samples.size()),
+          int(samples().size()),
           visible_samples_);
       fflush(stdout);
     }
@@ -312,18 +425,18 @@ class MeshOnionSkin : Overlay {
       printf("mesh_onion_skin_frames generation=%llu frames=",
              static_cast<unsigned long long>(bundle_->generation));
       bool first = true;
-      for (const int i : bundle_->samples.index_range()) {
-        const ed::mesh_onion_skin::Sample &sample = bundle_->samples[i];
-        if (batches_[i] && visible_meshes_.contains(sample.object_uid)) {
+      for (const int i : samples().index_range()) {
+        const ed::mesh_onion_skin::Sample &sample = samples()[i];
+        if (batches_[i].batch && visible_meshes_.contains(sample.object_uid)) {
           printf("%s%.9g", first ? "" : ",", double(sample.frame));
           first = false;
         }
       }
       printf(" offsets=");
       first = true;
-      for (const int i : bundle_->samples.index_range()) {
-        const ed::mesh_onion_skin::Sample &sample = bundle_->samples[i];
-        if (batches_[i] && visible_meshes_.contains(sample.object_uid)) {
+      for (const int i : samples().index_range()) {
+        const ed::mesh_onion_skin::Sample &sample = samples()[i];
+        if (batches_[i].batch && visible_meshes_.contains(sample.object_uid)) {
           printf("%s%.9g", first ? "" : ",", double(sample.temporal_offset));
           first = false;
         }
@@ -332,43 +445,68 @@ class MeshOnionSkin : Overlay {
       fflush(stdout);
     }
     diagnostics_pending_ = false;
-    if (bundle_ && visible_samples_ > 0 &&
+    if (bundle_ && !samples().is_empty() &&
         std::getenv("BLENDER_MESH_ONION_SKIN_GEOMETRY_DIAGNOSTICS"))
     {
       /* Includes redraws of held bundles: validation can observe scrolling without adding
        * diagnostics or allocations to normal playback. Values match the submitted constants. */
       printf(
-          "mesh_onion_skin_screen generation=%llu playhead=%.9g enabled=%d reverse=%d "
-          "spacing=%.9g "
+          "mesh_onion_skin_screen generation=%llu epoch=%llu playhead=%.9g native_frame=%.9g "
+          "center=%.9g enabled=%d reverse=%d spacing=%.9g vbo_uploads=%llu batch_creates=%llu "
           "frames=",
           static_cast<unsigned long long>(bundle_->generation),
+          static_cast<unsigned long long>(bundle_->epoch),
           double(playhead_frame_),
+          double(native_frame_),
+          double(bundle_->frame),
           int(screen_offset_enabled_),
           int(screen_offset_reversed_),
-          double(screen_offset_spacing_));
+          double(screen_offset_spacing_),
+          static_cast<unsigned long long>(vbo_uploads_),
+          static_cast<unsigned long long>(batch_creates_));
       bool first = true;
-      for (const int i : bundle_->samples.index_range()) {
-        if (screen_sample_submitted(i)) {
-          printf("%s%.9g", first ? "" : ",", double(bundle_->samples[i].frame));
-          first = false;
-        }
+      for (const int i : samples().index_range()) {
+        printf("%s%.9g", first ? "" : ",", double(samples()[i].frame));
+        first = false;
       }
       printf(" offsets=");
       first = true;
-      for (const int i : bundle_->samples.index_range()) {
-        if (screen_sample_submitted(i)) {
-          printf(
-              "%s%.9g", first ? "" : ",", double(displayed_temporal_offset(bundle_->samples[i])));
-          first = false;
-        }
+      for (const int i : samples().index_range()) {
+        printf("%s%.9g", first ? "" : ",", double(displayed_temporal_offset(samples()[i])));
+        first = false;
       }
       printf(" pixels=");
       first = true;
-      for (const int i : bundle_->samples.index_range()) {
-        if (screen_sample_submitted(i)) {
-          printf("%s%.9g", first ? "" : ",", double(screen_pixel_offset(bundle_->samples[i])));
-          first = false;
-        }
+      for (const int i : samples().index_range()) {
+        printf("%s%.9g", first ? "" : ",", double(screen_pixel_offset(samples()[i])));
+        first = false;
+      }
+      printf(" alpha=");
+      first = true;
+      for (const int i : samples().index_range()) {
+        printf("%s%.9g", first ? "" : ",", double(sample_opacities_[i]));
+        first = false;
+      }
+      printf(" ranks=");
+      first = true;
+      for (const ed::mesh_onion_skin::Sample &sample : samples()) {
+        printf("%s%.9g", first ? "" : ",", double(sample.rank - playhead_rank_));
+        first = false;
+      }
+      printf(" payloads=");
+      first = true;
+      for (const ed::mesh_onion_skin::Sample &sample : samples()) {
+        printf(
+            "%s%llu",
+            first ? "" : ",",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(sample.geometry.get())));
+        first = false;
+      }
+      printf(" submitted=");
+      first = true;
+      for (const int i : samples().index_range()) {
+        printf("%s%d", first ? "" : ",", int(screen_sample_submitted(i)));
+        first = false;
       }
       printf("\n");
       fflush(stdout);
@@ -379,19 +517,137 @@ class MeshOnionSkin : Overlay {
   }
 
  private:
+  Span<ed::mesh_onion_skin::Sample> samples() const
+  {
+    return screen_offset_enabled_ ? bundle_->timeline_samples.as_span() :
+                                    bundle_->samples.as_span();
+  }
+
+  void sync_batches()
+  {
+    batches_screen_offset_ = screen_offset_enabled_;
+    if (batch_epoch_ != bundle_->epoch) {
+      batches_.clear();
+      batch_epoch_ = bundle_->epoch;
+    }
+    Vector<BatchSlot> previous = std::move(batches_);
+    batches_.reserve(samples().size());
+    for (const ed::mesh_onion_skin::Sample &sample : samples()) {
+      BatchSlot slot;
+      for (BatchSlot &candidate : previous) {
+        if (candidate.object_uid == sample.object_uid && candidate.frame == sample.frame &&
+            candidate.geometry)
+        {
+          slot = std::move(candidate);
+          break;
+        }
+      }
+      slot.object_uid = sample.object_uid;
+      slot.frame = sample.frame;
+      if (!sample.geometry || sample.geometry->positions.is_empty() ||
+          sample.geometry->triangles.is_empty())
+      {
+        slot.batch.reset();
+      }
+      else if (!slot.batch ||
+               slot.batch->verts[0]->vertex_len != sample.geometry->positions.size())
+      {
+        slot.batch = create_batch(sample);
+        batch_creates_++;
+        vbo_uploads_++;
+      }
+      else if (slot.geometry != sample.geometry) {
+        /* Stable timeline identities retain GPU buffers. Cached frames with the same immutable
+         * payload need no vertex upload, even when their slot in the moving window changes. */
+        gpu::VertBuf *vbo = slot.batch->verts[0];
+        vbo->data<float3>().copy_from(sample.geometry->positions);
+        GPU_vertbuf_tag_dirty(vbo);
+        vbo_uploads_++;
+        if (!slot.geometry ||
+            slot.geometry->triangles.as_span() != sample.geometry->triangles.as_span())
+        {
+          GPU_batch_elembuf_set(slot.batch.get(), create_index_buffer(sample), true);
+        }
+      }
+      slot.geometry = sample.geometry;
+      batches_.append(std::move(slot));
+    }
+    /* Only active identities and their guard frames stay resident. No original object or
+     * evaluated mesh pointer is retained by this cache. */
+  }
+
+  static float smoothstep(const float t)
+  {
+    return t * t * (3.0f - 2.0f * t);
+  }
+
+  float timeline_opacity(const float rank) const
+  {
+    if ((rank < 0.0f && before_count_ == 0.0f) || (rank > 0.0f && after_count_ == 0.0f)) {
+      return 0.0f;
+    }
+    if (rank < -before_count_) {
+      return smoothstep(std::clamp(rank + before_count_ + 1.0f, 0.0f, 1.0f));
+    }
+    if (rank > after_count_) {
+      return smoothstep(std::clamp(after_count_ + 1.0f - rank, 0.0f, 1.0f));
+    }
+    return 1.0f;
+  }
+
+  float interpolated_playhead_rank(const float delta, const int step) const
+  {
+    const ed::mesh_onion_skin::Sample *left = nullptr;
+    const ed::mesh_onion_skin::Sample *right = nullptr;
+    for (const ed::mesh_onion_skin::Sample &sample : samples()) {
+      if (sample.temporal_offset <= delta &&
+          (!left || sample.temporal_offset > left->temporal_offset))
+      {
+        left = &sample;
+      }
+      if (sample.temporal_offset >= delta &&
+          (!right || sample.temporal_offset < right->temporal_offset))
+      {
+        right = &sample;
+      }
+    }
+    if (!left && !right) {
+      return 0.0f;
+    }
+    if (!left || !right) {
+      /* A held bundle may outlive its guard interval. Extrapolate the boundary cell until
+       * every old frame has smoothly faded out, instead of wrapping it back into view. */
+      const ed::mesh_onion_skin::Sample *edge = left ? left : right;
+      const ed::mesh_onion_skin::Sample *neighbor = nullptr;
+      for (const ed::mesh_onion_skin::Sample &sample : samples()) {
+        const float offset = sample.temporal_offset;
+        if ((left && offset < edge->temporal_offset &&
+             (!neighbor || offset > neighbor->temporal_offset)) ||
+            (right && offset > edge->temporal_offset &&
+             (!neighbor || offset < neighbor->temporal_offset)))
+        {
+          neighbor = &sample;
+        }
+      }
+      if (!neighbor) {
+        return edge->rank + (delta - edge->temporal_offset) / std::max(1, step);
+      }
+      left = left ? neighbor : edge;
+      right = right ? neighbor : edge;
+    }
+    const float span = right->temporal_offset - left->temporal_offset;
+    if (span == 0.0f) {
+      return left->rank;
+    }
+    return left->rank + (delta - left->temporal_offset) / span * (right->rank - left->rank);
+  }
+
   float displayed_temporal_offset(const ed::mesh_onion_skin::Sample &sample) const
   {
     if (!screen_offset_enabled_) {
       return sample.temporal_offset;
     }
-    /* Wrapped sample frames retain their signed temporal offset from the bundle's center.
-     * The nearest equivalent center avoids an end/start discontinuity during looping. */
-    const float bundle_frame = sample.frame - sample.temporal_offset;
-    float playhead_delta = playhead_frame_ - bundle_frame;
-    if (loop_period_ > 0.0f) {
-      playhead_delta = std::remainder(playhead_delta, loop_period_);
-    }
-    return sample.temporal_offset - playhead_delta;
+    return sample.temporal_offset - bundle_playhead_delta_;
   }
 
   float screen_pixel_offset(const ed::mesh_onion_skin::Sample &sample) const
@@ -405,9 +661,7 @@ class MeshOnionSkin : Overlay {
 
   bool screen_sample_submitted(const int index) const
   {
-    return batches_[index] && visible_meshes_.contains(bundle_->samples[index].object_uid) &&
-           (!screen_offset_enabled_ ||
-            std::abs(displayed_temporal_offset(bundle_->samples[index])) >= 1e-5f);
+    return sample_submitted_[index];
   }
 
   void dump_geometry()
@@ -436,9 +690,10 @@ class MeshOnionSkin : Overlay {
     }
     size_t dump_bytes = 32;
     for (const int index : dump_sample_indices_) {
-      const ed::mesh_onion_skin::Sample &sample = bundle_->samples[index];
+      const ed::mesh_onion_skin::Sample &sample = samples()[index];
       dump_bytes += 36 + dump_mesh_names_.lookup(sample.object_uid).size() +
-                    size_t(sample.positions.size() + sample.triangles.size()) * 12;
+                    size_t(sample.geometry->positions.size() + sample.geometry->triangles.size()) *
+                        12;
     }
     if (dump_bytes > size_t(256) * 1024 * 1024) {
       return;
@@ -474,22 +729,22 @@ class MeshOnionSkin : Overlay {
     integer(bundle_->generation, 8);
     integer(bundle_->epoch, 8);
     for (const int index : dump_sample_indices_) {
-      const ed::mesh_onion_skin::Sample &sample = bundle_->samples[index];
+      const ed::mesh_onion_skin::Sample &sample = samples()[index];
       const std::string &name = dump_mesh_names_.lookup(sample.object_uid);
       integer(sample.object_uid.hash(), 8);
       scalar(sample.frame);
       scalar(sample.temporal_offset);
       integer(name.size(), 4);
-      integer(sample.positions.size(), 8);
-      integer(sample.triangles.size(), 8);
+      integer(sample.geometry->positions.size(), 8);
+      integer(sample.geometry->triangles.size(), 8);
       bytes(name.data(), name.size());
-      for (const float3 &position : sample.positions) {
-        const float3 world = math::transform_point(sample.object_to_world, position);
+      for (const float3 &position : sample.geometry->positions) {
+        const float3 world = math::transform_point(sample.geometry->object_to_world, position);
         for (int axis = 0; axis < 3; axis++) {
           scalar(world[axis]);
         }
       }
-      for (const int3 &triangle : sample.triangles) {
+      for (const int3 &triangle : sample.geometry->triangles) {
         for (int corner = 0; corner < 3; corner++) {
           integer(uint32_t(triangle[corner]), 4);
         }
@@ -520,17 +775,17 @@ class MeshOnionSkin : Overlay {
       }
     };
     Vector<uint64_t> sample_hashes;
-    for (const int i : bundle_->samples.index_range()) {
-      const ed::mesh_onion_skin::Sample &sample = bundle_->samples[i];
-      if (!batches_[i] || !visible_meshes_.contains(sample.object_uid)) {
+    for (const int i : samples().index_range()) {
+      const ed::mesh_onion_skin::Sample &sample = samples()[i];
+      if (!batches_[i].batch || !visible_meshes_.contains(sample.object_uid)) {
         continue;
       }
       uint64_t hash = seed;
       append(hash, std::llround(double(sample.frame) * 100000.0));
       append(hash, std::llround(double(sample.temporal_offset) * 100000.0));
-      append(hash, sample.positions.size());
-      for (const float3 &position : sample.positions) {
-        const float3 world = math::transform_point(sample.object_to_world, position);
+      append(hash, sample.geometry->positions.size());
+      for (const float3 &position : sample.geometry->positions) {
+        const float3 world = math::transform_point(sample.geometry->object_to_world, position);
         for (int axis = 0; axis < 3; axis++) {
           append(hash, std::llround(double(world[axis]) * 100000.0));
         }
@@ -548,14 +803,14 @@ class MeshOnionSkin : Overlay {
 
   static BatchPtr create_batch(const ed::mesh_onion_skin::Sample &sample)
   {
-    if (sample.positions.is_empty() || sample.triangles.is_empty()) {
+    if (sample.geometry->positions.is_empty() || sample.geometry->triangles.is_empty()) {
       return nullptr;
     }
     GPUVertFormat format = {};
     GPU_vertformat_attr_add(&format, "pos", blender::gpu::VertAttrType::SFLOAT_32_32_32);
     gpu::VertBuf *vbo = GPU_vertbuf_create_with_format_ex(format, GPU_USAGE_DYNAMIC);
-    GPU_vertbuf_data_alloc(*vbo, sample.positions.size());
-    vbo->data<float3>().copy_from(sample.positions);
+    GPU_vertbuf_data_alloc(*vbo, sample.geometry->positions.size());
+    vbo->data<float3>().copy_from(sample.geometry->positions);
     return BatchPtr(GPU_batch_create_ex(GPU_PRIM_TRIS,
                                         vbo,
                                         create_index_buffer(sample),
@@ -567,11 +822,11 @@ class MeshOnionSkin : Overlay {
     /* Tessellation is supplied per sample; stable polygon connectivity alone is insufficient. */
     return GPU_indexbuf_build_from_memory(
         GPU_PRIM_TRIS,
-        reinterpret_cast<const uint32_t *>(sample.triangles.data()),
+        reinterpret_cast<const uint32_t *>(sample.geometry->triangles.data()),
         /* This API takes primitive count and multiplies by three for triangles. */
-        sample.triangles.size(),
+        sample.geometry->triangles.size(),
         0,
-        sample.positions.size() - 1,
+        sample.geometry->positions.size() - 1,
         false);
   }
 };

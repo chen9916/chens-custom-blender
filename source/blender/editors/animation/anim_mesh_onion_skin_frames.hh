@@ -22,6 +22,8 @@ struct SampleFrame {
   float frame;
   /** Signed temporal distance from the current frame, including wrapping around the range. */
   float offset;
+  /** Stable timeline cell/key index, including the occurrence's lap when looping. */
+  float rank = 0.0f;
 };
 
 /** Select nearest authored keys, or stepped frames. Results are ordered by signed offset.
@@ -31,5 +33,15 @@ Vector<SampleFrame> sample_frames_select(Span<float> sorted_keyed_frames,
                                          float current_frame,
                                          int frame_start,
                                          int frame_end);
+
+/** Stable timeline cells, including the current cell and one boundary guard on either side.
+ * Stepped cells are anchored at scene start; keyed cells use authored key indices. Looping
+ * repeats the canonical cells each lap. Duplicate cells prefer exact center, then an enabled
+ * side, then their nearest occurrence. Results are ordered by signed offset. */
+Vector<SampleFrame> sample_frames_select_timeline(Span<float> sorted_keyed_frames,
+                                                  const Settings &settings,
+                                                  float current_frame,
+                                                  int frame_start,
+                                                  int frame_end);
 
 }  // namespace blender::ed::mesh_onion_skin

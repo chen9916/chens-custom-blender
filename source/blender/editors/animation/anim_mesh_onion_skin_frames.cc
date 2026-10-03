@@ -416,4 +416,110 @@ Vector<SampleFrame> sample_frames_select(const Span<float> sorted_keyed_frames,
   return result;
 }
 
+Vector<SampleFrame> sample_frames_select_timeline(const Span<float> sorted_keyed_frames,
+                                                  const Settings &settings,
+                                                  const float current_frame,
+                                                  const int frame_start,
+                                                  const int frame_end)
+{
+  Vector<SampleFrame> candidates;
+  Vector<SampleFrame> result;
+  if (!std::isfinite(current_frame) || (settings.loop_frame_range && frame_end < frame_start)) {
+    return result;
+  }
+  const int before = math::clamp(settings.before, 0, samples_per_side_limit);
+  const int after = math::clamp(settings.after, 0, samples_per_side_limit);
+  const double period = double(frame_end) - frame_start + 1;
+  double reference = current_frame;
+  if (settings.loop_frame_range) {
+    reference = std::fmod(reference - frame_start, period);
+    if (reference < 0) {
+      reference += period;
+    }
+    reference += frame_start;
+  }
+
+  Span<float> keys = sorted_keyed_frames;
+  if (settings.keyed_frames_only && settings.loop_frame_range) {
+    const int64_t first = std::lower_bound(keys.begin(), keys.end(), float(frame_start)) -
+                          keys.begin();
+    const int64_t last = std::upper_bound(keys.begin(), keys.end(), float(frame_end)) -
+                         keys.begin();
+    keys = keys.slice(first, last - first);
+  }
+  if (settings.keyed_frames_only && keys.is_empty()) {
+    return result;
+  }
+
+  const int step = math::max(settings.step, 1);
+  /* A loop repeats the scene-start grid, including a potentially shorter final cell. Applying
+   * modulo to an infinite stepped grid would change every canonical sample after such a lap. */
+  const int64_t cell_count = settings.keyed_frames_only ? keys.size() :
+                                                          int64_t(std::ceil(period / step));
+  const double cell = settings.keyed_frames_only ?
+                          double(std::upper_bound(keys.begin(), keys.end(), reference) -
+                                 keys.begin() - 1) :
+                          std::floor((reference - frame_start) / step);
+  /* Including the zero-distance cell lets a pose move continuously through screen center. The
+   * outer guards enter/leave only where the renderer's continuous rank envelope reaches zero. */
+  for (int neighbor = -before - 1; neighbor <= after + 1; neighbor++) {
+    const double rank = cell + neighbor;
+    double frame;
+    double occurrence;
+    if (settings.loop_frame_range) {
+      const int64_t integer_rank = int64_t(rank);
+      int64_t index = integer_rank % cell_count;
+      if (index < 0) {
+        index += cell_count;
+      }
+      const int64_t lap = (integer_rank - index) / cell_count;
+      frame = settings.keyed_frames_only ? keys[index] : double(frame_start) + index * step;
+      occurrence = frame + lap * period;
+    }
+    else if (settings.keyed_frames_only) {
+      if (rank < 0 || rank >= keys.size()) {
+        continue;
+      }
+      frame = occurrence = keys[int64_t(rank)];
+    }
+    else {
+      frame = occurrence = double(frame_start) + rank * step;
+    }
+    const SampleFrame candidate = {float(frame), float(occurrence - reference), float(rank)};
+    if (std::isfinite(candidate.frame) && std::isfinite(candidate.offset) &&
+        std::isfinite(candidate.rank))
+    {
+      candidates.append(candidate);
+    }
+  }
+
+  /* Short loops may include multiple occurrences of the same canonical frame. Keep exact screen
+   * center first, then an enabled side before a hidden side, then the nearest occurrence. */
+  std::sort(candidates.begin(), candidates.end(), [&](const SampleFrame &a, const SampleFrame &b) {
+    if ((a.offset == 0) != (b.offset == 0)) {
+      return a.offset == 0;
+    }
+    const bool a_visible = a.offset < 0 ? before > 0 : after > 0;
+    const bool b_visible = b.offset < 0 ? before > 0 : after > 0;
+    if (a_visible != b_visible) {
+      return a_visible;
+    }
+    const float a_distance = std::abs(a.offset);
+    const float b_distance = std::abs(b.offset);
+    return a_distance == b_distance ? a.offset < b.offset : a_distance < b_distance;
+  });
+  for (const SampleFrame &candidate : candidates) {
+    if (!std::any_of(result.begin(), result.end(), [&](const SampleFrame &sample) {
+          return sample.frame == candidate.frame;
+        }))
+    {
+      result.append(candidate);
+    }
+  }
+  std::sort(result.begin(), result.end(), [](const SampleFrame &a, const SampleFrame &b) {
+    return a.offset < b.offset;
+  });
+  return result;
+}
+
 }  // namespace blender::ed::mesh_onion_skin

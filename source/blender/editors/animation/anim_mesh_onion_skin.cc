@@ -63,6 +63,7 @@
 
 #include "ED_mesh_onion_skin.hh"
 #include "ED_mesh_onion_skin_preview.hh"
+#include "ED_screen.hh"
 
 #include "RNA_access.hh"
 #include "RNA_path.hh"
@@ -214,6 +215,20 @@ static bool keep_pose_armature_update(const Object &rig,
          armature_rest_matches(*id_cast<const bArmature *>(&changed_id), definition);
 }
 
+static constexpr size_t cache_budget = 256 * 1024 * 1024;
+static constexpr int dependency_limit = 512;
+static constexpr int sample_limit = 8;
+static constexpr int timeline_sample_limit = 11;
+static constexpr int frame_cache_limit = 32;
+static constexpr uint8_t relative_mode = 1 << 0;
+static constexpr uint8_t timeline_mode = 1 << 1;
+
+struct CachedFrame {
+  float frame;
+  size_t bytes = 0;
+  Vector<std::pair<SessionUID, std::shared_ptr<const SampleGeometry>>> meshes;
+};
+
 /* The capsule is owned by the job, not by an evaluated object or a viewport. Its Main and every
  * evaluable ID are private. A second graph on the user's Main would not provide this isolation. */
 struct Capsule {
@@ -224,6 +239,12 @@ struct Capsule {
   Map<SessionUID, bAction *> actions;
   PreviewApplyState preview_state;
   Vector<std::pair<SessionUID, Object *>> meshes;
+  /** Worker-only; no source or evaluated mesh pointers are retained here. */
+  Vector<CachedFrame> frame_cache;
+  size_t frame_cache_bytes = 0;
+  uint64_t cache_epoch = 0;
+  uint64_t cache_geometry_revision = 0;
+  int workspace_sample_capacity = 0;
   ~Capsule()
   {
     if (graph) {
@@ -236,9 +257,14 @@ struct Capsule {
 struct Work {
   Settings settings;
   Vector<SampleFrame> frames;
+  Vector<SampleFrame> timeline_frames;
   float frame = 0;
+  int frame_start = 0;
+  int frame_end = 0;
+  int frame_cache_capacity = sample_limit;
   uint64_t generation = 0;
   uint64_t epoch = 0;
+  uint64_t geometry_revision = 0;
   double input_time = 0;
   double staging_seconds = 0;
   std::shared_ptr<const PreparedPreview> preview;
@@ -266,6 +292,10 @@ struct State {
   uint64_t generation = 1;
   uint64_t staged_generation = 0;
   uint64_t epoch = 1;
+  uint64_t geometry_revision = 1;
+  uint8_t modes = relative_mode;
+  Vector<SampleFrame> timeline_frames;
+  double last_animation_redraw = 0.0;
   double input_time = 0;
   std::shared_ptr<const PosePreviewInput> input;
   bool initialized = false;
@@ -287,9 +317,6 @@ struct State {
 static Vector<std::shared_ptr<State>> states;
 static Map<std::pair<SessionUID, SessionUID>, std::shared_ptr<const PosePreviewInput>>
     captured_inputs;
-static constexpr size_t cache_budget = 256 * 1024 * 1024;
-static constexpr int dependency_limit = 512;
-static constexpr int sample_limit = 8;
 
 static SessionUID uid(const ID &id)
 {
@@ -838,6 +865,11 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
     }
   }
 
+  const int workspace_sample_capacity = ((state.modes & relative_mode) ? sample_limit : 0) +
+                                        ((state.modes & timeline_mode) ? timeline_sample_limit :
+                                                                         0);
+  const int workspace_cache_capacity = (state.modes & timeline_mode) ? frame_cache_limit :
+                                                                       sample_limit;
   size_t estimated_bytes = 0;
   for (ID *id : gather.queue) {
     if (id->id_type() == ID_ME) {
@@ -907,7 +939,7 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
       }
     }
     estimated_bytes += (vertices * sizeof(float3) + triangles * sizeof(int3)) *
-                       (3 * sample_limit + 3);
+                       (workspace_cache_capacity + 2 * workspace_sample_capacity + 3);
     if (estimated_bytes > cache_budget) {
       break;
     }
@@ -918,6 +950,7 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
   }
 
   auto capsule = std::make_unique<Capsule>();
+  capsule->workspace_sample_capacity = workspace_sample_capacity;
   capsule->scene = BKE_scene_add(capsule->main, "Mesh Onion Skin Evaluation");
   Map<ID *, ID *> copies;
   Map<ID *, int> source_users;
@@ -1082,10 +1115,21 @@ static std::shared_ptr<Bundle> evaluate(Capsule &capsule,
                                         wmJobWorkerStatus &worker_status)
 {
   const double start = BLI_time_now_seconds();
-  const bool diagnostics = std::getenv("BLENDER_MESH_ONION_SKIN_DIAGNOSTICS") != nullptr;
+  const bool diagnostics = std::getenv("BLENDER_MESH_ONION_SKIN_DIAGNOSTICS") != nullptr ||
+                           std::getenv("BLENDER_MESH_ONION_SKIN_GEOMETRY_DIAGNOSTICS") != nullptr;
   double graph_seconds = 0.0;
   double snapshot_seconds = 0.0;
   double triangulation_seconds = 0.0;
+  if (capsule.cache_epoch != work.epoch ||
+      capsule.cache_geometry_revision != work.geometry_revision)
+  {
+    capsule.frame_cache.clear();
+    capsule.frame_cache_bytes = 0;
+    capsule.cache_epoch = work.epoch;
+    capsule.cache_geometry_revision = work.geometry_revision;
+  }
+  capsule.scene->r.sfra = work.frame_start;
+  capsule.scene->r.efra = work.frame_end;
   bool structure_changed = false;
   Object *edited_rig = work.preview ?
                            capsule.objects.lookup_default(work.preview->object_uid, nullptr) :
@@ -1139,15 +1183,75 @@ static std::shared_ptr<Bundle> evaluate(Capsule &capsule,
   auto bundle = std::make_shared<Bundle>();
   bundle->generation = work.generation;
   bundle->epoch = work.epoch;
+  bundle->geometry_revision = work.geometry_revision;
+  bundle->frame = work.frame;
   bundle->input_time = work.input_time;
   bundle->staging_seconds = work.staging_seconds;
-  /* Publish only a complete coherent set. The packet owns scene-time samples selected on the
-   * main thread; the worker never accesses source Actions or scene range settings. */
-  for (const SampleFrame &requested_frame : work.frames) {
+  Vector<float> needed_frames;
+  for (const SampleFrame &frame : work.frames) {
+    if (!needed_frames.contains(frame.frame)) {
+      needed_frames.append(frame.frame);
+    }
+  }
+  for (const SampleFrame &frame : work.timeline_frames) {
+    if (!needed_frames.contains(frame.frame)) {
+      needed_frames.append(frame.frame);
+    }
+  }
+  auto evict_frame = [&]() {
+    int victim = -1;
+    float farthest = -1.0f;
+    for (const int index : capsule.frame_cache.index_range()) {
+      const CachedFrame &cached = capsule.frame_cache[index];
+      if (needed_frames.contains(cached.frame)) {
+        continue;
+      }
+      const float distance = math::abs(cached.frame - work.frame);
+      if (distance > farthest) {
+        farthest = distance;
+        victim = index;
+      }
+    }
+    if (victim == -1) {
+      return false;
+    }
+    capsule.frame_cache_bytes -= capsule.frame_cache[victim].bytes;
+    capsule.frame_cache.remove_and_reorder(victim);
+    return true;
+  };
+  int evaluated_frames = 0;
+  int reused_frames = 0;
+  /* A normal-only subscriber keeps the original eight-frame storage envelope, including when
+   * the last timeline view was disabled after filling the larger playback cache. */
+  while (capsule.frame_cache.size() > work.frame_cache_capacity) {
+    if (!evict_frame()) {
+      return nullptr;
+    }
+  }
+  /* Only entering lattice/key poses are evaluated. Cached poses are exact native evaluations,
+   * never vertex interpolation. All descriptors in both policies share these owned payloads. */
+  for (const float frame : needed_frames) {
     if (worker_status.stop) {
       return nullptr;
     }
-    const float frame = requested_frame.frame;
+    bool cached = false;
+    for (const CachedFrame &entry : capsule.frame_cache) {
+      if (entry.frame == frame) {
+        cached = true;
+        break;
+      }
+    }
+    if (cached) {
+      reused_frames++;
+      continue;
+    }
+    while (capsule.frame_cache.size() >= work.frame_cache_capacity) {
+      if (!evict_frame()) {
+        return nullptr;
+      }
+    }
+    CachedFrame result;
+    result.frame = frame;
     BKE_scene_frame_set(capsule.scene, frame);
     const double graph_start = diagnostics ? BLI_time_now_seconds() : 0.0;
     DEG_evaluate_on_framechange(capsule.graph, frame, DEG_EVALUATE_SYNC_WRITEBACK_NO);
@@ -1159,52 +1263,81 @@ static std::shared_ptr<Bundle> evaluate(Capsule &capsule,
       if (!mesh) {
         return nullptr;
       }
-      Sample sample;
+      auto geometry = std::make_shared<SampleGeometry>();
       const size_t sample_bytes = size_t(mesh->verts_num) * sizeof(float3) +
                                   size_t(mesh->corners_num - 2 * mesh->faces_num) * sizeof(int3);
-      if (sample_bytes > cache_budget - bundle->bytes) {
+      if (sample_bytes > cache_budget - result.bytes) {
         return nullptr;
       }
-      sample.object_uid = entry.first;
-      sample.frame = frame;
-      sample.temporal_offset = requested_frame.offset;
-      sample.object_to_world = object->object_to_world();
-      sample.positions = Array<float3>(mesh->vert_positions());
+      while (capsule.frame_cache_bytes > cache_budget - result.bytes - sample_bytes) {
+        if (!evict_frame()) {
+          return nullptr;
+        }
+      }
+      geometry->object_to_world = object->object_to_world();
+      geometry->positions = Array<float3>(mesh->vert_positions());
       const double triangulation_start = diagnostics ? BLI_time_now_seconds() : 0.0;
       const Span<int3> corner_triangles = mesh->corner_tris();
       if (diagnostics) {
         triangulation_seconds += BLI_time_now_seconds() - triangulation_start;
       }
       const Span<int> corner_vertices = mesh->corner_verts();
-      sample.triangles.reinitialize(corner_triangles.size());
+      geometry->triangles.reinitialize(corner_triangles.size());
       threading::parallel_for(corner_triangles.index_range(), 4096, [&](IndexRange range) {
         for (const int index : range) {
           const int3 corners = corner_triangles[index];
-          sample.triangles[index] = int3(
+          geometry->triangles[index] = int3(
               corner_vertices[corners.x], corner_vertices[corners.y], corner_vertices[corners.z]);
         }
       });
-      bundle->bytes += sample.positions.size() * sizeof(float3) +
-                       sample.triangles.size() * sizeof(int3);
-      if (bundle->bytes > cache_budget) {
-        return nullptr;
-      }
-      bundle->samples.append(std::move(sample));
+      result.bytes += geometry->positions.size() * sizeof(float3) +
+                      geometry->triangles.size() * sizeof(int3);
+      result.meshes.append({entry.first, std::move(geometry)});
     }
     if (diagnostics) {
       snapshot_seconds += BLI_time_now_seconds() - snapshot_start;
+    }
+    capsule.frame_cache_bytes += result.bytes;
+    capsule.frame_cache.append(std::move(result));
+    evaluated_frames++;
+  }
+  auto append_samples = [&](const Span<SampleFrame> frames, Vector<Sample> &samples) {
+    for (const SampleFrame &requested : frames) {
+      for (const CachedFrame &cached : capsule.frame_cache) {
+        if (cached.frame != requested.frame) {
+          continue;
+        }
+        for (const auto &mesh : cached.meshes) {
+          samples.append(
+              {mesh.first, requested.frame, requested.offset, requested.rank, mesh.second});
+        }
+        break;
+      }
+    }
+  };
+  append_samples(work.frames, bundle->samples);
+  append_samples(work.timeline_frames, bundle->timeline_samples);
+  for (const CachedFrame &cached : capsule.frame_cache) {
+    if (needed_frames.contains(cached.frame)) {
+      bundle->bytes += cached.bytes;
     }
   }
   bundle->evaluation_seconds = BLI_time_now_seconds() - start;
   if (diagnostics) {
     printf(
         "mesh_onion_skin_worker generation=%llu preparation_ms=%.3f graph_ms=%.3f "
-        "snapshot_ms=%.3f triangulation_ms=%.3f\n",
+        "snapshot_ms=%.3f triangulation_ms=%.3f new_frames=%d reused_frames=%d "
+        "cache_frames=%lld cache_bytes=%zu geometry_revision=%llu\n",
         static_cast<unsigned long long>(work.generation),
         preparation_seconds * 1000.0,
         graph_seconds * 1000.0,
         snapshot_seconds * 1000.0,
-        triangulation_seconds * 1000.0);
+        triangulation_seconds * 1000.0,
+        evaluated_frames,
+        reused_frames,
+        static_cast<long long>(capsule.frame_cache.size()),
+        capsule.frame_cache_bytes,
+        static_cast<unsigned long long>(work.geometry_revision));
   }
   return bundle;
 }
@@ -1219,8 +1352,12 @@ static void stage(State &state)
   Work work;
   work.settings = state.settings;
   work.frame = state.frame;
+  work.frame_start = state.frame_start;
+  work.frame_end = state.frame_end;
+  work.frame_cache_capacity = (state.modes & timeline_mode) ? frame_cache_limit : sample_limit;
   work.generation = state.generation;
   work.epoch = state.epoch;
+  work.geometry_revision = state.geometry_revision;
   work.input_time = state.input_time;
   const double start = BLI_time_now_seconds();
   if (state.settings.keyed_frames_only && !state.keyed_frames.unsupported_reason.empty()) {
@@ -1233,11 +1370,21 @@ static void stage(State &state)
     state.staged_generation = state.generation;
     return;
   }
-  work.frames = sample_frames_select(state.keyed_frames.frames,
-                                     state.settings,
-                                     state.frame,
-                                     state.source_scene->r.sfra,
-                                     state.source_scene->r.efra);
+  if (state.modes & relative_mode) {
+    work.frames = sample_frames_select(state.keyed_frames.frames,
+                                       state.settings,
+                                       state.frame,
+                                       state.source_scene->r.sfra,
+                                       state.source_scene->r.efra);
+  }
+  if (state.modes & timeline_mode) {
+    work.timeline_frames = sample_frames_select_timeline(state.keyed_frames.frames,
+                                                         state.settings,
+                                                         state.frame,
+                                                         state.source_scene->r.sfra,
+                                                         state.source_scene->r.efra);
+    state.timeline_frames = work.timeline_frames;
+  }
   if (state.input) {
     work.preview = preview_prepare(
         *state.source_main, *state.source_scene, *state.source_rig, *state.input);
@@ -1343,7 +1490,9 @@ static void job_start(void *custom_data, wmJobWorkerStatus *worker_status)
 static void job_timer(void *custom_data)
 {
   State &state = **static_cast<std::shared_ptr<State> *>(custom_data);
-  bool subscribed = false;
+  uint8_t modes = 0;
+  const double now = BLI_time_now_seconds();
+  const bool redraw_animation = now - state.last_animation_redraw >= 1.0 / 60.0;
   if (state.source_rig->mode & OB_MODE_POSE) {
     for (wmWindow &window : state.wm->windows) {
       if (WM_window_get_active_scene(&window) != state.source_scene) {
@@ -1354,29 +1503,58 @@ static void job_timer(void *custom_data)
       if (BKE_view_layer_active_object_get(view_layer) != state.source_rig) {
         continue;
       }
-      const bScreen *screen = WM_window_get_active_screen(&window);
+      bScreen *screen = WM_window_get_active_screen(&window);
       if (!screen) {
         continue;
       }
-      for (const ScrArea &area : screen->areabase) {
+      const wmTimer *animation_timer = screen->animtimer;
+      const ScreenAnimData *animation = animation_timer ? static_cast<const ScreenAnimData *>(
+                                                              animation_timer->customdata) :
+                                                          nullptr;
+      const bool playing_scene = animation && animation->scene == state.source_scene &&
+                                 !animation_timer->sleep &&
+                                 !(animation_timer->flags & WM_TIMER_TAGGED_FOR_REMOVAL);
+      for (ScrArea &area : screen->areabase) {
         if (area.spacetype != SPACE_VIEW3D || !area.spacedata.first()) {
           continue;
         }
         const View3D &view = *reinterpret_cast<const View3D *>(area.spacedata.first());
         if (!(view.flag2 & V3D_HIDE_OVERLAYS) && view.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN) {
-          subscribed = true;
-          break;
+          const bool timeline = view.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET;
+          modes |= timeline ? timeline_mode : relative_mode;
+          if (timeline && playing_scene && redraw_animation) {
+            for (ARegion &region : area.regionbase) {
+              if (region.regiontype == RGN_TYPE_WINDOW) {
+                ED_region_tag_redraw(&region);
+              }
+            }
+          }
         }
       }
     }
   }
-  if (!subscribed) {
+  if (redraw_animation) {
+    state.last_animation_redraw = now;
+  }
+  if (!modes) {
     state.retired = true;
     state.published.reset();
     /* A timer must not destroy its own WM job. Cooperatively stop, then free in the WM loop. */
     WM_jobs_stop_type(state.wm, &state, WM_JOB_TYPE_MESH_ONION_SKIN);
     state.ready.notify_one();
     return;
+  }
+  if (state.modes != modes) {
+    state.modes = modes;
+    state.generation++;
+    state.input_time = now;
+    const int capacity = ((modes & relative_mode) ? sample_limit : 0) +
+                         ((modes & timeline_mode) ? timeline_sample_limit : 0);
+    if (state.capsule && capacity > state.capsule->workspace_sample_capacity) {
+      state.epoch++;
+      state.published.reset();
+      state.restart_requested = true;
+    }
   }
   if (state.restart_requested) {
     /* Requests only change the main-thread membership mailbox. Let WM reap the worker before
@@ -1482,7 +1660,8 @@ void request(bContext &C,
              Depsgraph &depsgraph,
              Object &rig,
              const Span<Object *> meshes,
-             const Settings &settings)
+             const Settings &settings,
+             const SamplingMode mode)
 {
   Scene *scene = CTX_data_scene(&C);
   wmWindowManager *wm = CTX_wm_manager(&C);
@@ -1505,6 +1684,19 @@ void request(bContext &C,
     return;
   }
   if (state) {
+    const uint8_t requested_mode = mode == SamplingMode::Timeline ? timeline_mode : relative_mode;
+    if (!(state->modes & requested_mode)) {
+      state->modes |= requested_mode;
+      state->generation++;
+      state->input_time = BLI_time_now_seconds();
+      const int capacity = ((state->modes & relative_mode) ? sample_limit : 0) +
+                           ((state->modes & timeline_mode) ? timeline_sample_limit : 0);
+      if (state->capsule && capacity > state->capsule->workspace_sample_capacity) {
+        state->epoch++;
+        state->published.reset();
+        state->restart_requested = true;
+      }
+    }
     if (source_membership_update(
             *scene, state->source_view_layer, state->source_meshes, requested_view_layer, meshes))
     {
@@ -1528,16 +1720,34 @@ void request(bContext &C,
     }
     if (state->frame != frame) {
       state->frame = frame;
-      state->generation++;
-      state->input_time = BLI_time_now_seconds();
+      bool changed = state->modes & relative_mode;
+      if (!changed && state->modes & timeline_mode) {
+        const Vector<SampleFrame> desired = sample_frames_select_timeline(
+            state->keyed_frames.frames, state->settings, frame, scene->r.sfra, scene->r.efra);
+        changed = desired.size() != state->timeline_frames.size();
+        if (!changed) {
+          for (const int index : desired.index_range()) {
+            if (desired[index].frame != state->timeline_frames[index].frame ||
+                desired[index].rank != state->timeline_frames[index].rank)
+            {
+              changed = true;
+              break;
+            }
+          }
+        }
+      }
+      if (changed) {
+        state->generation++;
+        state->input_time = BLI_time_now_seconds();
+      }
     }
     if (state->frame_start != scene->r.sfra || state->frame_end != scene->r.efra) {
       state->frame_start = scene->r.sfra;
       state->frame_end = scene->r.efra;
-      if (state->settings.loop_frame_range) {
-        state->generation++;
-        state->input_time = BLI_time_now_seconds();
-      }
+      /* Timeline anchoring and native Scene driver inputs both depend on these settings. */
+      state->geometry_revision++;
+      state->generation++;
+      state->input_time = BLI_time_now_seconds();
     }
     if (!state->initialized && !state->job_registered) {
       /* A rejected secondary request has no WM job to receive a window-close callback. Refresh
@@ -1573,6 +1783,7 @@ void request(bContext &C,
   state->scene_uid = uid(scene->id);
   state->rig_uid = uid(rig.id);
   state->settings = bounded;
+  state->modes = mode == SamplingMode::Timeline ? timeline_mode : relative_mode;
   state->frame = frame;
   state->input_time = BLI_time_now_seconds();
   state->input = captured_inputs.lookup_default({state->scene_uid, state->rig_uid}, nullptr);
@@ -1644,6 +1855,7 @@ void preview_input_update(bContext &C, std::shared_ptr<const PosePreviewInput> i
       }
       state->frame = state->input->frame;
       state->generation++;
+      state->geometry_revision++;
       state->input_time = BLI_time_now_seconds();
       if (state->input->supported) {
         /* Stage while the authored pose is available instead of waiting for the producer timer.
@@ -1795,6 +2007,59 @@ void cancel(wmWindowManager &wm, const Scene &scene, const Object &rig)
 }
 
 #ifdef WITH_GTESTS
+Vector<std::shared_ptr<const Bundle>> evaluate_sequence_for_test(
+    Main &bmain,
+    Scene &scene,
+    ViewLayer &view_layer,
+    Object &rig,
+    const Span<Object *> meshes,
+    const Settings &settings,
+    const Span<EvaluationRequestForTest> requests,
+    std::string &r_error)
+{
+  State state;
+  state.source_main = &bmain;
+  state.source_scene = &scene;
+  state.source_view_layer = &view_layer;
+  state.source_rig = &rig;
+  state.rig_uid = uid(rig.id);
+  state.source_meshes.extend(meshes);
+  state.modes = relative_mode | timeline_mode;
+  std::unique_ptr<Capsule> capsule = capsule_create(state);
+  if (!capsule) {
+    r_error = std::move(state.message);
+    return {};
+  }
+  Vector<std::shared_ptr<const Bundle>> results;
+  for (const EvaluationRequestForTest &request : requests) {
+    Work work;
+    work.settings = settings;
+    work.settings.before = math::clamp(settings.before, 0, sample_limit / 2);
+    work.settings.after = math::clamp(settings.after, 0, sample_limit / 2);
+    work.settings.step = math::max(settings.step, 1);
+    work.frame = request.frame;
+    work.frame_start = scene.r.sfra;
+    work.frame_end = scene.r.efra;
+    work.frame_cache_capacity = frame_cache_limit;
+    work.generation = results.size() + 1;
+    work.epoch = 1;
+    work.geometry_revision = request.geometry_revision;
+    work.preview = request.preview;
+    work.frames = sample_frames_select(
+        state.keyed_frames.frames, work.settings, work.frame, scene.r.sfra, scene.r.efra);
+    work.timeline_frames = sample_frames_select_timeline(
+        state.keyed_frames.frames, work.settings, work.frame, scene.r.sfra, scene.r.efra);
+    wmJobWorkerStatus worker_status{};
+    auto result = evaluate(*capsule, work, worker_status);
+    if (!result) {
+      r_error = "Private geometry evaluation failed";
+      return {};
+    }
+    results.append(std::move(result));
+  }
+  return results;
+}
+
 bool source_membership_update_for_test(const Scene &scene,
                                        ViewLayer *&source_view_layer,
                                        Vector<Object *> &source_meshes,
@@ -1848,6 +2113,8 @@ std::shared_ptr<const Bundle> evaluate_for_test(Main &bmain,
   work.settings.after = math::clamp(settings.after, 0, sample_limit / 2);
   work.settings.step = math::max(settings.step, 1);
   work.frame = frame;
+  work.frame_start = scene.r.sfra;
+  work.frame_end = scene.r.efra;
   work.generation = 1;
   work.epoch = 1;
   work.preview = std::move(preview);

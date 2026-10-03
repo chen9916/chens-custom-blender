@@ -5,6 +5,8 @@
 #include "anim_mesh_onion_skin_frames.hh"
 
 #include <array>
+#include <cmath>
+#include <limits>
 
 #include "ANIM_action.hh"
 #include "ANIM_keyframing.hh"
@@ -283,6 +285,139 @@ TEST_F(MeshOnionFramesTest, KeyedLoopFillsUnevenQuotasAfterSharedNearestKeys)
   const std::array frames = {10.0f, 2.0f, 3.0f, 4.0f, 5.0f};
   const std::array offsets = {-1.0f, 1.0f, 2.0f, 3.0f, 4.0f};
   expect_samples(sample_frames_select(keys, settings, 1.0f, 1, 10), frames, offsets);
+}
+
+TEST_F(MeshOnionFramesTest, TimelineStepGridRetainsIdentityAndCenter)
+{
+  Settings settings;
+  settings.step = 2;
+  const std::array frames = {5.0f, 7.0f, 9.0f, 11.0f, 13.0f, 15.0f, 17.0f};
+  const std::array offsets = {-7.0f, -5.0f, -3.0f, -1.0f, 1.0f, 3.0f, 5.0f};
+  const Vector<SampleFrame> first = sample_frames_select_timeline({}, settings, 12.0f, 1, 22);
+  expect_samples(first, frames, offsets);
+  for (const int i : first.index_range()) {
+    EXPECT_FLOAT_EQ(first[i].rank, float(i + 2));
+  }
+  const std::array next_frames = {7.0f, 9.0f, 11.0f, 13.0f, 15.0f, 17.0f, 19.0f};
+  const std::array next_offsets = {-6.0f, -4.0f, -2.0f, 0.0f, 2.0f, 4.0f, 6.0f};
+  const Vector<SampleFrame> next = sample_frames_select_timeline({}, settings, 13.0f, 1, 22);
+  expect_samples(next, next_frames, next_offsets);
+  for (int i = 1; i < first.size(); i++) {
+    EXPECT_FLOAT_EQ(first[i].frame, next[i - 1].frame);
+    EXPECT_FLOAT_EQ(first[i].rank, next[i - 1].rank);
+    EXPECT_FLOAT_EQ(first[i].offset - 1.0f, next[i - 1].offset);
+  }
+}
+
+TEST_F(MeshOnionFramesTest, TimelineFractionalMotionDoesNotResamplePoses)
+{
+  Settings settings;
+  settings.step = 2;
+  const Vector<SampleFrame> first = sample_frames_select_timeline({}, settings, 12.0f, 1, 22);
+  const Vector<SampleFrame> next = sample_frames_select_timeline({}, settings, 12.25f, 1, 22);
+  ASSERT_EQ(first.size(), next.size());
+  for (const int i : first.index_range()) {
+    EXPECT_FLOAT_EQ(first[i].frame, next[i].frame);
+    EXPECT_FLOAT_EQ(first[i].rank, next[i].rank);
+    EXPECT_FLOAT_EQ(first[i].offset - 0.25f, next[i].offset);
+  }
+  settings.before = settings.after = 4;
+  EXPECT_EQ(sample_frames_select_timeline({}, settings, 12.25f, 1, 22).size(), 11);
+}
+
+TEST_F(MeshOnionFramesTest, TimelineIrregularAuthoredKeysUseStableIndices)
+{
+  Settings settings;
+  settings.keyed_frames_only = true;
+  settings.step = 100;
+  const std::array keys = {1.0f, 4.25f, 5.0f, 6.75f, 10.0f, 12.0f, 20.0f, 30.0f};
+  const std::array frames = {1.0f, 4.25f, 5.0f, 6.75f, 10.0f, 12.0f};
+  const std::array offsets = {-5.5f, -2.25f, -1.5f, 0.25f, 3.5f, 5.5f};
+  const Vector<SampleFrame> first = sample_frames_select_timeline(keys, settings, 6.5f, 1, 22);
+  expect_samples(first, frames, offsets);
+  const Vector<SampleFrame> next = sample_frames_select_timeline(keys, settings, 6.75f, 1, 22);
+  ASSERT_EQ(next.size(), 7);
+  for (const int i : first.index_range()) {
+    EXPECT_FLOAT_EQ(first[i].frame, next[i].frame);
+    EXPECT_FLOAT_EQ(first[i].rank, float(i));
+    EXPECT_FLOAT_EQ(first[i].rank, next[i].rank);
+  }
+  EXPECT_FLOAT_EQ(next[3].frame, 6.75f);
+  EXPECT_FLOAT_EQ(next[3].offset, 0.0f);
+  EXPECT_TRUE(sample_frames_select_timeline({}, settings, 6.5f, 1, 22).is_empty());
+}
+
+TEST_F(MeshOnionFramesTest, TimelineLoopKeepsCanonicalGridAcrossBothDirections)
+{
+  Settings settings;
+  settings.step = 2;
+  settings.loop_frame_range = true;
+  /* The inclusive five-frame loop has a shortened last cell: 1, 3, 5, then 1 again. */
+  const std::array end_frames = {5.0f, 1.0f, 3.0f};
+  const std::array end_offsets = {-0.75f, 0.25f, 2.25f};
+  expect_samples(
+      sample_frames_select_timeline({}, settings, 5.75f, 1, 5), end_frames, end_offsets);
+  const std::array start_frames = {5.0f, 1.0f, 3.0f};
+  const std::array start_offsets = {-1.25f, -0.25f, 1.75f};
+  const Vector<SampleFrame> start = sample_frames_select_timeline({}, settings, 1.25f, 1, 5);
+  expect_samples(start, start_frames, start_offsets);
+  EXPECT_FLOAT_EQ(start[0].rank, -1.0f);
+  EXPECT_FLOAT_EQ(start[1].rank, 0.0f);
+  EXPECT_FLOAT_EQ(start[2].rank, 1.0f);
+  expect_samples(
+      sample_frames_select_timeline({}, settings, 6.25f, 1, 5), start_frames, start_offsets);
+  expect_samples(
+      sample_frames_select_timeline({}, settings, -3.75f, 1, 5), start_frames, start_offsets);
+  const std::array at_start_frames = {5.0f, 1.0f, 3.0f};
+  const std::array at_start_offsets = {-1.0f, 0.0f, 2.0f};
+  expect_samples(
+      sample_frames_select_timeline({}, settings, 1.0f, 1, 5), at_start_frames, at_start_offsets);
+}
+
+TEST_F(MeshOnionFramesTest, TimelineKeyedLoopRanksIncludeOccurrenceLap)
+{
+  Settings settings;
+  settings.keyed_frames_only = true;
+  settings.loop_frame_range = true;
+  const std::array keys = {-1.0f, 1.0f, 4.25f, 8.0f, 11.0f};
+  const std::array frames = {8.0f, 1.0f, 4.25f};
+  const std::array offsets = {-3.5f, -0.5f, 2.75f};
+  const Vector<SampleFrame> samples = sample_frames_select_timeline(keys, settings, 1.5f, 1, 10);
+  expect_samples(samples, frames, offsets);
+  ASSERT_EQ(samples.size(), 3);
+  EXPECT_FLOAT_EQ(samples[0].rank, -1.0f);
+  EXPECT_FLOAT_EQ(samples[1].rank, 0.0f);
+  EXPECT_FLOAT_EQ(samples[2].rank, 1.0f);
+}
+
+TEST_F(MeshOnionFramesTest, TimelineShortLoopsKeepCenterAndEnabledSide)
+{
+  Settings settings;
+  settings.loop_frame_range = true;
+  const std::array single_frame = {1.0f};
+  const std::array single_offset = {0.0f};
+  expect_samples(
+      sample_frames_select_timeline({}, settings, 1.0f, 1, 1), single_frame, single_offset);
+  settings.before = 0;
+  settings.after = 1;
+  const std::array frames = {1.0f, 2.0f, 3.0f};
+  const std::array offsets = {-0.25f, 0.75f, 1.75f};
+  expect_samples(sample_frames_select_timeline({}, settings, 1.25f, 1, 3), frames, offsets);
+  settings.before = 1;
+  settings.after = 0;
+  const std::array past_frames = {3.0f, 1.0f, 2.0f};
+  const std::array past_offsets = {-2.75f, -1.75f, -0.75f};
+  expect_samples(
+      sample_frames_select_timeline({}, settings, 2.75f, 1, 3), past_frames, past_offsets);
+  for (const SampleFrame &sample : sample_frames_select_timeline({}, settings, 1.5f, 1, 3)) {
+    EXPECT_TRUE(std::isfinite(sample.frame));
+    EXPECT_TRUE(std::isfinite(sample.offset));
+    EXPECT_TRUE(std::isfinite(sample.rank));
+  }
+  EXPECT_TRUE(sample_frames_select_timeline({}, settings, 1.0f, 3, 1).is_empty());
+  EXPECT_TRUE(
+      sample_frames_select_timeline({}, settings, std::numeric_limits<float>::infinity(), 1, 3)
+          .is_empty());
 }
 
 }  // namespace blender::ed::mesh_onion_skin::tests

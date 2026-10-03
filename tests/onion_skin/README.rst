@@ -355,21 +355,32 @@ Screen-space ghost offsets
 
 The Pose Mode onion-skin popover has a viewport-local ``Screen Space Offset``
 toggle, a separate ``Reverse Direction`` toggle, and ``Pixels per Frame``.
-By default, past ghosts move left and future ghosts move right. Reversing swaps
+By default, past ghosts appear left and future ghosts appear right. Reversing swaps
 their screen sides while retaining the past/future colors. Spacing defaults to
 24 pixels per frame and uses the actual temporal distance, including sparse keys
 and inclusive scene-range looping.
 
 Translation occurs after projection, so camera rotation and zoom do not change
-the pixel spacing. Mesh snapshots, animation and the shared evaluation cache
-remain unchanged. Displayed displacement follows the current playhead during
-playback, including held asynchronous bundles; current-frame duplicates are
-suppressed until the next bundle arrives. Disabling the toggle restores the
-ordinary overlay. These appearance controls are stored independently per view.
+the pixel spacing. Offset mode uses a rolling timeline anchored to scene Start,
+or to authored key times with Keyframes Only. A sampled pose keeps its identity
+as it moves from future through the current model into the past. The center pose
+is retained, colors blend across the center, and outer guard poses fade at the
+window edges. New publications therefore do not reset poses into fixed slots.
+
+The private worker caches exact native evaluations, shares immutable geometry
+between ordinary and timeline views, and evaluates only missing frame poses.
+Cache storage is bounded to 32 frames and 256 MiB; pose edits invalidate the
+geometry revision. Display-only interpolation and native redraws smooth screen
+motion between playback ticks without changing scene time or evaluating rigs
+inside drawing. At a matching evaluated frame, the crossing pose uses the native
+mesh and object matrix. The live model retains Blender's normal playback cadence.
+Disabling offset restores ordinary centered sampling. Appearance controls remain
+independent per view, including when both modes are visible together.
 
 The focused GUI check uses the disposable Mixamo fixture, observes native draw
-constants and framebuffer colors, and checks reversal, spacing, playback and
-loop boundaries without modifying the original asset::
+constants and framebuffer colors. It follows the same cached poses across
+publications, fractional movement, center crossings, forward/reverse playback
+and loop boundaries, and checks mixed viewport modes without saving the asset::
 
   blender.exe --factory-startup --disable-autoexec mixamo_running.blend --python tests/onion_skin/run_screen_offset_test.py -- --output <directory> --log <redirected-stdout.log>
 

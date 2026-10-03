@@ -2,10 +2,12 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""Observe native screen offsets and playback using the disposable Mixamo fixture.
+"""Observe stable native ghost identities, rendered offsets and native playback.
 
 Python changes viewport controls and reads native draw diagnostics/pixels only.
 It neither evaluates ghost geometry nor draws ghosts, and never saves the asset.
+Playback phases deliberately do not request redraws from Python: fractional
+presentation must be driven by Blender's own viewport timer.
 """
 
 import argparse
@@ -35,11 +37,16 @@ scene = bpy.context.scene
 rig = bpy.data.objects['Armature']
 assert rig.mode == 'POSE'
 bpy.context.preferences.filepaths.use_auto_save_temporary_files = False
-scene.frame_set(12)
+scene.frame_start, scene.frame_end = 1, 22
+scene.frame_set(13)
 scene.render.fps = 12
+scene.render.fps_base = 1.0
 overlay.show_mesh_onion_skin = True
 overlay.mesh_onion_skin_before = overlay.mesh_onion_skin_after = 2
 overlay.mesh_onion_skin_step = 2
+overlay.mesh_onion_skin_keyed_frames_only = False
+overlay.mesh_onion_skin_loop_frame_range = False
+overlay.mesh_onion_skin_distance_fade = False
 overlay.mesh_onion_skin_in_front = True
 overlay.mesh_onion_skin_opacity = 0.7
 overlay.mesh_onion_skin_screen_offset = True
@@ -67,9 +74,10 @@ def source_state():
 
 original = source_state()
 report = {'build_hash': bpy.app.build_hash.decode(), 'checks': [], 'observations': {},
-          'scope': 'native screen pixels, reversal, spacing/zoom, playhead scrolling, playback and loop boundary'}
-state = {'phase': 'normal', 'ready': time.perf_counter() + 1.0,
-         'deadline': time.perf_counter() + 8.0, 'pixels': {}}
+          'scope': 'native stable poses, center alignment, rendered sides, fractional scrolling, '
+                   'forward/backward native playback and mixed viewport sampling'}
+started = time.perf_counter()
+state = {'phase': 'normal', 'ready': started + 1.0, 'deadline': started + 8.0, 'pixels': {}}
 
 
 def check(label, condition):
@@ -78,8 +86,8 @@ def check(label, condition):
 
 
 def transition(phase, delay=0.35):
-    state.update(phase=phase, ready=time.perf_counter() + delay,
-                 deadline=time.perf_counter() + 5.0)
+    now = time.perf_counter()
+    state.update(phase=phase, ready=now + delay, deadline=now + 8.0)
     print('ONION_SCREEN_PHASE', phase, flush=True)
 
 
@@ -90,14 +98,27 @@ def rows():
     result = []
     for match in re.finditer(r'^mesh_onion_skin_screen (.+)$', text, re.MULTILINE):
         data = dict(re.findall(r'(\w+)=([^\s]+)', match.group(1)))
-        for key in ('frames', 'offsets', 'pixels'):
+        if not {'native_frame', 'alpha', 'ranks', 'payloads', 'submitted'} <= data.keys():
+            continue
+        for key in ('frames', 'offsets', 'pixels', 'alpha', 'ranks'):
             data[key] = [float(value) for value in data[key].split(',')]
-        for key in ('generation', 'enabled', 'reverse'):
+        for key in ('payloads', 'submitted'):
+            data[key] = [int(value) for value in data[key].split(',')]
+        for key in ('generation', 'epoch', 'enabled', 'reverse', 'vbo_uploads', 'batch_creates'):
             data[key] = int(data[key])
-        for key in ('playhead', 'spacing'):
+        for key in ('playhead', 'native_frame', 'center', 'spacing'):
             data[key] = float(data[key])
-        result.append(data)
+        if all(len(data[key]) == len(data['frames']) for key in
+               ('offsets', 'pixels', 'alpha', 'ranks', 'payloads', 'submitted')):
+            result.append(data)
     return result
+
+
+def samples(row):
+    return {frame: {'offset': row['offsets'][i], 'pixel': row['pixels'][i],
+                    'alpha': row['alpha'][i], 'rank': row['ranks'][i],
+                    'payload': row['payloads'][i], 'submitted': row['submitted'][i]}
+            for i, frame in enumerate(row['frames'])}
 
 
 def observe_pixels():
@@ -120,12 +141,19 @@ def observe_pixels():
 handler = bpy.types.SpaceView3D.draw_handler_add(observe_pixels, (), 'WINDOW', 'POST_PIXEL')
 
 
-def finish():
+def cancel_playback():
     if window.screen.is_animation_playing:
         with bpy.context.temp_override(window=window, area=area, region=region):
             bpy.ops.screen.animation_cancel(restore_frame=False)
-    overlay.show_mesh_onion_skin = False
+
+
+def finish():
+    cancel_playback()
+    for viewport in window.screen.areas:
+        if viewport.type == 'VIEW_3D':
+            viewport.spaces.active.overlay.show_mesh_onion_skin = False
     bpy.types.SpaceView3D.draw_handler_remove(handler, 'WINDOW')
+    report['elapsed_seconds'] = time.perf_counter() - started
     report['passed'] = bool(report['checks']) and all(c['passed'] for c in report['checks']) and 'error' not in report
     (args.output / 'result.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print('ONION_SCREEN_RESULT', json.dumps(report), flush=True)
@@ -133,95 +161,211 @@ def finish():
     return None
 
 
+def pixel_law(row):
+    sign = -1 if row['reverse'] else 1
+    spacing = row['spacing'] if row['enabled'] else 0.0
+    return all(abs(pixel - offset * spacing * sign) < 2e-4
+               for pixel, offset in zip(row['pixels'], row['offsets']))
+
+
+def center_visible(row, frame):
+    value = samples(row).get(float(frame))
+    return value is not None and abs(value['offset']) < 1e-5 and value['alpha'] > 0 and value['submitted']
+
+
+def same_payloads(left, right):
+    return {frame: value['payload'] for frame, value in samples(left).items()} == {
+        frame: value['payload'] for frame, value in samples(right).items()}
+
+
+def playback_observation(candidates, direction):
+    phase = state['phase']
+    valid = [row for row in candidates if row['enabled'] and not row['reverse']
+             and abs(row['spacing'] - 43.5) < 1e-5]
+    check(phase + ' receives native presentation draws', len(valid) >= 20)
+    check(phase + ' uses signed screen pixels throughout', all(pixel_law(row) for row in valid))
+    check(phase + ' displays subframe motion between animation ticks', sum(
+        abs(row['playhead'] - row['native_frame']) > 1e-3 for row in valid) >= 8)
+    held = {}
+    for row in valid:
+        held.setdefault(row['native_frame'], set()).add(round(row['playhead'], 4))
+    check(phase + ' native redraws move ghosts between unchanged scene frames',
+          sum(len(values) > 1 for values in held.values()) >= 4)
+    check(phase + ' keeps boundary guards invisible', any(
+        alpha == 0 and not submitted for row in valid
+        for alpha, submitted in zip(row['alpha'], row['submitted'])))
+    check(phase + ' fades boundary poses continuously', any(
+        1e-3 < alpha < 0.699 for row in valid for alpha in row['alpha']))
+    period = scene.frame_end - scene.frame_start + 1
+    check(phase + ' crosses the inclusive scene loop boundary', any(
+        abs(current['native_frame'] - previous['native_frame']) > period / 2
+        for previous, current in zip(valid, valid[1:])))
+    comparisons = publications = movements = centers = 0
+    identities_ok = offsets_ok = pixels_ok = alpha_ok = direction_ok = True
+    visits = {}
+    for row in valid:
+        for frame, value in samples(row).items():
+            if value['alpha'] > 0 and value['submitted']:
+                position = 'future' if value['offset'] > 0.3 else 'past' if value['offset'] < -0.3 else 'center'
+                visits.setdefault(frame, set()).add(position)
+                centers += position == 'center'
+    for previous, current in zip(valid, valid[1:]):
+        delta = current['playhead'] - previous['playhead']
+        delta -= round(delta / period) * period
+        if abs(delta) > 3 or previous['epoch'] != current['epoch']:
+            continue
+        if abs(delta) > 1e-4:
+            direction_ok &= direction * delta >= -1e-3
+        old = samples(previous)
+        new = samples(current)
+        for frame in old.keys() & new.keys():
+            left, right = old[frame], new[frame]
+            identities_ok &= left['payload'] == right['payload']
+            # A canonical pose's distant alias can change laps outside the visible window.
+            if abs(right['offset'] - left['offset']) > period / 2:
+                continue
+            comparisons += 1
+            publications += previous['generation'] != current['generation']
+            offsets_ok &= abs(right['offset'] - left['offset'] + delta) < 2e-4
+            pixels_ok &= abs(right['pixel'] - left['pixel'] + delta * 43.5) < 0.01
+            # Smoothstep's maximum derivative is 1.5, with configured alpha 0.7.
+            alpha_ok &= abs(right['alpha'] - left['alpha']) <= 1.05 * abs(right['rank'] - left['rank']) + 0.002
+            movements += abs(delta) > 1e-4 and left['alpha'] > 0 and right['alpha'] > 0
+    check(phase + ' retains fixed-pose payloads across publications', identities_ok and publications >= 6)
+    check(phase + ' scrolls fixed poses continuously across publications',
+          offsets_ok and pixels_ok and comparisons >= 60 and movements >= 20)
+    check(phase + ' pixel motion follows playback direction', direction_ok)
+    check(phase + ' has no abrupt opacity changes for retained poses', alpha_ok)
+    check(phase + ' retains poses through future-center-past alignment',
+          centers > 0 and any({'future', 'center', 'past'} <= positions for positions in visits.values()))
+    return {'rows': len(valid), 'native_frames': len(held),
+            'frames_with_fractional_redraws': sum(len(values) > 1 for values in held.values()),
+            'shared_pose_comparisons': comparisons, 'cross_publication_comparisons': publications,
+            'visible_pose_movements': movements, 'near_center_draws': centers,
+            'first': valid[0], 'last': valid[-1]}
+
+
+def start_playback(direction):
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.screen.animation_play(reverse=direction < 0)
+    transition('forward' if direction > 0 else 'backward', delay=2.2)
+
+
 def tick():
+    global region
     try:
-        area.tag_redraw()
         now = time.perf_counter()
+        assert now - started < 30.0, 'Focused native scrolling test exceeded 30 seconds'
+        phase = state['phase']
+        # Playback must supply its own 60 Hz presentation redraws.
+        if phase not in ('forward', 'backward'):
+            area.tag_redraw()
         if now < state['ready']:
             return 0.04
         candidates = rows()
-        phase = state['phase']
-        if phase == 'playback':
-            frames = {r['playhead'] for r in candidates}
-            if len(frames) < 3 and now < state['deadline']:
-                return 0.04
-            check('playback produces advancing native ghost draws', len(frames) >= 3)
-            check('native worker remains active during playback', bpy.app.is_job_running('MESH_ONION_SKIN'))
-            check('playback screen spacing follows displayed frame distance', all(
-                abs(p - d * 43.5) < 1e-4 for r in candidates for p, d in zip(r['pixels'], r['offsets'])))
-            with bpy.context.temp_override(window=window, area=area, region=region):
-                bpy.ops.screen.animation_cancel(restore_frame=False)
-            scene.frame_set(1)
-            overlay.mesh_onion_skin_loop_frame_range = True
-            transition('loop_start')
+        if phase in ('forward', 'backward'):
+            report['observations'][phase] = playback_observation(candidates, 1 if phase == 'forward' else -1)
+            cancel_playback()
+            scene.frame_set(13)
+            if phase == 'forward':
+                transition('backward_ready')
+            else:
+                with bpy.context.temp_override(window=window, area=area):
+                    assert bpy.ops.screen.area_split(direction='VERTICAL', factor=0.5) == {'FINISHED'}
+                viewports = [viewport for viewport in window.screen.areas if viewport.type == 'VIEW_3D']
+                assert len(viewports) >= 2
+                second = next(viewport for viewport in viewports if viewport != area)
+                second.spaces.active.overlay.show_mesh_onion_skin = True
+                second.spaces.active.overlay.mesh_onion_skin_screen_offset = False
+                region = next(r for r in area.regions if r.type == 'WINDOW')
+                state['second'] = second
+                transition('mixed')
             return 0.04
-        expected_frames = {'normal': [8, 10, 14, 16], 'reverse': [8, 10, 14, 16],
-                           'spacing': [8, 10, 14, 16], 'zoom': [8, 10, 14, 16],
-                           'keyed': [10, 11, 13, 14], 'advance': [11, 12, 14, 15],
-                           'loop_start': [21, 22, 2, 3], 'loop_end': [20, 21, 1, 2],
-                           'disabled': [20, 21, 1, 2]}[phase]
-        matching = [r for r in candidates if r['playhead'] == scene.frame_current
-                    and r['frames'] == expected_frames and
-                    r['enabled'] == int(overlay.mesh_onion_skin_screen_offset) and
-                    r['reverse'] == int(overlay.mesh_onion_skin_screen_offset_reverse) and
-                    r['spacing'] == overlay.mesh_onion_skin_screen_offset_spacing]
+        target = scene.frame_current + scene.frame_subframe
+        matching = [row for row in candidates if abs(row['native_frame'] - target) < 1e-5
+                    and abs(row['playhead'] - target) < 1e-5
+                    and row['enabled'] == int(overlay.mesh_onion_skin_screen_offset)
+                    and row['reverse'] == int(overlay.mesh_onion_skin_screen_offset_reverse)
+                    and abs(row['spacing'] - overlay.mesh_onion_skin_screen_offset_spacing) < 1e-5]
+        if phase == 'mixed':
+            state['second'].tag_redraw()
+            matching = [row for row in matching if center_visible(row, 13)]
+            relative = [row for row in candidates if not row['enabled'] and row['native_frame'] == 13
+                        and row['frames'] == [9, 11, 15, 17]]
+            if not matching or not relative:
+                assert now < state['deadline'], 'Mixed viewports did not publish both sampling modes'
+                return 0.04
+            check('mixed viewport retains original relative cohort', all(pixel == 0 for pixel in relative[-1]['pixels']))
+            check('mixed timeline viewport retains aligned center pose', center_visible(matching[-1], 13))
+            report['observations']['mixed'] = {'timeline': matching[-1], 'relative': relative[-1]}
+            check('source animation and ID users remain unchanged', source_state() == original)
+            return finish()
+        if phase == 'keyed':
+            matching = [row for row in matching if center_visible(row, 13) and 12 in row['frames']]
+        elif phase in ('forward_ready', 'backward_ready'):
+            matching = [row for row in matching if abs(row['center'] - target) < 1e-5]
+        elif phase == 'fractional':
+            matching = [row for row in matching if 13 in row['frames']]
+        else:
+            matching = [row for row in matching if center_visible(row, 13)]
         if not matching:
-            assert now < state['deadline'], 'No matching native screen-offset draw: ' + phase
+            assert now < state['deadline'], 'No matching native stable-timeline draw: ' + phase
             return 0.04
         row = matching[-1]
-        sign = -1 if overlay.mesh_onion_skin_screen_offset_reverse else 1
-        spacing = overlay.mesh_onion_skin_screen_offset_spacing if row['enabled'] else 0
-        check(phase + ' submits correct native signed pixel offsets', all(
-            abs(p - d * spacing * sign) < 1e-4 for p, d in zip(row['pixels'], row['offsets'])))
-        report['observations'][phase] = row
         if phase in ('normal', 'reverse'):
             image = state['pixels'].get(phase)
             if image is None:
                 assert now < state['deadline'], 'Colored native ghosts were not observed: ' + phase
                 return 0.04
-            check(phase + ' rendered past/future ghosts on correct screen sides',
+            check(phase + ' renders past/future ghosts on correct screen sides',
                   image['past_x'] < image['future_x'] if phase == 'normal' else image['past_x'] > image['future_x'])
-            report['observations'][phase]['viewport_pixels'] = image
+            row['viewport_pixels'] = image
             with bpy.context.temp_override(window=window, area=area, region=region):
                 bpy.ops.screen.screenshot(filepath=str(args.output / (phase + '.png')))
+        check(phase + ' submits correct signed native pixels', pixel_law(row))
+        report['observations'][phase] = row
         if phase == 'normal':
+            check('timeline retains the aligned zero-offset current pose', center_visible(row, 13))
+            check('timeline retains transparent entry and exit guards', sum(
+                alpha == 0 and not submitted for alpha, submitted in zip(row['alpha'], row['submitted'])) >= 2)
             overlay.mesh_onion_skin_screen_offset_reverse = True
             transition('reverse')
         elif phase == 'reverse':
-            check('side switch reuses the cached geometry generation', row['generation'] == report['observations']['normal']['generation'])
+            initial = report['observations']['normal']
+            check('Reverse Direction reuses immutable geometry', same_payloads(initial, row))
+            check('Reverse Direction does not upload geometry', row['vbo_uploads'] == initial['vbo_uploads'])
             overlay.mesh_onion_skin_screen_offset_reverse = False
             overlay.mesh_onion_skin_screen_offset_spacing = 43.5
             transition('spacing')
         elif phase == 'spacing':
-            check('spacing reuses cached geometry', row['generation'] == report['observations']['normal']['generation'])
+            initial = report['observations']['normal']
+            check('spacing reuses immutable geometry', same_payloads(initial, row))
+            check('spacing does not upload geometry', row['vbo_uploads'] == initial['vbo_uploads'])
             view.region_3d.view_distance *= 1.3
             transition('zoom')
         elif phase == 'zoom':
             check('zoom preserves pixel displacement', row['pixels'] == report['observations']['spacing']['pixels'])
+            scene.frame_set(13, subframe=0.25)
+            transition('fractional')
+        elif phase == 'fractional':
+            pose = samples(row)[13]
+            check('fractional advance retains the same frame13 pose',
+                  pose['payload'] == samples(report['observations']['spacing'])[13]['payload'])
+            check('fractional advance scrolls frame13 by a quarter-frame',
+                  abs(pose['offset'] + 0.25) < 1e-5 and abs(pose['pixel'] + 0.25 * 43.5) < 2e-4)
+            scene.frame_set(13)
             overlay.mesh_onion_skin_keyed_frames_only = True
             transition('keyed')
         elif phase == 'keyed':
-            scene.frame_set(13)
-            transition('advance')
-        elif phase == 'advance':
-            prior = report['observations']['keyed']
-            check('same future pose scrolls left as playhead advances',
-                  abs(row['pixels'][row['frames'].index(14)] - prior['pixels'][prior['frames'].index(14)] + 43.5) < 1e-4)
-            with bpy.context.temp_override(window=window, area=area, region=region):
-                bpy.ops.screen.animation_play()
-            transition('playback', delay=0.7)
-        elif phase == 'loop_start':
-            check('looped past ghosts remain on left', row['pixels'][0] < 0 and row['pixels'][1] < 0)
-            scene.frame_set(22)
-            transition('loop_end')
-        elif phase == 'loop_end':
-            check('looped future ghosts remain on right', row['pixels'][2] > 0 and row['pixels'][3] > 0)
-            overlay.mesh_onion_skin_screen_offset = False
-            transition('disabled')
-        else:
-            check('disabling offset restores zero screen displacement', all(p == 0 for p in row['pixels']))
-            check('source animation and ID users remain unchanged', source_state() == original)
-            return finish()
+            check('keyed-only timeline retains aligned current authored pose', center_visible(row, 13))
+            overlay.mesh_onion_skin_keyed_frames_only = False
+            overlay.mesh_onion_skin_loop_frame_range = True
+            scene.frame_set(8)
+            transition('forward_ready')
+        elif phase == 'forward_ready':
+            start_playback(1)
+        elif phase == 'backward_ready':
+            start_playback(-1)
         return 0.04
     except Exception:
         report['error'] = traceback.format_exc()

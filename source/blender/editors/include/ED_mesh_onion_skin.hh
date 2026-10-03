@@ -38,25 +38,37 @@ struct Settings {
   bool operator==(const Settings &) const = default;
 };
 
+enum class SamplingMode : uint8_t { Relative, Timeline };
+
+/** Owned immutable geometry, shared by view policies and overlapping timeline windows. */
+struct SampleGeometry {
+  float4x4 object_to_world;
+  Array<float3> positions;
+  Array<int3> triangles;
+};
+
 struct Sample {
   SessionUID object_uid;
   float frame;
   /** Signed distance from the playhead, including travel across a loop boundary. */
   float temporal_offset;
-  float4x4 object_to_world;
-  Array<float3> positions;
-  Array<int3> triangles;
+  /** Stable grid/key index, including the selected lap when looping. */
+  float rank = 0.0f;
+  std::shared_ptr<const SampleGeometry> geometry;
 };
 
 /** Immutable, coherent result. All samples belong to the same edit revision. */
 struct Bundle {
   uint64_t generation = 0;
   uint64_t epoch = 0;
+  uint64_t geometry_revision = 0;
+  float frame = 0.0f;
   double input_time = 0.0;
   double staging_seconds = 0.0;
   double evaluation_seconds = 0.0;
   size_t bytes = 0;
   Vector<Sample> samples;
+  Vector<Sample> timeline_samples;
 };
 
 /** Main-thread only. Queues work; never evaluates geometry in the draw caller. */
@@ -64,7 +76,8 @@ void request(bContext &C,
              Depsgraph &depsgraph,
              Object &rig,
              Span<Object *> meshes,
-             const Settings &settings);
+             const Settings &settings,
+             SamplingMode mode = SamplingMode::Relative);
 std::shared_ptr<const Bundle> get(const Scene &scene, const Object &rig);
 std::string status(const Scene &scene, const Object &rig);
 bool is_requested(const Scene &scene, const Object &rig);
