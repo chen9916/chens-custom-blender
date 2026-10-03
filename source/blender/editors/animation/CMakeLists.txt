@@ -27,6 +27,7 @@ set(SRC
   anim_markers.cc
   anim_motion_paths.cc
   anim_mesh_onion_skin.cc
+  anim_mesh_onion_skin_frames.cc
   anim_mesh_onion_skin_preview.cc
   anim_ops.cc
   drivers.cc
@@ -42,6 +43,7 @@ set(SRC
   world_space_copy.cc
 
   anim_intern.hh
+  anim_mesh_onion_skin_frames.hh
   keyframes_general_intern.hh
 )
 
@@ -73,6 +75,7 @@ if(WITH_GTESTS)
   target_compile_definitions(bf_editor_animation PRIVATE WITH_GTESTS)
   set(TEST_SRC
     anim_mesh_onion_skin_test.cc
+    anim_mesh_onion_skin_frames_test.cc
     anim_mesh_onion_skin_preview_test.cc
     anim_draw_test.cc
     anim_filter_test.cc

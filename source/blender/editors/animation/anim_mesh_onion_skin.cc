@@ -18,6 +18,7 @@
 #include "BLI_map.hh"
 #include "BLI_math_base.hh"
 #include "BLI_set.hh"
+#include "BLI_string.hh"
 #include "BLI_task.hh"
 #include "BLI_time.hh"
 #include "BLI_utildefines.hh"
@@ -40,6 +41,7 @@
 #include "BKE_armature.hh"
 #include "BKE_collection.hh"
 #include "BKE_context.hh"
+#include "BKE_fcurve_driver.h"
 #include "BKE_global.hh"
 #include "BKE_idprop.hh"
 #include "BKE_layer.hh"
@@ -62,7 +64,13 @@
 #include "ED_mesh_onion_skin.hh"
 #include "ED_mesh_onion_skin_preview.hh"
 
+#include "RNA_access.hh"
+#include "RNA_path.hh"
+#include "RNA_prototypes.hh"
+
 #include "ANIM_action_legacy.hh"
+
+#include "anim_mesh_onion_skin_frames.hh"
 
 #ifdef WITH_GTESTS
 #  include "anim_mesh_onion_skin_intern.hh"
@@ -213,6 +221,8 @@ struct Capsule {
   Scene *scene = nullptr;
   Depsgraph *graph = nullptr;
   Map<SessionUID, Object *> objects;
+  Map<SessionUID, bAction *> actions;
+  PreviewApplyState preview_state;
   Vector<std::pair<SessionUID, Object *>> meshes;
   ~Capsule()
   {
@@ -225,6 +235,7 @@ struct Capsule {
 
 struct Work {
   Settings settings;
+  Vector<SampleFrame> frames;
   float frame = 0;
   uint64_t generation = 0;
   uint64_t epoch = 0;
@@ -248,7 +259,10 @@ struct State {
   SessionUID rig_uid;
   std::unique_ptr<Capsule> capsule;
   Settings settings;
+  KeyedFrames keyed_frames;
   float frame = 0;
+  int frame_start = 0;
+  int frame_end = 0;
   uint64_t generation = 1;
   uint64_t staged_generation = 0;
   uint64_t epoch = 1;
@@ -348,19 +362,216 @@ static bool supported_constraint(const bConstraint &constraint)
   }
 }
 
-static bool supported_id(ID &id, std::string &message)
+static bool supported_scene_path(const StringRef path)
 {
-  if (!ELEM(id.id_type(), ID_OB, ID_AR, ID_ME, ID_KE, ID_AC)) {
+  /* Only authored fields copied into the evaluation scene. Avoid silently substituting
+   * defaults for a driver that reads unrelated render, compositor or collection state. */
+  return path.startswith("[") ||
+         ELEM(path,
+              "frame_current",
+              "frame_subframe",
+              "frame_current_final",
+              "frame_start",
+              "frame_end",
+              "render.fps",
+              "render.fps_base") ||
+         path.startswith("unit_settings.");
+}
+
+static bool supported_driver_path(PointerRNA pointer,
+                                  const char *path,
+                                  const Scene &scene,
+                                  std::string &message)
+{
+  Vector<PropertyElemRNA> elements;
+  const bool complete = RNA_path_resolve_elements(&pointer, path, &elements);
+  const auto supported_owner = [&](const ID *owner) {
+    if (owner && !ELEM(owner->id_type(), ID_OB, ID_AR, ID_ME, ID_KE, ID_AC, ID_SCE)) {
+      message =
+          "Onion skin driver reads a display or shading dependency outside the private "
+          "workspace";
+      return false;
+    }
+    if (owner && owner->id_type() == ID_SCE &&
+        (owner != &scene.id || pointer.owner_id != &scene.id))
+    {
+      message = "Onion skin does not support redirected Scene driver inputs";
+      return false;
+    }
+    return true;
+  };
+  /* An invalid driver can legitimately use its native fallback. Audit the resolved prefix too:
+   * a failed trailing lookup must not hide a shading dependency stripped from the capsule. */
+  for (const int index : elements.index_range()) {
+    PropertyElemRNA &element = elements[index];
+    if (!supported_owner(element.ptr.owner_id)) {
+      return false;
+    }
+    if (RNA_property_type(element.prop) == PROP_POINTER &&
+        (!complete || index + 1 < elements.size()))
+    {
+      const PointerRNA next = RNA_property_pointer_get_never_create(&element.ptr, element.prop);
+      if (!supported_owner(next.owner_id)) {
+        return false;
+      }
+      /* RenderSettings and other copied Scene substructures retain their Scene owner. Only an
+       * actual Scene ID pointer is a redirect, including a self reference or Scene reentry. */
+      if (next.owner_id && next.owner_id->id_type() == ID_SCE && RNA_struct_is_ID(next.type)) {
+        message = "Onion skin does not support redirected Scene driver inputs";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static bool supported_driver(const ChannelDriver &driver, const Scene &scene, std::string &message)
+{
+  if (driver.type == DRIVER_TYPE_PYTHON) {
+    FCurve disposable{};
+    disposable.driver = fcurve_copy_driver(&driver);
+    const bool simple = BKE_driver_has_simple_expression(disposable.driver);
+    fcurve_free_driver(&disposable);
+    if (!simple) {
+      message =
+          "Onion skin requires native driver expressions; Python namespace drivers are "
+          "unsupported";
+      return false;
+    }
+  }
+  else if (!ELEM(driver.type,
+                 DRIVER_TYPE_AVERAGE,
+                 DRIVER_TYPE_SUM,
+                 DRIVER_TYPE_MIN,
+                 DRIVER_TYPE_MAX))
+  {
+    message = "Onion skin driver type is unsupported";
+    return false;
+  }
+  for (const DriverVar &variable : driver.variables) {
+    for (int index = 0; index < variable.num_targets; index++) {
+      const DriverTarget &target = variable.targets[index];
+      const StringRef path = target.rna_path ? target.rna_path : "";
+      if (path.startswith("active_material") || path.find(".active_material") != -1 ||
+          path.startswith("material_slots[") || path.find(".material_slots[") != -1 ||
+          path.find(".materials[") != -1 || path.startswith("custom_shape") ||
+          path.find(".custom_shape") != -1 || path.startswith("instance_collection") ||
+          path.find(".instance_collection") != -1 || path.startswith("users_collection") ||
+          path.find(".users_collection") != -1)
+      {
+        message =
+            "Onion skin driver reads a display or shading dependency outside the private "
+            "workspace";
+        return false;
+      }
+      if (target.id && variable.type == DVAR_TYPE_SINGLE_PROP) {
+        PointerRNA pointer = RNA_id_pointer_create(target.id);
+        if (!supported_driver_path(pointer, target.rna_path, scene, message)) {
+          return false;
+        }
+      }
+      if (target.id && target.id->id_type() == ID_SCE &&
+          (target.id != &scene.id || !supported_scene_path(path)))
+      {
+        message =
+            "Onion skin Scene drivers require current-scene custom properties or frame settings";
+        return false;
+      }
+      if (variable.type == DVAR_TYPE_CONTEXT_PROP) {
+        const bool supported = target.context_property == DTAR_CONTEXT_PROPERTY_ACTIVE_SCENE ?
+                                   supported_scene_path(path) :
+                                   target.context_property ==
+                                           DTAR_CONTEXT_PROPERTY_ACTIVE_VIEW_LAYER &&
+                                       (path.startswith("[") || path == "name");
+        if (!supported) {
+          message = "Onion skin context drivers require copied Scene or View Layer properties";
+          return false;
+        }
+        PointerRNA pointer = target.context_property == DTAR_CONTEXT_PROPERTY_ACTIVE_SCENE ?
+                                 RNA_id_pointer_create(const_cast<ID *>(&scene.id)) :
+                                 RNA_pointer_create_discrete(const_cast<ID *>(&scene.id),
+                                                             RNA_ViewLayer,
+                                                             scene.view_layers.first());
+        if (!supported_driver_path(pointer, target.rna_path, scene, message)) {
+          return false;
+        }
+        if (target.context_property == DTAR_CONTEXT_PROPERTY_ACTIVE_VIEW_LAYER) {
+          const ViewLayer *baseline = scene.view_layers.first();
+          for (const ViewLayer &layer : scene.view_layers) {
+            const bool matching = path == "name" ?
+                                      StringRef(layer.name) == baseline->name :
+                                      IDP_EqualsProperties(layer.id_properties,
+                                                           baseline->id_properties) &&
+                                          IDP_EqualsProperties(layer.system_properties,
+                                                               baseline->system_properties);
+            if (!matching) {
+              message = "Onion skin requires matching context driver inputs across View Layers";
+              return false;
+            }
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
+static bool strip_controls_supported(const ListBaseT<NlaStrip> &strips)
+{
+  for (const NlaStrip &strip : strips) {
+    for (const FCurve &curve : strip.fcurves) {
+      if (curve.driver) {
+        return false;
+      }
+    }
+    if (!strip_controls_supported(strip.strips)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool supported_id(ID &id, const Scene &scene, std::string &message)
+{
+  if (!ELEM(id.id_type(), ID_OB, ID_AR, ID_ME, ID_KE, ID_AC, ID_SCE) ||
+      (id.id_type() == ID_SCE && &id != &scene.id))
+  {
     message = "Onion skin dependency type is not supported";
     return false;
   }
   const AnimData *adt = BKE_animdata_from_id(&id);
-  if (adt && (!BLI_listbase_is_empty(&adt->nla_tracks) || adt->tmpact ||
-              !BLI_listbase_is_empty(&adt->drivers) ||
-              adt->act_blendmode != NLASTRIP_MODE_REPLACE || adt->act_influence != 1.0f))
-  {
-    message = "Onion skin currently requires an active Action without NLA or drivers";
-    return false;
+  if (adt) {
+    for (const NlaTrack &track : adt->nla_tracks) {
+      if (!strip_controls_supported(track.strips)) {
+        message = "Onion skin does not support drivers embedded in NLA strip controls";
+        return false;
+      }
+    }
+    for (const FCurve &curve : adt->drivers) {
+      if (curve.rna_path().endswith(".solidify_mode")) {
+        message = "Onion skin requires an unanimated Solidify algorithm";
+        return false;
+      }
+      if (curve.driver && !supported_driver(*curve.driver, scene, message)) {
+        return false;
+      }
+      if (id.id_type() == ID_SCE && !supported_scene_path(curve.rna_path())) {
+        message = "Onion skin Scene animation targets an uncopied setting";
+        return false;
+      }
+    }
+  }
+  if (id.id_type() == ID_AC) {
+    for (const FCurve *curve : animrig::legacy::fcurves_all(id_cast<bAction *>(&id))) {
+      if (curve->rna_path().endswith(".solidify_mode")) {
+        message = "Onion skin requires an unanimated Solidify algorithm";
+        return false;
+      }
+      if (curve->driver) {
+        message = "Onion skin does not support drivers embedded in Action curves";
+        return false;
+      }
+    }
   }
   if (id.id_type() != ID_OB) {
     if (id.id_type() == ID_ME && id_cast<Mesh *>(&id)->runtime->edit_mesh) {
@@ -382,8 +593,17 @@ static bool supported_id(ID &id, std::string &message)
       trailing_subdivision = true;
       continue;
     }
-    if (modifier.type != eModifierType_Armature || trailing_subdivision) {
-      message = "Onion skin supports Armature modifiers followed by terminal Subdivision only";
+    if (!ELEM(
+            modifier.type, eModifierType_Armature, eModifierType_Mirror, eModifierType_Solidify) ||
+        trailing_subdivision)
+    {
+      message = "Onion skin supports Armature, Mirror and Solidify with terminal Subdivision";
+      return false;
+    }
+    if (modifier.type == eModifierType_Solidify &&
+        reinterpret_cast<const SolidifyModifierData &>(modifier).mode != MOD_SOLIDIFY_MODE_EXTRUDE)
+    {
+      message = "Onion skin supports the simple Solidify mode";
       return false;
     }
   }
@@ -433,6 +653,46 @@ struct Gather {
   Set<ID *> ids;
   Vector<ID *> queue;
 };
+
+/* Copy only the Scene inputs used by geometry and native drivers, keeping its collection,
+ * compositor and display data out of the evaluation dependency closure. */
+static void foreach_scene_input(Main *bmain,
+                                Scene &scene,
+                                ViewLayer &view_layer,
+                                FunctionRef<LibraryIDLinkCallback> callback,
+                                void *user_data,
+                                LibraryForeachIDFlag flag)
+{
+  BKE_library_foreach_subdata_id(
+      bmain,
+      &scene.id,
+      &scene.id,
+      [&](LibraryForeachIDData *data) {
+        if (scene.adt) {
+          BKE_animdata_foreach_id(scene.adt, data);
+        }
+        for (IDProperty *properties : {scene.id.properties,
+                                       scene.id.system_properties,
+                                       view_layer.id_properties,
+                                       view_layer.system_properties})
+        {
+          IDP_foreach_property(properties, IDP_TYPE_FILTER_ID, [&](IDProperty *property) {
+            BKE_lib_query_idpropertiesForeachIDLink_callback(property, data);
+          });
+        }
+      },
+      callback,
+      user_data,
+      flag);
+}
+
+static void clear_strip_source_pointers(ListBaseT<NlaStrip> &strips)
+{
+  for (NlaStrip &strip : strips) {
+    strip.orig_strip = nullptr;
+    clear_strip_source_pointers(strip.strips);
+  }
+}
 
 static int gather_link(LibraryIDLinkCallbackData *data)
 {
@@ -522,44 +782,60 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
     }
   };
   add(&state.source_rig->id);
+  add(&state.source_scene->id);
   for (Object *mesh : state.source_meshes) {
     add(&mesh->id);
   }
-  /* Enumerate a targeted graph on the main thread. It is never evaluated and is destroyed before
-   * copying. Reference traversal also covers inactive links, preventing keys escaping the capsule.
-   */
-  Vector<ID *> source_targets;
-  source_targets.append(&state.source_rig->id);
-  for (Object *mesh : state.source_meshes) {
-    source_targets.append(&mesh->id);
-  }
-  Depsgraph *source_graph = DEG_graph_new(
-      state.source_main, state.source_scene, state.source_view_layer, DAG_EVAL_VIEWPORT);
-  DEG_graph_build_from_ids(source_graph, source_targets);
-  auto add_dependency = [&](ID *id) {
-    if (ELEM(id->id_type(), ID_OB, ID_AR, ID_ME, ID_KE, ID_AC)) {
-      add(id);
-    }
-  };
-  DEG_foreach_ancestor_ID(source_graph, &state.source_rig->id, add_dependency);
-  for (Object *mesh : state.source_meshes) {
-    DEG_foreach_ancestor_ID(source_graph, &mesh->id, add_dependency);
-  }
-  DEG_graph_free(source_graph);
-  /* ID reference closure complements the targeted dependency graph: every referenced ID must
-   * be owned, including links which are currently inactive in the animation graph. */
+  /* Native reference traversal covers every dependency in the audited envelope, including
+   * inactive Actions, drivers and constraint targets. Construct relations only on private IDs:
+   * building a source graph would compile driver caches in the user's database. */
   for (int index = 0; index < gather.queue.size(); index++) {
     state.source_dependencies.add(gather.queue[index]->session_uid);
     if (gather.queue.size() > dependency_limit ||
-        !supported_id(*gather.queue[index], state.message))
+        !supported_id(*gather.queue[index], *state.source_scene, state.message))
     {
       if (gather.queue.size() > dependency_limit) {
         state.message = "Onion skin dependency capsule exceeds the supported size limit";
       }
       return nullptr;
     }
-    BKE_library_foreach_ID_link(
-        state.source_main, gather.queue[index], gather_link, &gather, IDWALK_READONLY);
+    if (gather.queue[index] == &state.source_scene->id) {
+      foreach_scene_input(state.source_main,
+                          *state.source_scene,
+                          *state.source_view_layer,
+                          gather_link,
+                          &gather,
+                          IDWALK_READONLY);
+      bool valid_scene_animation = true;
+      BKE_library_foreach_subdata_id(
+          state.source_main,
+          &state.source_scene->id,
+          &state.source_scene->id,
+          [&](LibraryForeachIDData *data) {
+            if (state.source_scene->adt) {
+              BKE_animdata_foreach_id(state.source_scene->adt, data);
+            }
+          },
+          [&](LibraryIDLinkCallbackData *data) {
+            ID *id = *data->id_pointer;
+            if (id && id->id_type() == ID_AC) {
+              for (const FCurve *curve : animrig::legacy::fcurves_all(id_cast<bAction *>(id))) {
+                valid_scene_animation &= supported_scene_path(curve->rna_path());
+              }
+            }
+            return IDWALK_RET_NOP;
+          },
+          nullptr,
+          IDWALK_READONLY);
+      if (!valid_scene_animation) {
+        state.message = "Onion skin Scene animation targets an uncopied setting";
+        return nullptr;
+      }
+    }
+    else {
+      BKE_library_foreach_ID_link(
+          state.source_main, gather.queue[index], gather_link, &gather, IDWALK_READONLY);
+    }
   }
 
   size_t estimated_bytes = 0;
@@ -567,8 +843,8 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
     if (id->id_type() == ID_ME) {
       const Mesh &mesh = *id_cast<Mesh *>(id);
       const size_t triangle_count = size_t(math::max(mesh.corners_num - 2 * mesh.faces_num, 0));
-      estimated_bytes += size_t(mesh.verts_num) * sizeof(float3) * (3 * sample_limit + 3);
-      estimated_bytes += triangle_count * sizeof(int3) * (3 * sample_limit + 3);
+      estimated_bytes += size_t(mesh.verts_num) * sizeof(float3) * 3;
+      estimated_bytes += triangle_count * sizeof(int3) * 3;
     }
     if (id->id_type() == ID_KE) {
       const Key &key = *id_cast<Key *>(id);
@@ -585,12 +861,64 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
       }
     }
   }
+  /* Bound constructive modifier output before invoking native mesh evaluation. Account for
+   * each sampled Object separately, even when several objects share one source Mesh. */
+  for (Object *object : state.source_meshes) {
+    const Mesh &mesh = *id_cast<const Mesh *>(object->data);
+    size_t vertices = size_t(mesh.verts_num);
+    size_t edges = size_t(mesh.edges_num);
+    size_t triangles = size_t(math::max(mesh.corners_num - 2 * mesh.faces_num, 0));
+    for (const ModifierData &modifier : object->modifiers) {
+      if (modifier.type == eModifierType_Mirror) {
+        const auto flag = reinterpret_cast<const MirrorModifierData &>(modifier).flag;
+        const bool animated = object->adt &&
+                              (object->adt->action || !object->adt->nla_tracks.is_empty() ||
+                               !object->adt->drivers.is_empty());
+        const bool bisect = animated || flag & (MOD_MIR_BISECT_AXIS_X | MOD_MIR_BISECT_AXIS_Y |
+                                                MOD_MIR_BISECT_AXIS_Z);
+        if (bisect) {
+          /* Each plane can split edges/faces before mirroring. Conservatively bound all three
+           * cuts, including flags driven or animated at another sampled time. */
+          for (int axis = 0; axis < 3; axis++) {
+            vertices += edges;
+            edges *= 3;
+            triangles *= 3;
+          }
+        }
+        const int axes = animated ?
+                             3 :
+                             int(bool(flag & MOD_MIR_AXIS_X)) + int(bool(flag & MOD_MIR_AXIS_Y)) +
+                                 int(bool(flag & MOD_MIR_AXIS_Z));
+        const size_t factor = size_t(1) << axes;
+        vertices *= factor;
+        edges *= factor;
+        triangles *= factor;
+      }
+      else if (modifier.type == eModifierType_Solidify) {
+        triangles = 2 * triangles + 2 * edges;
+        edges = 2 * edges + vertices;
+        vertices *= 2;
+      }
+      if (vertices > cache_budget / sizeof(float3) || edges > cache_budget / sizeof(int2) ||
+          triangles > cache_budget / sizeof(int3))
+      {
+        state.message = "Onion skin constructive modifier output exceeds the cache budget";
+        return nullptr;
+      }
+    }
+    estimated_bytes += (vertices * sizeof(float3) + triangles * sizeof(int3)) *
+                       (3 * sample_limit + 3);
+    if (estimated_bytes > cache_budget) {
+      break;
+    }
+  }
   if (estimated_bytes > cache_budget) {
     state.message = "Onion skin workspace exceeds the 256 MiB cache budget";
     return nullptr;
   }
 
   auto capsule = std::make_unique<Capsule>();
+  capsule->scene = BKE_scene_add(capsule->main, "Mesh Onion Skin Evaluation");
   Map<ID *, ID *> copies;
   Map<ID *, int> source_users;
   /* No user reference changes, caches, override hierarchy or source ID.newid writes. Remap all
@@ -600,11 +928,15 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
                          LIB_ID_COPY_NO_LIB_OVERRIDE;
   for (ID *source : gather.queue) {
     source_users.add(source, source->us);
-    ID *copy = BKE_id_copy_ex(nullptr, source, nullptr, copy_flags);
+    ID *copy = source == &state.source_scene->id ?
+                   &capsule->scene->id :
+                   BKE_id_copy_ex(nullptr, source, nullptr, copy_flags);
     if (!copy) {
       state.message = "Onion skin could not copy an evaluation dependency";
       for (ID *owned : copies.values()) {
-        BKE_id_free(nullptr, owned);
+        if (owned != &capsule->scene->id) {
+          BKE_id_free(nullptr, owned);
+        }
       }
       return nullptr;
     }
@@ -632,25 +964,59 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
     }
     copies.add(source, copy);
   }
+  Scene &private_scene = *capsule->scene;
+  const Scene &source_scene = *state.source_scene;
+  private_scene.r.frs_sec = source_scene.r.frs_sec;
+  private_scene.r.frs_sec_base = source_scene.r.frs_sec_base;
+  private_scene.r.framelen = source_scene.r.framelen;
+  private_scene.r.sfra = source_scene.r.sfra;
+  private_scene.r.efra = source_scene.r.efra;
+  private_scene.unit = source_scene.unit;
+  private_scene.adt = BKE_animdata_copy(nullptr, source_scene.adt, copy_flags);
+  private_scene.id.properties = property_snapshot(source_scene.id.properties).release();
+  private_scene.id.system_properties =
+      property_snapshot(source_scene.id.system_properties).release();
+  ViewLayer *view_layer = BKE_view_layer_default_view(capsule->scene);
+  STRNCPY(view_layer->name, state.source_view_layer->name);
+  view_layer->id_properties = property_snapshot(state.source_view_layer->id_properties).release();
+  view_layer->system_properties =
+      property_snapshot(state.source_view_layer->system_properties).release();
   Set<ID *> owned_copies;
   for (ID *copy : copies.values()) {
+    if (AnimData *adt = BKE_animdata_from_id(copy)) {
+      for (NlaTrack &track : adt->nla_tracks) {
+        clear_strip_source_pointers(track.strips);
+      }
+    }
     owned_copies.add(copy);
   }
   Remap remap{copies, owned_copies};
   for (ID *copy : copies.values()) {
-    BKE_library_foreach_ID_link(nullptr, copy, remap_link, &remap, IDWALK_NOP);
+    if (copy == &capsule->scene->id) {
+      foreach_scene_input(nullptr, private_scene, *view_layer, remap_link, &remap, IDWALK_NOP);
+    }
+    else {
+      BKE_library_foreach_ID_link(nullptr, copy, remap_link, &remap, IDWALK_NOP);
+    }
   }
   if (!remap.valid) {
     state.message = "Onion skin could not isolate every evaluation dependency";
     for (ID *copy : copies.values()) {
-      BKE_id_free(nullptr, copy);
+      if (copy != &capsule->scene->id) {
+        BKE_id_free(nullptr, copy);
+      }
     }
     return nullptr;
   }
   for (const auto item : copies.items()) {
-    BKE_libblock_management_main_add(capsule->main, item.value);
+    if (item.value != &capsule->scene->id) {
+      BKE_libblock_management_main_add(capsule->main, item.value);
+    }
     if (item.value->id_type() == ID_OB) {
       capsule->objects.add(uid(*item.key), id_cast<Object *>(item.value));
+    }
+    if (item.value->id_type() == ID_AC) {
+      capsule->actions.add(uid(*item.key), id_cast<bAction *>(item.value));
     }
   }
   for (const auto item : source_users.items()) {
@@ -661,11 +1027,6 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
     }
   }
 
-  capsule->scene = BKE_scene_add(capsule->main, "Mesh Onion Skin Evaluation");
-  capsule->scene->r.frs_sec = state.source_scene->r.frs_sec;
-  capsule->scene->r.frs_sec_base = state.source_scene->r.frs_sec_base;
-  capsule->scene->r.framelen = state.source_scene->r.framelen;
-  capsule->scene->unit = state.source_scene->unit;
   for (Object *copy : capsule->objects.values()) {
     for (ModifierData &modifier : copy->modifiers) {
       if (modifier.type == eModifierType_Subsurf) {
@@ -686,7 +1047,6 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
   for (Object *mesh : state.source_meshes) {
     capsule->meshes.append({uid(mesh->id), capsule->objects.lookup(uid(mesh->id))});
   }
-  ViewLayer *view_layer = BKE_view_layer_default_view(capsule->scene);
   BKE_view_layer_synced_ensure(*capsule->main, capsule->scene, view_layer);
   OwnershipValidation ownership;
   ownership.owned.add(&capsule->scene->id);
@@ -713,6 +1073,7 @@ static std::unique_ptr<Capsule> capsule_create(State &state)
   }
   DEG_graph_build_from_ids(capsule->graph, targets);
   state.armature_rest = armature_rest_capture(*id_cast<bArmature *>(state.source_rig->data));
+  state.keyed_frames = keyed_frames_collect(*state.source_rig);
   return capsule;
 }
 
@@ -721,8 +1082,26 @@ static std::shared_ptr<Bundle> evaluate(Capsule &capsule,
                                         wmJobWorkerStatus &worker_status)
 {
   const double start = BLI_time_now_seconds();
+  const bool diagnostics = std::getenv("BLENDER_MESH_ONION_SKIN_DIAGNOSTICS") != nullptr;
+  double graph_seconds = 0.0;
+  double snapshot_seconds = 0.0;
+  double triangulation_seconds = 0.0;
   bool structure_changed = false;
-  if (work.preview && !preview_apply(*work.preview, capsule.objects, &structure_changed)) {
+  Object *edited_rig = work.preview ?
+                           capsule.objects.lookup_default(work.preview->object_uid, nullptr) :
+                           nullptr;
+  bAction *previous_action = nullptr;
+  if (edited_rig) {
+    const AnimData *adt = BKE_animdata_from_id(&edited_rig->id);
+    previous_action = adt ? adt->action : nullptr;
+  }
+  if (work.preview && !preview_apply(*work.preview,
+                                     *capsule.main,
+                                     capsule.objects,
+                                     capsule.actions,
+                                     capsule.preview_state,
+                                     &structure_changed))
+  {
     return nullptr;
   }
   if (structure_changed) {
@@ -730,64 +1109,103 @@ static std::shared_ptr<Bundle> evaluate(Capsule &capsule,
     DEG_graph_tag_relations_update(capsule.graph);
     DEG_graph_relations_update(capsule.graph);
   }
-  for (Object *object : capsule.objects.values()) {
-    DEG_id_tag_update_ex(
-        capsule.main, &object->id, ID_RECALC_ANIMATION | ID_RECALC_TRANSFORM | ID_RECALC_GEOMETRY);
-    if (AnimData *adt = BKE_animdata_from_id(&object->id); adt && adt->action) {
-      DEG_id_tag_update_ex(capsule.main, &adt->action->id, ID_RECALC_ANIMATION);
+  if (edited_rig) {
+    /* Only the proposal changes private originals. Native frame-change evaluation tags the
+     * time source and propagates updates to the remaining animated dependencies. Retain the
+     * pose geometry tag here: unkeyed channels are authored inputs even without an Action. */
+    DEG_id_tag_update_ex(capsule.main,
+                         &edited_rig->id,
+                         ID_RECALC_ANIMATION | ID_RECALC_TRANSFORM | ID_RECALC_GEOMETRY);
+    /* A rollback can restore a related data Action's slots while unassigning it from the Rig.
+     * Select the packet's actual target independently of the resulting AnimData assignment. */
+    bAction *modified_action = work.preview->action_uid.is_generated() ?
+                                   capsule.actions.lookup_default(work.preview->action_uid,
+                                                                  nullptr) :
+                                   capsule.preview_state.created_action;
+    const bool action_modified = modified_action &&
+                                 (work.preview->channelbag || work.preview->action_template);
+    if (action_modified) {
+      DEG_id_tag_update_ex(capsule.main, &modified_action->id, ID_RECALC_ANIMATION);
+    }
+    const AnimData *adt = BKE_animdata_from_id(&edited_rig->id);
+    if (previous_action && previous_action != (adt ? adt->action : nullptr) &&
+        (!action_modified || previous_action != modified_action))
+    {
+      /* Removing a provisional assignment must also flush its previous evaluated use. */
+      DEG_id_tag_update_ex(capsule.main, &previous_action->id, ID_RECALC_ANIMATION);
     }
   }
+  const double preparation_seconds = diagnostics ? BLI_time_now_seconds() - start : 0.0;
   auto bundle = std::make_shared<Bundle>();
   bundle->generation = work.generation;
   bundle->epoch = work.epoch;
   bundle->input_time = work.input_time;
   bundle->staging_seconds = work.staging_seconds;
-  /* Nearest samples first, but publish only a complete coherent set. */
-  for (int distance = 1; distance <= math::max(work.settings.before, work.settings.after);
-       distance++)
-  {
-    for (const int direction : {-1, 1}) {
-      if (distance > (direction < 0 ? work.settings.before : work.settings.after)) {
-        continue;
-      }
-      if (worker_status.stop) {
+  /* Publish only a complete coherent set. The packet owns scene-time samples selected on the
+   * main thread; the worker never accesses source Actions or scene range settings. */
+  for (const SampleFrame &requested_frame : work.frames) {
+    if (worker_status.stop) {
+      return nullptr;
+    }
+    const float frame = requested_frame.frame;
+    BKE_scene_frame_set(capsule.scene, frame);
+    const double graph_start = diagnostics ? BLI_time_now_seconds() : 0.0;
+    DEG_evaluate_on_framechange(capsule.graph, frame, DEG_EVALUATE_SYNC_WRITEBACK_NO);
+    const double snapshot_start = diagnostics ? BLI_time_now_seconds() : 0.0;
+    graph_seconds += snapshot_start - graph_start;
+    for (const auto &entry : capsule.meshes) {
+      Object *object = DEG_get_evaluated(capsule.graph, entry.second);
+      const Mesh *mesh = BKE_object_get_evaluated_mesh_no_subsurf(object);
+      if (!mesh) {
         return nullptr;
       }
-      const float frame = work.frame + direction * distance * work.settings.step;
-      BKE_scene_frame_set(capsule.scene, frame);
-      DEG_evaluate_on_framechange(capsule.graph, frame, DEG_EVALUATE_SYNC_WRITEBACK_NO);
-      for (const auto &entry : capsule.meshes) {
-        Object *object = DEG_get_evaluated(capsule.graph, entry.second);
-        const Mesh *mesh = BKE_object_get_evaluated_mesh_no_subsurf(object);
-        if (!mesh) {
-          return nullptr;
-        }
-        Sample sample;
-        sample.object_uid = entry.first;
-        sample.frame = frame;
-        sample.object_to_world = object->object_to_world();
-        sample.positions = Array<float3>(mesh->vert_positions());
-        const Span<int3> corner_triangles = mesh->corner_tris();
-        const Span<int> corner_vertices = mesh->corner_verts();
-        sample.triangles.reinitialize(corner_triangles.size());
-        threading::parallel_for(corner_triangles.index_range(), 4096, [&](IndexRange range) {
-          for (const int index : range) {
-            const int3 corners = corner_triangles[index];
-            sample.triangles[index] = int3(corner_vertices[corners.x],
-                                           corner_vertices[corners.y],
-                                           corner_vertices[corners.z]);
-          }
-        });
-        bundle->bytes += sample.positions.size() * sizeof(float3) +
-                         sample.triangles.size() * sizeof(int3);
-        if (bundle->bytes > cache_budget) {
-          return nullptr;
-        }
-        bundle->samples.append(std::move(sample));
+      Sample sample;
+      const size_t sample_bytes = size_t(mesh->verts_num) * sizeof(float3) +
+                                  size_t(mesh->corners_num - 2 * mesh->faces_num) * sizeof(int3);
+      if (sample_bytes > cache_budget - bundle->bytes) {
+        return nullptr;
       }
+      sample.object_uid = entry.first;
+      sample.frame = frame;
+      sample.temporal_offset = requested_frame.offset;
+      sample.object_to_world = object->object_to_world();
+      sample.positions = Array<float3>(mesh->vert_positions());
+      const double triangulation_start = diagnostics ? BLI_time_now_seconds() : 0.0;
+      const Span<int3> corner_triangles = mesh->corner_tris();
+      if (diagnostics) {
+        triangulation_seconds += BLI_time_now_seconds() - triangulation_start;
+      }
+      const Span<int> corner_vertices = mesh->corner_verts();
+      sample.triangles.reinitialize(corner_triangles.size());
+      threading::parallel_for(corner_triangles.index_range(), 4096, [&](IndexRange range) {
+        for (const int index : range) {
+          const int3 corners = corner_triangles[index];
+          sample.triangles[index] = int3(
+              corner_vertices[corners.x], corner_vertices[corners.y], corner_vertices[corners.z]);
+        }
+      });
+      bundle->bytes += sample.positions.size() * sizeof(float3) +
+                       sample.triangles.size() * sizeof(int3);
+      if (bundle->bytes > cache_budget) {
+        return nullptr;
+      }
+      bundle->samples.append(std::move(sample));
+    }
+    if (diagnostics) {
+      snapshot_seconds += BLI_time_now_seconds() - snapshot_start;
     }
   }
   bundle->evaluation_seconds = BLI_time_now_seconds() - start;
+  if (diagnostics) {
+    printf(
+        "mesh_onion_skin_worker generation=%llu preparation_ms=%.3f graph_ms=%.3f "
+        "snapshot_ms=%.3f triangulation_ms=%.3f\n",
+        static_cast<unsigned long long>(work.generation),
+        preparation_seconds * 1000.0,
+        graph_seconds * 1000.0,
+        snapshot_seconds * 1000.0,
+        triangulation_seconds * 1000.0);
+  }
   return bundle;
 }
 
@@ -805,6 +1223,21 @@ static void stage(State &state)
   work.epoch = state.epoch;
   work.input_time = state.input_time;
   const double start = BLI_time_now_seconds();
+  if (state.settings.keyed_frames_only && !state.keyed_frames.unsupported_reason.empty()) {
+    state.message = state.keyed_frames.unsupported_reason;
+    state.epoch++;
+    state.published.reset();
+    std::lock_guard lock(state.mutex);
+    state.pending.reset();
+    state.completed.reset();
+    state.staged_generation = state.generation;
+    return;
+  }
+  work.frames = sample_frames_select(state.keyed_frames.frames,
+                                     state.settings,
+                                     state.frame,
+                                     state.source_scene->r.sfra,
+                                     state.source_scene->r.efra);
   if (state.input) {
     work.preview = preview_prepare(
         *state.source_main, *state.source_scene, *state.source_rig, *state.input);
@@ -855,6 +1288,12 @@ static void job_init(void *custom_data)
         view.overlay.mesh_onion_skin_before = state.settings.before;
         view.overlay.mesh_onion_skin_after = state.settings.after;
         view.overlay.mesh_onion_skin_step = state.settings.step;
+        SET_FLAG_FROM_TEST(view.overlay.flag,
+                           state.settings.keyed_frames_only,
+                           V3D_OVERLAY_MESH_ONION_SKIN_KEYED_FRAMES_ONLY);
+        SET_FLAG_FROM_TEST(view.overlay.flag,
+                           state.settings.loop_frame_range,
+                           V3D_OVERLAY_MESH_ONION_SKIN_LOOP_FRAME_RANGE);
       }
     }
   }
@@ -1092,6 +1531,14 @@ void request(bContext &C,
       state->generation++;
       state->input_time = BLI_time_now_seconds();
     }
+    if (state->frame_start != scene->r.sfra || state->frame_end != scene->r.efra) {
+      state->frame_start = scene->r.sfra;
+      state->frame_end = scene->r.efra;
+      if (state->settings.loop_frame_range) {
+        state->generation++;
+        state->input_time = BLI_time_now_seconds();
+      }
+    }
     if (!state->initialized && !state->job_registered) {
       /* A rejected secondary request has no WM job to receive a window-close callback. Refresh
        * its main-thread window/view-layer handles before retrying from a different live window. */
@@ -1113,6 +1560,8 @@ void request(bContext &C,
   state = owned_state.get();
   state->source_main = CTX_data_main(&C);
   state->source_scene = scene;
+  state->frame_start = scene->r.sfra;
+  state->frame_end = scene->r.efra;
   state->source_view_layer = requested_view_layer;
   state->source_rig = &rig;
   state->source_meshes.extend(meshes);
@@ -1193,14 +1642,20 @@ void preview_input_update(bContext &C, std::shared_ptr<const PosePreviewInput> i
         state->pending.reset();
         state->completed.reset();
       }
+      state->frame = state->input->frame;
       state->generation++;
       state->input_time = BLI_time_now_seconds();
+      if (state->input->supported) {
+        /* Stage while the authored pose is available instead of waiting for the producer timer.
+         * Only private IDs are keyed; the worker receives an immutable latest-input packet. */
+        stage(*state);
+      }
       break;
     }
   }
 }
 
-void preview_finish(bContext &C, const uint64_t transaction_id, const bool /*cancelled*/)
+void preview_finish(bContext &C, const uint64_t transaction_id, const bool cancelled)
 {
   wmWindowManager *wm = CTX_wm_manager(&C);
   Vector<std::pair<SessionUID, SessionUID>> finished_inputs;
@@ -1217,6 +1672,7 @@ void preview_finish(bContext &C, const uint64_t transaction_id, const bool /*can
   for (int index = states.size() - 1; index >= 0; index--) {
     const std::shared_ptr<State> state = states[index];
     if (state->input && state->input->transaction_id == transaction_id) {
+      preview_debug_action(*state->source_rig, cancelled ? "cancel" : "confirm");
       state->epoch++;
       states.remove_if([&](const std::shared_ptr<State> &other) { return other == state; });
       WM_jobs_kill_type(wm, state.get(), WM_JOB_TYPE_MESH_ONION_SKIN);
@@ -1264,11 +1720,6 @@ void tag_id_changed(Main &bmain, ID &id)
     }
     if (!(id.recalc & (ID_RECALC_ANIMATION | ID_RECALC_TRANSFORM | ID_RECALC_GEOMETRY |
                        ID_RECALC_PARAMETERS | ID_RECALC_SOURCE)))
-    {
-      continue;
-    }
-    if (id.session_uid == state->source_scene->id.session_uid &&
-        !(id.recalc & (ID_RECALC_PARAMETERS | ID_RECALC_SOURCE)))
     {
       continue;
     }
@@ -1400,6 +1851,12 @@ std::shared_ptr<const Bundle> evaluate_for_test(Main &bmain,
   work.generation = 1;
   work.epoch = 1;
   work.preview = std::move(preview);
+  if (settings.keyed_frames_only && !state.keyed_frames.unsupported_reason.empty()) {
+    r_error = state.keyed_frames.unsupported_reason;
+    return nullptr;
+  }
+  work.frames = sample_frames_select(
+      state.keyed_frames.frames, work.settings, frame, scene.r.sfra, scene.r.efra);
   wmJobWorkerStatus worker_status{};
   auto result = evaluate(*capsule, work, worker_status);
   if (!result) {

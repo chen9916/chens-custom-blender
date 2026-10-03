@@ -1443,8 +1443,8 @@ static void autokeyframe_pose(bContext *C,
   }
 }
 
-/** Capture precisely the controls and key paths used by native pose auto-keying. This mailbox
- * does not evaluate animation or insert keys, so mouse events cannot build an evaluation queue. */
+/** Capture the controls and key paths used by native pose auto-keying. Staging keys private
+ * copies on the main thread; a single pending packet coalesces edits for the evaluation job. */
 static void mesh_onion_skin_capture_pose(TransInfo *t, Object &ob)
 {
   using namespace ed::mesh_onion_skin;

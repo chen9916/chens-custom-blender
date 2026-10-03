@@ -21,12 +21,17 @@ parallelism. Latest input replaces pending input instead of building a queue.
 Completed coherent bundles can be published during continuous input even when a
 newer request is pending, provided the result belongs to the current epoch and
 is newer than the displayed result.
+Supported modal pose edits stage their copied animation immediately after capture;
+the job timer handles cold activation and changes to time or sampling settings.
+This removes a producer timer wait while retaining one pending worker request.
 
 The pose adapter in
 ``source/blender/editors/transform/transform_convert_armature.cc`` captures
 supported authored transform channels after native mirroring. Main-thread staging
 in ``source/blender/editors/animation/anim_mesh_onion_skin_preview.cc`` copies the
-active Action and uses Blender's native key inserter. Staging remains on the main
+authored animation and uses Blender's native key inserter in a private owned rig.
+This includes native NLA tweak-time mapping and an owned new-Action template when
+the source has no active Action. Staging remains on the main
 thread because key insertion reads user preferences. The worker applies the
 resulting private curves, evaluates sample times and copies geometry; it never
 inserts keys into the live scene or caches evaluated mesh pointers.
@@ -37,20 +42,57 @@ vertex buffers are reused when vertex counts agree; index buffers are rebuilt
 when actual tessellation changes. Ghosts use native uniform-color drawing with
 alpha blending, optional depth testing, and no depth writes or selection picking.
 
-The initial envelope is one active posed armature, direct Armature-deformed
-meshes, an active Action without drivers or NLA, and authored standard IK with
-supported transform constraints. Terminal Subdivision modifiers are shown as the
-deformation cage. The UI exposes two past and two future samples by default,
-step one, and opacity 0.15. Before/after counts are limited to four each.
-Sampling is shared across enabled viewports showing the same scene and active
-rig; opacity and in-front display remain local. The native RNA implementation is
-in ``source/blender/makesrna/intern/rna_space.cc``.
+The evaluation envelope is one active posed armature, directly skinned meshes,
+native Action/NLA animation, authored standard IK and supported native transform
+constraints. Modifier evaluation includes Armature, Mirror and simple Solidify;
+terminal Subdivision modifiers are shown as the deformation cage. Conservative
+preflight estimates account for constructive modifier expansion before admitting
+work. Simulations, instancing, complex Solidify and arbitrary modifier stacks
+remain outside the audited envelope.
+
+Native driver evaluation supports Average, Sum, Minimum and Maximum drivers plus
+scripted drivers handled by Blender's native simple expression evaluator. General
+Python expressions and driver namespace
+callbacks are rejected. Referenced object, armature, mesh, shape-key and Action
+data are privately copied and remapped. Scene path inputs and driver-facing custom
+properties are copied without copying the live scene's entire contents. View-layer
+context properties must agree before different views share a CPU cache. These
+checks support the supplied mannequin's rig and shape-key driver setup without
+allowing arbitrary source references into the worker.
+Drivers embedded in NLA strip controls and Scene paths outside the copied
+driver-facing settings are rejected with an explicit status message.
+Driver path auditing also rejects intermediate shading IDs and redirected Scene
+reads through ID-valued properties. Safe invalid properties retain Blender's
+native fallback behavior. Preview updates tag the edited rig and changed Actions;
+native frame-change relations update the other animated dependencies.
+
+The native Pose Mode header toggle opens a popover with two past and two future
+samples by default, frame step one, and opacity 0.15. Before/after counts are
+limited to four each. Keyframes Only selects the nearest authored key times,
+including supported NLA time mapping, and disables Frame Step. Animated or
+noninvertible NLA key-time mapping disables keyed-only sampling with a status
+message; ordinary frame sampling can still evaluate that NLA animation. Loop
+Frame Range wraps across the inclusive scene Start/End range. Each sample retains
+its signed requested temporal offset so wrapped past samples keep past coloring
+and distance fade uses their true distance from the playhead.
+
+Sampling settings, including keyed-only and looping, are shared across enabled
+viewports showing the same scene and active rig. Opacity, in-front display,
+Distance Fade and Fade Strength are local viewport appearance settings. Fade is
+disabled by default; strength defaults to 0.75. Enabled fade applies a smooth
+monotonic falloff from the nearest to farthest actual temporal distance, shared
+across meshes and both directions. Nearest samples retain configured opacity;
+farthest samples retain 15 percent of it at maximum strength. Equal-distance
+samples retain full opacity. Appearance changes redraw GPU batches without
+restarting CPU evaluation. RNA lives in ``source/blender/makesrna/intern/rna_space.cc``.
 
 Live temporary-key preview supports native translate, rotate, trackball and scale
-of controls in one rig, including native mirrored controls. It requires one Action
-layer and one strip. Visual keying, custom keying sets, targetless/automatic IK,
-iTaSC, multi-rig transforms, other modifiers, simulations and instancing are
-outside the initial envelope. Unsupported evaluation clears ghosts and reports a
+of controls in one rig, including native mirrored controls, native NLA tweak
+mapping and native creation of an active Action for NLA-only source animation.
+The editable Action uses one layer and one strip. Visual keying, custom keying
+sets, targetless/automatic IK, iTaSC and multi-rig transforms remain unsupported.
+ID-valued custom properties that cannot be safely owned by the new-Action preview
+template are rejected. Unsupported evaluation clears ghosts and reports a
 status message. With auto-key disabled, unkeyed channels can affect ghosts;
 authored animation curves continue to determine keyed channels at sample times.
 
@@ -63,11 +105,11 @@ placeholders with absolute file paths or values. Create output directories first
 
 A deterministic standard-IK fixture::
 
-  <blender> --factory-startup --background --python tests/onion_skin/make_live_fixture.py -- --vertices 100000 --output <ik-fixture.blend>
+  <blender> --factory-startup --background --python-exit-code 1 --python tests/onion_skin/make_live_fixture.py -- --vertices 100000 --output <ik-fixture.blend>
 
 Import the supplied Mixamo FBX into a disposable posed test file::
 
-  <blender> --factory-startup --background --python tests/onion_skin/make_mixamo_fixture.py -- --input <character.fbx> --output <mixamo-fixture.blend>
+  <blender> --factory-startup --background --python-exit-code 1 --python tests/onion_skin/make_mixamo_fixture.py -- --input <character.fbx> --output <mixamo-fixture.blend>
 
 The generator writes a JSON sidecar with rig/control names, bones, key counts and
 mesh sizes. Keep this untouched dense-key fixture as the primary imported-data
@@ -76,20 +118,35 @@ selected control to make interpolation changes easier to observe. Report that
 copy separately. Dense authored keys at neighboring sample frames can correctly
 keep those ghosts unchanged when only the current frame's key is adjusted.
 
+Prepare the supplied Adjustable Mannequin as disposable authored-rig and NLA
+fixtures. The generator rejects output equal to input, loads with scripts disabled,
+preserves the original curves/keys and driver/modifier stacks, selects
+``c_hand_ik.l`` on ``rig`` at frame 17, and sets a front orthographic viewport::
+
+  <blender> --factory-startup --disable-autoexec --background --python-exit-code 1 --python tests/onion_skin/make_mannequin_fixture.py -- --input <original-mannequin.blend> --output <mannequin-active.blend> --variant active
+  <blender> --factory-startup --disable-autoexec --background --python-exit-code 1 --python tests/onion_skin/make_mannequin_fixture.py -- --input <original-mannequin.blend> --output <mannequin-tweak.blend> --variant nla-tweak
+  <blender> --factory-startup --disable-autoexec --background --python-exit-code 1 --python tests/onion_skin/make_mannequin_fixture.py -- --input <original-mannequin.blend> --output <mannequin-nla-only.blend> --variant nla-only
+
+NLA variants place the original Action into a strip starting at frame 5 with scale
+1.5. The tweak variant enters through Blender's native NLA operator; the NLA-only
+variant has no active Action. Sidecars record actual strip mapping, retained key
+times and rig/mesh metadata. ``--bone c_foot_ik.l`` selects the foot control instead.
+
 Native tests and lifecycle checks
 --------------------------------
 
 Build Blender's native test target with the project's normal test configuration,
-then run the two native fixtures::
+then run all native onion skin sampling, evaluation and preview fixtures::
 
-  <blender_test> --gtest_filter="MeshOnionEvaluationTest.*:MeshOnionPreviewTest.*"
+  <blender_test> --gtest_filter="MeshOnion*"
 
 They check source preservation, native key insertion policies, private provisional
-curve replacement, authored IK deformation parity, terminal subdivision cages,
-and rejection of unsupported evaluation. Run the UI defaults/file round-trip test
+curve replacement, authored IK deformation parity, constructive modifiers,
+native drivers/NLA ownership, keyed/looped sampling and unsupported evaluation.
+Run the UI defaults/file round-trip and split-view appearance/sampling test
 in a disposable interactive process::
 
-  <blender> --factory-startup --python tests/onion_skin/check_settings.py -- <settings-roundtrip.blend>
+  <blender> --factory-startup --python-exit-code 1 --python tests/onion_skin/check_settings.py -- <settings-roundtrip.blend>
 
 Run native job lifecycle checks using the imported fixture's rig name::
 
@@ -131,6 +188,14 @@ on/off runs. Collect several independent runs to expose variance::
 
   python tests/onion_skin/summarize_benchmark.py <on-four> <off-four> --output <summary.json>
 
+Run the mannequin active and NLA tweak cases with all authored Actions protected.
+For NLA-only, the distinct confirmation policy checks native creation of exactly
+one active Action and verifies undo restores the original animation stack::
+
+  <blender> --disable-autoexec <mannequin-active.blend> --enable-event-simulate --python tests/onion_skin/run_live_test.py -- --output <mannequin-active-results> --rig rig --bone c_hand_ik.l --transform TRANSLATE --all-actions
+  <blender> --disable-autoexec <mannequin-tweak.blend> --enable-event-simulate --python tests/onion_skin/run_live_test.py -- --output <mannequin-tweak-results> --rig rig --bone c_hand_ik.l --transform TRANSLATE --all-actions
+  <blender> --disable-autoexec <mannequin-nla-only.blend> --enable-event-simulate --python tests/onion_skin/run_live_test.py -- --output <mannequin-nla-only-results> --rig rig --bone c_hand_ik.l --transform TRANSLATE --all-actions --confirm-policy new-action
+
 Telemetry includes staging, worker evaluation, input-to-publication and
 input-to-native-draw-submission timing. The summary restricts these values to the
 continuous modal dragging phases and reports median/p95/max and redraw intervals.
@@ -161,6 +226,47 @@ continuous drags. Dense Mixamo samples must remain stable. Failed source or
 geometry checks cause a nonzero summarizer exit. The geometry checks use world
 positions quantized to 1e-5 and do not measure framebuffer presentation.
 
+Append ``--geometry-dump`` to a separate geometry correctness run to capture
+actual submitted world-space positions and triangles at all six quiet states.
+These bounded native captures live in the run's ``geometry`` directory. The
+postprocessor requires matching mesh names, sample times, signed offsets and
+triangle order, then checks a maximum Euclidean vertex displacement of 1e-5 world
+units for cancel, undo and confirmation. It reports maximum and RMS displacement;
+quantized hashes continue to prove movement during dragging. This avoids treating
+an arbitrarily small change across a rounding boundary as a full geometry mismatch.
+Missing or stale captures fail validation. These runs are ineligible for latency
+claims because capture and file output add work.
+
+For ``--confirm-policy new-action``, the disposable test disables the user
+preference Only Insert Available so native confirmation can create new channels.
+Other runs retain the native keying policy. The test also allows three seconds
+after undo for a large control rig's private graph to be rebuilt.
+
+The live driver accepts ``--keyed-only``, ``--loop-range``, ``--fade`` and
+``--fade-strength`` to exercise the native controls. ``--frame`` sets the initial
+playhead. For sampling correctness, provide fixture-authored explicit oracles
+``--expected-frames`` and paired ``--expected-offsets``. With geometry diagnostics
+enabled, the summarizer compares these against ``mesh_onion_skin_frames`` lines
+emitted from actual native submitted batches at baseline, held poses, cancel,
+confirm and undo. It also checks the submitted sample count, including meshes.
+Missing diagnostics, stale phases, wrong wrapped offsets or wrong evaluated
+frames fail validation; Python does not calculate onion skin geometry or generate
+the expected sampling algorithm.
+
+For the mannequin active fixture's retained times and scene range 1..30, frame 17
+with two samples each side has the explicit keyed-only oracle::
+
+  --keyed-only --frame 17 --expected-frames 12 15 18 22 --expected-offsets -5 -2 1 5
+
+At frame 1, normal step-two looping and keyed-only looping respectively use::
+
+  --loop-range --frame 1 --expected-frames 27 29 3 5 --expected-offsets -4 -2 2 4
+  --keyed-only --loop-range --frame 1 --expected-frames 23 30 5 8 --expected-offsets -8 -1 4 7
+
+Confirm the sidecar's scene range before applying these particular oracles to any
+other fixture. Key-only sampling may produce fewer than the requested count when
+there are insufficient authored times; the explicit oracle specifies that count.
+
 Run the small postprocessor regression suite without launching Blender::
 
   python -m unittest discover -s tests/onion_skin -p test_summarize_benchmark.py -v
@@ -172,3 +278,35 @@ this target is not a guarantee across rigs or hardware. CPU admission and bundle
 size guards limit this initial feature, but private dependency state, concurrent
 snapshots and per-viewport GPU buffers also consume memory. Report measured peak
 memory when assessing a production rig.
+
+Measured development build
+--------------------------
+
+The final control-rig candidate was measured on a Ryzen 9 7900X with an
+RTX 5070 Ti (driver 616.92), using 120 continuous native modal moves before
+cancel and another 120 before confirm. Warm-cache latency from native pose input
+to native draw submission was:
+
+============================= ======= ========= =========
+Fixture                       Ghosts  Median ms P95 ms
+============================= ======= ========= =========
+Mixamo Running                4       7.431     13.791
+Adjustable Mannequin          4       75.276    100.347
+Adjustable Mannequin          2       71.720    98.586
+Adjustable Mannequin NLA tweak 4       84.637    108.924
+============================= ======= ========= =========
+
+These are individual runs with latency diagnostics enabled and geometry
+instrumentation disabled. They measure CPU-side submission, excluding operating
+system event queuing, GPU completion and monitor presentation. The Mixamo fixture
+meets the 33 ms p95 target on this machine; the 344-bone mannequin does not. Its
+four-sample native graph solve takes about 51 ms median and dominates worker
+cost. Reducing its samples improves worker cost but does not guarantee low
+end-to-end latency through viewport redraw scheduling.
+
+The tests validated the uncommitted extension with embedded checkpoint hash
+``0d6467bd605c``; the final package rebuild updates the commit metadata. The
+package's ``ONION_SKIN_VALIDATION.json`` records the fixture metadata, source
+assertions, exact measured timings, process memory and supported limitations.
+Whole-process memory includes the asset, undo history and evaluation capsule;
+GPU memory was not measured.

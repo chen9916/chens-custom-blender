@@ -309,6 +309,9 @@ enum eView3DOverlay_Flag : int {
   V3D_OVERLAY_PERFORMANCE = (1 << 19),
   V3D_OVERLAY_MESH_ONION_SKIN = (1 << 20),
   V3D_OVERLAY_MESH_ONION_SKIN_IN_FRONT = (1 << 21),
+  V3D_OVERLAY_MESH_ONION_SKIN_KEYED_FRAMES_ONLY = (1 << 22),
+  V3D_OVERLAY_MESH_ONION_SKIN_DISTANCE_FADE = (1 << 23),
+  V3D_OVERLAY_MESH_ONION_SKIN_LOOP_FRAME_RANGE = (1 << 24),
 };
 ENUM_OPERATORS(eView3DOverlay_Flag)
 
@@ -683,6 +686,8 @@ struct View3DOverlay {
   int mesh_onion_skin_after = 2;
   int mesh_onion_skin_step = 1;
   float mesh_onion_skin_opacity = 0.15f;
+  float mesh_onion_skin_fade_strength = 0.75f;
+  char _pad_mesh_onion_skin[4] = {};
 
   /** Darken Inactive. */
   float fade_alpha = 0.40f;

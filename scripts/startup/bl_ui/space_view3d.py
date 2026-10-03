@@ -7772,8 +7772,16 @@ class VIEW3D_PT_overlay_mesh_onion_skin(Panel):
         col.label(text="Geometry: Deformation Cage")
         col.prop(overlay, "mesh_onion_skin_before")
         col.prop(overlay, "mesh_onion_skin_after")
-        col.prop(overlay, "mesh_onion_skin_step")
+        col.prop(overlay, "mesh_onion_skin_keyed_frames_only")
+        col.prop(overlay, "mesh_onion_skin_loop_frame_range")
+        sub = col.column()
+        sub.active = not overlay.mesh_onion_skin_keyed_frames_only
+        sub.prop(overlay, "mesh_onion_skin_step")
         col.prop(overlay, "mesh_onion_skin_opacity")
+        col.prop(overlay, "mesh_onion_skin_distance_fade")
+        sub = col.column()
+        sub.active = overlay.mesh_onion_skin_distance_fade
+        sub.prop(overlay, "mesh_onion_skin_fade_strength", slider=True)
         col.prop(overlay, "mesh_onion_skin_in_front")
 
 

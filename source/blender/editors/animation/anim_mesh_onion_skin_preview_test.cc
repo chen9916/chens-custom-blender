@@ -6,13 +6,18 @@
 
 #include "ANIM_action.hh"
 #include "ANIM_keyframing.hh"
+#include "ANIM_nla.hh"
 
 #include "BKE_action.hh"
+#include "BKE_anim_data.hh"
 #include "BKE_animsys.hh"
 #include "BKE_armature.hh"
+#include "BKE_constraint.h"
+#include "BKE_fcurve.hh"
 #include "BKE_gtest_base.hh"
 #include "BKE_lib_id.hh"
 #include "BKE_main.hh"
+#include "BKE_nla.hh"
 #include "BKE_object.hh"
 #include "BKE_scene.hh"
 
@@ -20,6 +25,7 @@
 #include "BLI_string.hh"
 
 #include "DNA_armature_types.h"
+#include "DNA_constraint_types.h"
 #include "DNA_object_types.h"
 #include "DNA_scene_types.h"
 
@@ -92,6 +98,20 @@ class MeshOnionPreviewTest : public bke::BlenderGTestBase {
   const animrig::Channelbag &source_bag()
   {
     return *animrig::channelbag_for_action_slot(rig->adt->action->wrap(), rig->adt->slot_handle);
+  }
+
+  NlaStrip *add_strip(bAction &action, const float start = 1.0f)
+  {
+    NlaTrack *track = BKE_nlatrack_new_tail(&rig->adt->nla_tracks, false);
+    NlaStrip *strip = BKE_nlastrip_new(&action, rig->id);
+    EXPECT_TRUE(animrig::nla::assign_action(*strip, action.wrap(), rig->id));
+    EXPECT_TRUE(BKE_nlatrack_add_strip(track, strip, false));
+    strip->start = start;
+    strip->end = start + 9.0f;
+    strip->actstart = 1.0f;
+    strip->actend = 10.0f;
+    strip->scale = 1.0f;
+    return strip;
   }
 
   static void expect_same_curves(const animrig::Channelbag &a, const animrig::Channelbag &b)
@@ -196,18 +216,21 @@ TEST_F(MeshOnionPreviewTest, PrivateApplyDoesNotRetainPreviousProvisionalKeys)
   private_rig->adt->action = private_action;
   Map<SessionUID, Object *> objects;
   objects.add(SessionUID{rig->id.session_uid}, private_rig);
+  Map<SessionUID, bAction *> actions;
+  actions.add(SessionUID{rig->adt->action->id.session_uid}, private_action);
+  PreviewApplyState state;
   bool structure_changed = true;
-  EXPECT_TRUE(preview_apply(*keyed, objects, &structure_changed));
+  EXPECT_TRUE(preview_apply(*keyed, *bmain, objects, actions, state, &structure_changed));
   EXPECT_FALSE(structure_changed); /* Existing channels only acquired new values/keys. */
   PosePreviewInput rotation = input(3.0f);
   rotation.bones[0].key_paths = {{"rotation_quaternion"}};
   const auto new_channels = preview_prepare(*bmain, *scene, *rig, rotation);
   ASSERT_NE(new_channels, nullptr);
-  EXPECT_TRUE(preview_apply(*new_channels, objects, &structure_changed));
+  EXPECT_TRUE(preview_apply(*new_channels, *bmain, objects, actions, state, &structure_changed));
   EXPECT_TRUE(structure_changed);
-  EXPECT_TRUE(preview_apply(*new_channels, objects, &structure_changed));
+  EXPECT_TRUE(preview_apply(*new_channels, *bmain, objects, actions, state, &structure_changed));
   EXPECT_FALSE(structure_changed);
-  EXPECT_TRUE(preview_apply(*unkeyed, objects, &structure_changed));
+  EXPECT_TRUE(preview_apply(*unkeyed, *bmain, objects, actions, state, &structure_changed));
   EXPECT_TRUE(structure_changed); /* Returning to baseline removes provisional channels. */
   expect_same_curves(
       baseline,
@@ -216,6 +239,248 @@ TEST_F(MeshOnionPreviewTest, PrivateApplyDoesNotRetainPreviousProvisionalKeys)
   expect_same_curves(baseline, source_bag());
   BKE_id_free(nullptr, private_rig);
   BKE_id_free(nullptr, private_action);
+}
+
+TEST_F(MeshOnionPreviewTest, NlaTweakUsesNativeTimeMappingAndPreservesSharedAction)
+{
+  bAction *action = rig->adt->action;
+  const int slot_handle = rig->adt->slot_handle;
+  NlaStrip *strip = add_strip(*action, 11.0f);
+  strip->scale = 2.0f;
+  strip->end = 29.0f;
+  NlaStrip *other_strip = add_strip(*action, 40.0f);
+  ASSERT_TRUE(animrig::unassign_action(rig->id));
+  BKE_nlatrack_set_active(&rig->adt->nla_tracks, rig->adt->nla_tracks.first());
+  strip->flag |= NLASTRIP_FLAG_ACTIVE;
+  BKE_nla_tweakmode_enter({rig->id, *rig->adt});
+  ASSERT_EQ(rig->adt->actstrip, strip);
+  const animrig::Channelbag baseline(
+      *animrig::channelbag_for_action_slot(action->wrap(), slot_handle));
+  const int users = action->id.us;
+  PosePreviewInput proposal_input = input(3.0f);
+  proposal_input.frame = 19.0f; /* Scene 19 maps to Action 5. */
+  const auto proposal = preview_prepare(*bmain, *scene, *rig, proposal_input);
+  ASSERT_NE(proposal, nullptr);
+  ASSERT_NE(proposal->channelbag, nullptr);
+  EXPECT_EQ(proposal->action_uid, SessionUID{action->id.session_uid});
+  EXPECT_EQ(action->id.us, users);
+  EXPECT_EQ(rig->adt->actstrip, strip);
+  EXPECT_EQ(strip->act, action);
+  EXPECT_EQ(other_strip->act, action);
+  expect_same_curves(baseline, source_bag());
+  insert_location(19.0f, 3.0f);
+  expect_same_curves(*proposal->channelbag, source_bag());
+  const FCurve *curve = proposal->channelbag->fcurve_find({"pose.bones[\"Bone\"].location", 0});
+  ASSERT_NE(curve, nullptr);
+  ASSERT_EQ(curve->totvert, 3);
+  EXPECT_FLOAT_EQ(curve->bezt[1].vec[1][0], 5.0f);
+  BKE_nla_tweakmode_exit({rig->id, *rig->adt});
+}
+
+TEST_F(MeshOnionPreviewTest, NlaAdditiveInfluenceMatchesNativeConfirmation)
+{
+  bAction *lower_action = id_cast<bAction *>(BKE_id_copy(bmain, &rig->adt->action->id));
+  add_strip(*lower_action);
+  rig->adt->act_blendmode = NLASTRIP_MODE_ADD;
+  rig->adt->act_influence = 0.4f;
+  const animrig::Channelbag baseline(source_bag());
+  const int users = lower_action->id.us;
+  const auto proposal = preview_prepare(*bmain, *scene, *rig, input(3.0f));
+  ASSERT_NE(proposal, nullptr);
+  ASSERT_NE(proposal->channelbag, nullptr);
+  expect_same_curves(baseline, source_bag());
+  EXPECT_EQ(lower_action->id.us, users);
+  insert_location(5.0f, 3.0f);
+  expect_same_curves(*proposal->channelbag, source_bag());
+}
+
+TEST_F(MeshOnionPreviewTest, FractionallyScaledTweakPreservesAlignedHandles)
+{
+  ASSERT_TRUE(animrig::unassign_action(rig->id));
+  const float frames[] = {1.0f, 8.0f, 15.0f, 23.0f, 30.0f};
+  const float values[] = {-0.23933783f, -0.15113649f, -0.05122352f, -0.17220214f, -0.23933783f};
+  for (int i = 0; i < 5; i++) {
+    insert_location(frames[i], values[i]);
+  }
+  bAction *action = rig->adt->action;
+  for (FCurve *curve :
+       animrig::channelbag_for_action_slot(action->wrap(), rig->adt->slot_handle)->fcurves())
+  {
+    for (int i : {1, 3}) {
+      curve->bezt[i].h1 = curve->bezt[i].h2 = HD_ALIGN;
+    }
+    BKE_fcurve_deselect_all_keys(*curve);
+    BKE_fcurve_handles_recalc(*curve);
+  }
+  NlaStrip *strip = add_strip(*action, 5.0f);
+  strip->actend = 30.0f;
+  strip->scale = 1.5f;
+  strip->end = 48.5f;
+  ASSERT_TRUE(animrig::unassign_action(rig->id));
+  BKE_nlatrack_set_active(&rig->adt->nla_tracks, rig->adt->nla_tracks.first());
+  strip->flag |= NLASTRIP_FLAG_ACTIVE | NLASTRIP_FLAG_SYNC_LENGTH;
+  ASSERT_TRUE(BKE_nla_tweakmode_enter({rig->id, *rig->adt}));
+  PosePreviewInput requested = input(-0.1216193214f);
+  requested.frame = 17.0f;
+  requested.key_flags = INSERTKEY_AVAILABLE;
+  const auto prepared = preview_prepare(*bmain, *scene, *rig, requested);
+  ASSERT_NE(prepared, nullptr);
+  insert_location(requested.frame, requested.bones[0].location[0], INSERTKEY_AVAILABLE);
+  expect_same_curves(*prepared->channelbag, source_bag());
+  for (int i : source_bag().fcurves().index_range()) {
+    const FCurve &actual = *source_bag().fcurve(i);
+    const FCurve &expected = *prepared->channelbag->fcurve(i);
+    for (int key = 0; key < actual.totvert; key++) {
+      for (int handle = 0; handle < 3; handle++) {
+        for (int axis = 0; axis < 3; axis++) {
+          EXPECT_EQ(actual.bezt[key].vec[handle][axis], expected.bezt[key].vec[handle][axis]);
+        }
+      }
+    }
+  }
+  BKE_nla_tweakmode_exit({rig->id, *rig->adt});
+}
+
+TEST_F(MeshOnionPreviewTest, NlaOnlyCreatesPrivateActionOnlyWhenNativeKeyingDoes)
+{
+  bAction *strip_action = rig->adt->action;
+  NlaStrip *strip = add_strip(*strip_action);
+  ASSERT_TRUE(animrig::unassign_action(rig->id));
+  const int users = strip_action->id.us;
+  const int action_count = bmain->actions.count();
+  const auto unkeyed = preview_prepare(*bmain, *scene, *rig, input(4.0f, false));
+  ASSERT_NE(unkeyed, nullptr);
+  EXPECT_FALSE(unkeyed->assign_action);
+  EXPECT_EQ(unkeyed->channelbag, nullptr);
+  EXPECT_EQ(unkeyed->action_template, nullptr);
+  PosePreviewInput available = input(3.0f);
+  available.key_flags = INSERTKEY_AVAILABLE;
+  const auto available_only = preview_prepare(*bmain, *scene, *rig, available);
+  ASSERT_NE(available_only, nullptr);
+  EXPECT_FALSE(available_only->assign_action);
+  const auto keyed = preview_prepare(*bmain, *scene, *rig, input(3.0f));
+  ASSERT_NE(keyed, nullptr);
+  EXPECT_TRUE(keyed->assign_action);
+  EXPECT_FALSE(keyed->action_uid.is_generated());
+  ASSERT_NE(keyed->action_template, nullptr);
+  EXPECT_EQ(rig->adt->action, nullptr);
+  EXPECT_EQ(strip->act, strip_action);
+  EXPECT_EQ(strip_action->id.us, users);
+  EXPECT_EQ(bmain->actions.count(), action_count);
+
+  Main *private_main = BKE_main_new();
+  Object *private_rig = id_cast<Object *>(
+      BKE_id_copy_ex(nullptr, &rig->id, nullptr, LIB_ID_CREATE_LOCALIZE | LIB_ID_COPY_NO_PREVIEW));
+  bAction *private_strip_action = id_cast<bAction *>(BKE_id_copy_ex(
+      nullptr, &strip_action->id, nullptr, LIB_ID_CREATE_LOCALIZE | LIB_ID_COPY_NO_PREVIEW));
+  private_rig->data = nullptr;
+  private_rig->adt->nla_tracks.first()->strips.first()->act = private_strip_action;
+  BKE_libblock_management_main_add(private_main, &private_strip_action->id);
+  BKE_libblock_management_main_add(private_main, &private_rig->id);
+  Map<SessionUID, Object *> objects;
+  objects.add(SessionUID{rig->id.session_uid}, private_rig);
+  Map<SessionUID, bAction *> actions;
+  PreviewApplyState state;
+  bool changed = false;
+  ASSERT_TRUE(preview_apply(*keyed, *private_main, objects, actions, state, &changed));
+  EXPECT_TRUE(changed);
+  ASSERT_NE(private_rig->adt->action, nullptr);
+  EXPECT_NE(private_rig->adt->action, strip_action);
+  bAction *created_action = private_rig->adt->action;
+  ASSERT_TRUE(preview_apply(*keyed, *private_main, objects, actions, state, &changed));
+  EXPECT_FALSE(changed); /* Repeated drag proposals reuse Action topology and graph relations. */
+  EXPECT_EQ(private_rig->adt->action, created_action);
+  ASSERT_TRUE(preview_apply(*unkeyed, *private_main, objects, actions, state, &changed));
+  EXPECT_TRUE(changed);
+  EXPECT_EQ(private_rig->adt->action, nullptr);
+  EXPECT_EQ(strip_action->id.us, users);
+  BKE_main_free(private_main);
+
+  insert_location(5.0f, 3.0f);
+  ASSERT_NE(rig->adt->action, nullptr);
+  ASSERT_NE(keyed->channelbag, nullptr);
+  expect_same_curves(*keyed->channelbag, source_bag());
+}
+
+TEST_F(MeshOnionPreviewTest, RelatedDataActionIsCopiedBeforeNativeSlotCreation)
+{
+  bAction *action = BKE_action_add(bmain, "DataAction");
+  AnimData *data_adt = BKE_animdata_ensure_id(&armature->id);
+  ASSERT_TRUE(animrig::assign_action(action, armature->id));
+  ASSERT_TRUE(animrig::unassign_action(rig->id));
+  armature->id.us = 1;
+  const int slots = action->wrap().slots().size();
+  const int users = action->id.us;
+  const auto proposal = preview_prepare(*bmain, *scene, *rig, input(3.0f));
+  ASSERT_NE(proposal, nullptr);
+  EXPECT_EQ(proposal->action_uid, SessionUID{action->id.session_uid});
+  ASSERT_NE(proposal->action_template, nullptr);
+  EXPECT_EQ(action->wrap().slots().size(), slots);
+  EXPECT_EQ(action->id.us, users);
+  EXPECT_EQ(rig->adt->action, nullptr);
+  EXPECT_EQ(data_adt->action, action);
+  const auto unkeyed = preview_prepare(*bmain, *scene, *rig, input(3.0f, false));
+  ASSERT_NE(unkeyed, nullptr);
+  ASSERT_NE(unkeyed->action_template, nullptr);
+  Main *private_main = BKE_main_new();
+  constexpr int flags = LIB_ID_CREATE_LOCALIZE | LIB_ID_COPY_NO_PREVIEW;
+  Object *private_rig = id_cast<Object *>(BKE_id_copy_ex(nullptr, &rig->id, nullptr, flags));
+  bAction *private_action = id_cast<bAction *>(
+      BKE_id_copy_ex(nullptr, &action->id, nullptr, flags));
+  private_rig->data = nullptr;
+  BKE_libblock_management_main_add(private_main, &private_rig->id);
+  BKE_libblock_management_main_add(private_main, &private_action->id);
+  Map<SessionUID, Object *> objects;
+  objects.add(SessionUID{rig->id.session_uid}, private_rig);
+  Map<SessionUID, bAction *> actions;
+  actions.add(SessionUID{action->id.session_uid}, private_action);
+  PreviewApplyState state;
+  bool changed = false;
+  ASSERT_TRUE(preview_apply(*proposal, *private_main, objects, actions, state, &changed));
+  EXPECT_TRUE(changed);
+  EXPECT_EQ(private_rig->adt->action, private_action);
+  EXPECT_EQ(actions.lookup(SessionUID{action->id.session_uid}), private_action);
+  EXPECT_GT(private_action->wrap().slots().size(), slots);
+  ASSERT_TRUE(preview_apply(*unkeyed, *private_main, objects, actions, state, &changed));
+  EXPECT_TRUE(changed);
+  EXPECT_EQ(private_rig->adt->action, nullptr);
+  EXPECT_EQ(private_action->wrap().slots().size(), slots);
+  EXPECT_EQ(action->id.us, users);
+  BKE_main_free(private_main);
+  insert_location(5.0f, 3.0f);
+  expect_same_curves(*proposal->channelbag, source_bag());
+}
+
+TEST_F(MeshOnionPreviewTest, RepeatedStagingNeverCountsExternalSourceReferences)
+{
+  Object *target = BKE_object_add_only_object(bmain, OB_EMPTY, "ConstraintTarget");
+  Object *shape = BKE_object_add_only_object(bmain, OB_EMPTY, "CustomShape");
+  bConstraint *constraint = BKE_constraint_add_for_pose(
+      rig, bone, "Copy Location", CONSTRAINT_TYPE_LOCLIKE);
+  static_cast<bLocateLikeConstraint *>(constraint->data)->tar = target;
+  bone->custom = shape;
+  bAction *action = rig->adt->action;
+  add_strip(*action);
+  const animrig::Channelbag baseline(source_bag());
+  const int action_users = action->id.us;
+  const int data_users = armature->id.us;
+  const int target_users = target->id.us;
+  const int shape_users = shape->id.us;
+  const int action_count = bmain->actions.count();
+  for (int iteration = 0; iteration < 24; iteration++) {
+    SCOPED_TRACE(iteration);
+    const auto packet = preview_prepare(
+        *bmain, *scene, *rig, input(float(iteration), iteration % 2));
+    ASSERT_NE(packet, nullptr);
+    EXPECT_EQ(action->id.us, action_users);
+    EXPECT_EQ(armature->id.us, data_users);
+    EXPECT_EQ(target->id.us, target_users);
+    EXPECT_EQ(shape->id.us, shape_users);
+    EXPECT_EQ(bmain->actions.count(), action_count);
+    EXPECT_EQ(static_cast<bLocateLikeConstraint *>(constraint->data)->tar, target);
+    EXPECT_EQ(bone->custom, shape);
+    expect_same_curves(baseline, source_bag());
+  }
 }
 
 }  // namespace blender::ed::mesh_onion_skin::tests

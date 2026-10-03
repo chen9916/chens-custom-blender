@@ -33,12 +33,16 @@ struct Settings {
   int before = 2;
   int after = 2;
   int step = 1;
+  bool keyed_frames_only = false;
+  bool loop_frame_range = false;
   bool operator==(const Settings &) const = default;
 };
 
 struct Sample {
   SessionUID object_uid;
   float frame;
+  /** Signed distance from the playhead, including travel across a loop boundary. */
+  float temporal_offset;
   float4x4 object_to_world;
   Array<float3> positions;
   Array<int3> triangles;
