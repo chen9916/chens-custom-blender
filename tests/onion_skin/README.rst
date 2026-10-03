@@ -310,3 +310,42 @@ package's ``ONION_SKIN_VALIDATION.json`` records the fixture metadata, source
 assertions, exact measured timings, process memory and supported limitations.
 Whole-process memory includes the asset, undo history and evaluation capsule;
 GPU memory was not measured.
+
+GPU release and existing user profile
+------------------------------------
+
+An ordinary Windows package must use the existing
+``%APPDATA%\Blender Foundation\Blender\5.3`` profile. A directory named
+``portable`` beside ``blender.exe`` selects a separate profile and hides the
+existing user add-ons. Preserve any portable profile under another directory
+name when restoring ordinary AppData discovery. The release check observes
+existing add-on names and native search paths without importing those add-ons
+or saving preferences. It fingerprints the user's preferences and startup file
+before and after the check.
+
+Build CUDA devices, OptiX devices and precompiled CUDA kernels with
+``WITH_CYCLES_DEVICE_CUDA=ON``, ``WITH_CYCLES_DEVICE_OPTIX=ON`` and
+``WITH_CYCLES_CUDA_BINARIES=ON``. The local GPU release uses CUDA 13.4.1/12.9.1,
+OptiX 8.0.0, and ``CYCLES_CUDA_BINARIES_ARCH=sm_86;sm_120;compute_75`` to cover
+the RTX 3080 and RTX 5070 Ti plus PTX fallback. Record the actual CMake cache and
+installed kernel inventory with the release results; these settings alone do
+not prove that a backend can render.
+
+Run each backend/device combination in a fresh background process, using a
+distinct workspace output directory. For example::
+
+  blender.exe --background --factory-startup --disable-autoexec --debug-cycles --python-exit-code 1 --python tests/onion_skin/check_release.py -- --output-dir E:/dev/blender/blender/mesh-onion-live-dev/release-cuda-5070 --backend CUDA --device "RTX 5070 Ti"
+  blender.exe --background --factory-startup --disable-autoexec --debug-cycles --python-exit-code 1 --python tests/onion_skin/check_release.py -- --output-dir E:/dev/blender/blender/mesh-onion-live-dev/release-optix-3080 --backend OPTIX --device "RTX 3080"
+
+Omit ``--backend`` and ``--device`` for a profile-only check. A GPU check requires
+one unambiguous eligible native device, disables all CPUs and other GPUs, and
+renders the factory scene at 32 by 32 pixels with two samples and no denoising.
+Adaptive kernel optimization is disabled in memory to exercise the bundled
+generic kernels without requesting background scene-specific compilation.
+It checks meaningful PNG pixels and records the physical device ID, build hash,
+precompiled kernel inventory and render duration in ``result.json`` and
+``ONION_RELEASE_RESULT``. Native selection and driver eligibility are checked
+before and after rendering to reject the preference-level CPU fallback. Cycles
+does not expose a Python query for the render session's actual device; retain
+the debug log as additional native kernel evidence. This checks backend startup
+and rendering, and supplies no new onion-skin performance claim.
