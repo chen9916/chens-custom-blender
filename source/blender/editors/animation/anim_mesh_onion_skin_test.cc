@@ -242,7 +242,7 @@ TEST_F(MeshOnionEvaluationTest, TimelineCenterAndOverlappingWindowsShareExactNat
   const EvaluationRequestForTest requests[] = {{5.0f}, {7.0f}};
   std::string error;
   const auto bundles = evaluate_sequence_for_test(
-      *bmain, *scene, *view_layer, *rig, {&object, 1}, {2, 2, 2}, requests, error);
+      *bmain, *scene, *view_layer, *rig, {&object, 1}, {2, 2, 2}, {requests, 2}, error);
   ASSERT_EQ(bundles.size(), 2) << error;
   EXPECT_FLOAT_EQ(bundles[0]->frame, 5.0f);
   ASSERT_EQ(bundles[0]->samples.size(), 4);
@@ -278,7 +278,7 @@ TEST_F(MeshOnionEvaluationTest, PreviewGeometryRevisionInvalidatesEveryCachedPos
   const int users = rig->id.us;
   std::string error;
   const auto bundles = evaluate_sequence_for_test(
-      *bmain, *scene, *view_layer, *rig, {&object, 1}, {2, 2, 2}, requests, error);
+      *bmain, *scene, *view_layer, *rig, {&object, 1}, {2, 2, 2}, {requests, 3}, error);
   ASSERT_EQ(bundles.size(), 3) << error;
   EXPECT_EQ(bundles[2]->geometry_revision, 2);
   bool compared_center = false;

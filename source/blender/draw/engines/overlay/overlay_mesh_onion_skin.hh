@@ -525,6 +525,7 @@ class MeshOnionSkin : Overlay {
 
   void sync_batches()
   {
+    const bool reuse_relative_slots = !screen_offset_enabled_ && !batches_screen_offset_;
     batches_screen_offset_ = screen_offset_enabled_;
     if (batch_epoch_ != bundle_->epoch) {
       batches_.clear();
@@ -532,14 +533,22 @@ class MeshOnionSkin : Overlay {
     }
     Vector<BatchSlot> previous = std::move(batches_);
     batches_.reserve(samples().size());
-    for (const ed::mesh_onion_skin::Sample &sample : samples()) {
+    for (const int sample_index : samples().index_range()) {
+      const ed::mesh_onion_skin::Sample &sample = samples()[sample_index];
       BatchSlot slot;
-      for (BatchSlot &candidate : previous) {
-        if (candidate.object_uid == sample.object_uid && candidate.frame == sample.frame &&
-            candidate.geometry)
-        {
-          slot = std::move(candidate);
-          break;
+      if (reuse_relative_slots && sample_index < previous.size()) {
+        /* Ordinary centered ghosts update their existing slots as before. Only the scrolling
+         * timeline needs GPU allocations to follow persistent authored-frame identities. */
+        slot = std::move(previous[sample_index]);
+      }
+      else {
+        for (BatchSlot &candidate : previous) {
+          if (candidate.object_uid == sample.object_uid && candidate.frame == sample.frame &&
+              candidate.geometry)
+          {
+            slot = std::move(candidate);
+            break;
+          }
         }
       }
       slot.object_uid = sample.object_uid;
