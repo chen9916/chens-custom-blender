@@ -8,93 +8,20 @@ Run interactive tests in a separate Blender process. They change the loaded
 session, delete test objects and quit automatically; they do not save the loaded
 fixture. Keep the original production file separate from generated test copies.
 
+The `current design <../../doc/onion_skin/DESIGN.md>`_ describes the implemented
+architecture. Workspace build and packaging instructions live in
+``E:/dev/blender/blender/AGENTS.md``. The former ``onion-skin`` prototype design
+has been removed; use the active ``mesh-onion-live`` worktree.
+
 Architecture and supported scope
 --------------------------------
 
-The public contract in ``source/blender/editors/include/ED_mesh_onion_skin.hh``
-provides main-thread requests and immutable bundles containing owned positions,
-triangles, sample frames and object transforms. The evaluator in
-``source/blender/editors/animation/anim_mesh_onion_skin.cc`` builds a private,
-copied and remapped dependency capsule. A native WM job serializes sampling;
-Blender's existing dependency evaluation and geometry tasks provide internal
-parallelism. Latest input replaces pending input instead of building a queue.
-Completed coherent bundles can be published during continuous input even when a
-newer request is pending, provided the result belongs to the current epoch and
-is newer than the displayed result.
-Supported modal pose edits stage their copied animation immediately after capture;
-the job timer handles cold activation and changes to time or sampling settings.
-This removes a producer timer wait while retaining one pending worker request.
-
-The pose adapter in
-``source/blender/editors/transform/transform_convert_armature.cc`` captures
-supported authored transform channels after native mirroring. Main-thread staging
-in ``source/blender/editors/animation/anim_mesh_onion_skin_preview.cc`` copies the
-authored animation and uses Blender's native key inserter in a private owned rig.
-This includes native NLA tweak-time mapping and an owned new-Action template when
-the source has no active Action. Staging remains on the main
-thread because key insertion reads user preferences. The worker applies the
-resulting private curves, evaluates sample times and copies geometry; it never
-inserts keys into the live scene or caches evaluated mesh pointers.
-
-``source/blender/draw/engines/overlay/overlay_mesh_onion_skin.hh`` owns GPU batches
-per viewport. Drawing queues requests and reads completed snapshots. Dynamic
-vertex buffers are reused when vertex counts agree; index buffers are rebuilt
-when actual tessellation changes. Ghosts use native uniform-color drawing with
-alpha blending, optional depth testing, and no depth writes or selection picking.
-
-The evaluation envelope is one active posed armature, directly skinned meshes,
-native Action/NLA animation, authored standard IK and supported native transform
-constraints. Modifier evaluation includes Armature, Mirror and simple Solidify;
-terminal Subdivision modifiers are shown as the deformation cage. Conservative
-preflight estimates account for constructive modifier expansion before admitting
-work. Simulations, instancing, complex Solidify and arbitrary modifier stacks
-remain outside the audited envelope.
-
-Native driver evaluation supports Average, Sum, Minimum and Maximum drivers plus
-scripted drivers handled by Blender's native simple expression evaluator. General
-Python expressions and driver namespace
-callbacks are rejected. Referenced object, armature, mesh, shape-key and Action
-data are privately copied and remapped. Scene path inputs and driver-facing custom
-properties are copied without copying the live scene's entire contents. View-layer
-context properties must agree before different views share a CPU cache. These
-checks support the supplied mannequin's rig and shape-key driver setup without
-allowing arbitrary source references into the worker.
-Drivers embedded in NLA strip controls and Scene paths outside the copied
-driver-facing settings are rejected with an explicit status message.
-Driver path auditing also rejects intermediate shading IDs and redirected Scene
-reads through ID-valued properties. Safe invalid properties retain Blender's
-native fallback behavior. Preview updates tag the edited rig and changed Actions;
-native frame-change relations update the other animated dependencies.
-
-The native Pose Mode header toggle opens a popover with two past and two future
-samples by default, frame step one, and opacity 0.15. Before/after counts are
-limited to four each. Keyframes Only selects the nearest authored key times,
-including supported NLA time mapping, and disables Frame Step. Animated or
-noninvertible NLA key-time mapping disables keyed-only sampling with a status
-message; ordinary frame sampling can still evaluate that NLA animation. Loop
-Frame Range wraps across the inclusive scene Start/End range. Each sample retains
-its signed requested temporal offset so wrapped past samples keep past coloring
-and distance fade uses their true distance from the playhead.
-
-Sampling settings, including keyed-only and looping, are shared across enabled
-viewports showing the same scene and active rig. Opacity, in-front display,
-Distance Fade and Fade Strength are local viewport appearance settings. Fade is
-disabled by default; strength defaults to 0.75. Enabled fade applies a smooth
-monotonic falloff from the nearest to farthest actual temporal distance, shared
-across meshes and both directions. Nearest samples retain configured opacity;
-farthest samples retain 15 percent of it at maximum strength. Equal-distance
-samples retain full opacity. Appearance changes redraw GPU batches without
-restarting CPU evaluation. RNA lives in ``source/blender/makesrna/intern/rna_space.cc``.
-
-Live temporary-key preview supports native translate, rotate, trackball and scale
-of controls in one rig, including native mirrored controls, native NLA tweak
-mapping and native creation of an active Action for NLA-only source animation.
-The editable Action uses one layer and one strip. Visual keying, custom keying
-sets, targetless/automatic IK, iTaSC and multi-rig transforms remain unsupported.
-ID-valued custom properties that cannot be safely owned by the new-Action preview
-template are rejected. Unsupported evaluation clears ghosts and reports a
-status message. With auto-key disabled, unkeyed channels can affect ghosts;
-authored animation curves continue to determine keyed channels at sample times.
+Read the current design for evaluation ownership, native driver/NLA limits,
+live Auto Key preview, cache validity, sampling and viewport appearance policy.
+This guide documents how to validate those behaviors. Use native operators and
+source-preservation checks; Python must not evaluate or draw substitute ghosts.
+When a feature exceeds the supported envelope, check the native status rather
+than interpreting unchanged or absent ghosts as successful evaluation.
 
 Fixture preparation
 -------------------
@@ -279,10 +206,10 @@ size guards limit this initial feature, but private dependency state, concurrent
 snapshots and per-viewport GPU buffers also consume memory. Report measured peak
 memory when assessing a production rig.
 
-Measured development build
---------------------------
+Historical interaction baseline
+-------------------------------
 
-The final control-rig candidate was measured on a Ryzen 9 7900X with an
+An earlier control-rig candidate was measured on a Ryzen 9 7900X with an
 RTX 5070 Ti (driver 616.92), using 120 continuous native modal moves before
 cancel and another 120 before confirm. Warm-cache latency from native pose input
 to native draw submission was:
@@ -304,12 +231,35 @@ four-sample native graph solve takes about 51 ms median and dominates worker
 cost. Reducing its samples improves worker cost but does not guarantee low
 end-to-end latency through viewport redraw scheduling.
 
-The tests validated the uncommitted extension with embedded checkpoint hash
-``0d6467bd605c``; the final package rebuild updates the commit metadata. The
-package's ``ONION_SKIN_VALIDATION.json`` records the fixture metadata, source
-assertions, exact measured timings, process memory and supported limitations.
+These runs used binaries embedding checkpoint hash ``0d6467bd605c`` while
+validating the then-uncommitted control-rig changes. The historical report
+``ONION_SKIN_VALIDATION.json`` identifies their final source commit as
+``120ea670ff1351d3bbd09b66b85484cd7cadbc41`` and preserves the original per-case
+build metadata. These figures predate smooth timeline scrolling and scene-distance
+spacing; they are not fresh performance measurements of the current release.
 Whole-process memory includes the asset, undo history and evaluation capsule;
-GPU memory was not measured.
+GPU memory was not measured. Keep historical evidence labeled when copying it
+into a later package.
+
+Current tested application
+--------------------------
+
+The camera-distance package uses code commit
+``e7763b5893b28918bad78d63f019a959e2bea36a`` and is installed at
+``E:/dev/blender/blender/blender-mesh-onion-skin-native-5.3-camera-distance``.
+It passed 72 native regression tests, settings persistence checks, and 109
+focused Running viewport checks. The viewport run took about 12.22 seconds and
+observed rendered sides, zoom, perspective distance, rotation, fractional
+scrolling, native forward/reverse playback and cache reuse. This is correctness
+evidence, not a new interaction-latency benchmark.
+
+``ONION_SKIN_SCREEN_OFFSET_VALIDATION.json`` and
+``ONION_SKIN_PACKAGE_SMOKE.json`` record this executable's current results.
+``ONION_SKIN_GPU_RELEASE_VALIDATION.json`` records historical renders at
+``9fc3cde71ce8841e93d757401e8c3987a00f48ed``; those renders were not repeated for
+the camera-distance package. Its kernels and normal AppData paths were checked
+during packaging. Documentation-only commits after this release do not change
+the executable's embedded hash.
 
 GPU release and existing user profile
 ------------------------------------
@@ -350,41 +300,13 @@ does not expose a Python query for the render session's actual device; retain
 the debug log as additional native kernel evidence. This checks backend startup
 and rendering, and supplies no new onion-skin performance claim.
 
-Screen-space ghost offsets
---------------------------
+Scrolling and camera-distance viewport check
+--------------------------------------------
 
-The Pose Mode onion-skin popover has a viewport-local ``Screen Space Offset``
-toggle, a separate ``Reverse Direction`` toggle, and ``Pixels per Frame``.
-By default, past ghosts appear left and future ghosts appear right. Reversing swaps
-their screen sides while retaining the past/future colors. Spacing defaults to
-24 pixels per frame and uses the actual temporal distance, including sparse keys
-and inclusive scene-range looping.
-
-Enable ``Scene Distance`` to use ``Distance per Frame`` instead of pixels. This
-uses Blender's scene units and translates the ghost along the viewer's horizontal
-axis before projection. Zoom and camera distance therefore affect apparent
-separation naturally, including in perspective and camera views. Each point
-keeps its view depth; clipping planes apply to the displaced ghost. The setting
-is local to the viewport and defaults to 0.1 scene units per frame. Existing
-files retain pixel mode and their original spacing.
-
-In pixel mode, translation occurs after projection, so camera rotation and zoom
-do not change the pixel spacing. Both spacing modes use a rolling timeline
-anchored to scene Start,
-or to authored key times with Keyframes Only. A sampled pose keeps its identity
-as it moves from future through the current model into the past. The center pose
-is retained, colors blend across the center, and outer guard poses fade at the
-window edges. New publications therefore do not reset poses into fixed slots.
-
-The private worker caches exact native evaluations, shares immutable geometry
-between ordinary and timeline views, and evaluates only missing frame poses.
-Cache storage is bounded to 32 frames and 256 MiB; pose edits invalidate the
-geometry revision. Display-only interpolation and native redraws smooth screen
-motion between playback ticks without changing scene time or evaluating rigs
-inside drawing. At a matching evaluated frame, the crossing pose uses the native
-mesh and object matrix. The live model retains Blender's normal playback cadence.
-Disabling offset restores ordinary centered sampling. Appearance controls remain
-independent per view, including when both modes are visible together.
+The current design specifies the pixel/scene-distance controls, reverse direction,
+continuous scrolling and geometry-cache behavior. Validate appearance changes in
+a real viewport; diagnostic uniforms alone cannot prove the shader rendered the
+correct separation. Keep these checks separate from latency measurement.
 
 The focused GUI check uses the disposable Mixamo fixture, observes native draw
 constants and framebuffer colors. It follows the same cached poses across
