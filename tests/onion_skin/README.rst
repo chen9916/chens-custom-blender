@@ -360,8 +360,17 @@ their screen sides while retaining the past/future colors. Spacing defaults to
 24 pixels per frame and uses the actual temporal distance, including sparse keys
 and inclusive scene-range looping.
 
-Translation occurs after projection, so camera rotation and zoom do not change
-the pixel spacing. Offset mode uses a rolling timeline anchored to scene Start,
+Enable ``Scene Distance`` to use ``Distance per Frame`` instead of pixels. This
+uses Blender's scene units and translates the ghost along the viewer's horizontal
+axis before projection. Zoom and camera distance therefore affect apparent
+separation naturally, including in perspective and camera views. Each point
+keeps its view depth; clipping planes apply to the displaced ghost. The setting
+is local to the viewport and defaults to 0.1 scene units per frame. Existing
+files retain pixel mode and their original spacing.
+
+In pixel mode, translation occurs after projection, so camera rotation and zoom
+do not change the pixel spacing. Both spacing modes use a rolling timeline
+anchored to scene Start,
 or to authored key times with Keyframes Only. A sampled pose keeps its identity
 as it moves from future through the current model into the past. The center pose
 is retained, colors blend across the center, and outer guard poses fade at the
@@ -380,7 +389,10 @@ independent per view, including when both modes are visible together.
 The focused GUI check uses the disposable Mixamo fixture, observes native draw
 constants and framebuffer colors. It follows the same cached poses across
 publications, fractional movement, center crossings, forward/reverse playback
-and loop boundaries, and checks mixed viewport modes without saving the asset::
+and loop boundaries, and checks mixed viewport modes without saving the asset.
+Scene-distance checks observe framebuffer separation under orthographic zoom,
+perspective distance changes, rotation, reversal and fractional movement. Changing
+spacing or the view must retain cached geometry without vertex uploads::
 
   blender.exe --factory-startup --disable-autoexec mixamo_running.blend --python tests/onion_skin/run_screen_offset_test.py -- --output <directory> --log <redirected-stdout.log>
 

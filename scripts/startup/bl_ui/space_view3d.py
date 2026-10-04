@@ -7785,7 +7785,11 @@ class VIEW3D_PT_overlay_mesh_onion_skin(Panel):
         col.prop(overlay, "mesh_onion_skin_screen_offset")
         sub = col.column()
         sub.active = overlay.mesh_onion_skin_screen_offset
-        sub.prop(overlay, "mesh_onion_skin_screen_offset_spacing")
+        sub.prop(overlay, "mesh_onion_skin_screen_offset_world_space")
+        if overlay.mesh_onion_skin_screen_offset_world_space:
+            sub.prop(overlay, "mesh_onion_skin_screen_offset_distance")
+        else:
+            sub.prop(overlay, "mesh_onion_skin_screen_offset_spacing")
         sub.prop(overlay, "mesh_onion_skin_screen_offset_reverse")
         col.prop(overlay, "mesh_onion_skin_in_front")
 

@@ -5596,6 +5596,29 @@ static void rna_def_space_view3d_overlay(BlenderRNA *brna)
       prop, "Reverse Direction", "Place past poses on the right and future poses on the left");
   RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
 
+  prop = RNA_def_property(
+      srna, "mesh_onion_skin_screen_offset_world_space", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(
+      prop, nullptr, "overlay.flag", V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET_WORLD_SPACE);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop,
+                           "Scene Distance",
+                           "Use scene distance along the viewer's horizontal axis for spacing; "
+                           "zoom and perspective affect the visible separation");
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
+  prop = RNA_def_property(
+      srna, "mesh_onion_skin_screen_offset_distance", PROP_FLOAT, PROP_DISTANCE);
+  RNA_def_property_float_sdna(prop, nullptr, "overlay.mesh_onion_skin_screen_offset_distance");
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 0.0f, 10.0f, 0.1f, 3);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(prop,
+                           "Distance per Frame",
+                           "Scene distance along the viewer's horizontal axis for each frame from "
+                           "the current pose");
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
   prop = RNA_def_property(srna, "mesh_onion_skin_screen_offset_spacing", PROP_FLOAT, PROP_PIXEL);
   RNA_def_property_float_sdna(prop, nullptr, "overlay.mesh_onion_skin_screen_offset_spacing");
   RNA_def_property_range(prop, 0.0f, 1000.0f);

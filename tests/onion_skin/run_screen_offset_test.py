@@ -22,6 +22,8 @@ import traceback
 import bpy
 import gpu
 import numpy as np
+from bpy_extras import view3d_utils
+from mathutils import Quaternion, Vector
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--output', type=Path, required=True)
@@ -52,6 +54,7 @@ overlay.mesh_onion_skin_opacity = 0.7
 overlay.mesh_onion_skin_screen_offset = True
 overlay.mesh_onion_skin_screen_offset_reverse = False
 overlay.mesh_onion_skin_screen_offset_spacing = 24.0
+overlay.mesh_onion_skin_screen_offset_world_space = False
 overlay.show_bones = False
 overlay.show_floor = overlay.show_axis_x = overlay.show_axis_y = False
 overlay.show_extras = overlay.show_relationship_lines = False
@@ -75,7 +78,8 @@ def source_state():
 original = source_state()
 report = {'build_hash': bpy.app.build_hash.decode(), 'checks': [], 'observations': {},
           'scope': 'native stable poses, center alignment, rendered sides, fractional scrolling, '
-                   'forward/backward native playback and mixed viewport sampling'}
+                   'camera-dependent scene-distance spacing, forward/backward native playback '
+                   'and mixed viewport sampling'}
 started = time.perf_counter()
 state = {'phase': 'normal', 'ready': started + 1.0, 'deadline': started + 8.0, 'pixels': {}}
 
@@ -98,31 +102,35 @@ def rows():
     result = []
     for match in re.finditer(r'^mesh_onion_skin_screen (.+)$', text, re.MULTILINE):
         data = dict(re.findall(r'(\w+)=([^\s]+)', match.group(1)))
-        if not {'native_frame', 'alpha', 'ranks', 'payloads', 'submitted'} <= data.keys():
+        if not {'native_frame', 'alpha', 'ranks', 'payloads', 'submitted', 'world_space',
+                'distance', 'world_offsets'} <= data.keys():
             continue
-        for key in ('frames', 'offsets', 'pixels', 'alpha', 'ranks'):
+        for key in ('frames', 'offsets', 'pixels', 'world_offsets', 'alpha', 'ranks'):
             data[key] = [float(value) for value in data[key].split(',')]
         for key in ('payloads', 'submitted'):
             data[key] = [int(value) for value in data[key].split(',')]
-        for key in ('generation', 'epoch', 'enabled', 'reverse', 'vbo_uploads', 'batch_creates'):
+        for key in ('generation', 'epoch', 'enabled', 'reverse', 'vbo_uploads', 'batch_creates', 'world_space'):
             data[key] = int(data[key])
-        for key in ('playhead', 'native_frame', 'center', 'spacing'):
+        for key in ('playhead', 'native_frame', 'center', 'spacing', 'distance'):
             data[key] = float(data[key])
         if all(len(data[key]) == len(data['frames']) for key in
-               ('offsets', 'pixels', 'alpha', 'ranks', 'payloads', 'submitted')):
+               ('offsets', 'pixels', 'world_offsets', 'alpha', 'ranks', 'payloads', 'submitted')):
             result.append(data)
     return result
 
 
 def samples(row):
     return {frame: {'offset': row['offsets'][i], 'pixel': row['pixels'][i],
+                    'world_offset': row['world_offsets'][i],
                     'alpha': row['alpha'][i], 'rank': row['ranks'][i],
                     'payload': row['payloads'][i], 'submitted': row['submitted'][i]}
             for i, frame in enumerate(row['frames'])}
 
 
 def observe_pixels():
-    if bpy.context.area != area or state['phase'] not in ('normal', 'reverse'):
+    if bpy.context.area != area or state['phase'] not in (
+            'normal', 'reverse', 'world_normal', 'world_reverse', 'world_zoom',
+            'world_perspective', 'world_perspective_far', 'world_orbit'):
         return
     x, y, width, height = gpu.state.viewport_get()
     buffer = gpu.state.active_framebuffer_get().read_color(x, y, width, height, 4, 0, 'FLOAT')
@@ -134,6 +142,7 @@ def observe_pixels():
     if blue_x.size > 100 and red_x.size > 100:
         state['pixels'][state['phase']] = {'past_x': float(blue_x.mean()),
                                            'future_x': float(red_x.mean()),
+                                           'separation': float(abs(red_x.mean() - blue_x.mean())),
                                            'past_pixels': int(blue_x.size),
                                            'future_pixels': int(red_x.size)}
 
@@ -163,9 +172,16 @@ def finish():
 
 def pixel_law(row):
     sign = -1 if row['reverse'] else 1
-    spacing = row['spacing'] if row['enabled'] else 0.0
+    spacing = row['spacing'] if row['enabled'] and not row['world_space'] else 0.0
     return all(abs(pixel - offset * spacing * sign) < 2e-4
                for pixel, offset in zip(row['pixels'], row['offsets']))
+
+
+def world_law(row):
+    sign = -1 if row['reverse'] else 1
+    distance = row['distance'] if row['enabled'] and row['world_space'] else 0.0
+    return all(abs(world_offset - offset * distance * sign) < 2e-4
+               for world_offset, offset in zip(row['world_offsets'], row['offsets']))
 
 
 def center_visible(row, frame):
@@ -286,7 +302,9 @@ def tick():
                     and abs(row['playhead'] - target) < 1e-5
                     and row['enabled'] == int(overlay.mesh_onion_skin_screen_offset)
                     and row['reverse'] == int(overlay.mesh_onion_skin_screen_offset_reverse)
-                    and abs(row['spacing'] - overlay.mesh_onion_skin_screen_offset_spacing) < 1e-5]
+                    and abs(row['spacing'] - overlay.mesh_onion_skin_screen_offset_spacing) < 1e-5
+                    and row['world_space'] == int(overlay.mesh_onion_skin_screen_offset_world_space)
+                    and abs(row['distance'] - overlay.mesh_onion_skin_screen_offset_distance) < 1e-5]
         if phase == 'mixed':
             state['second'].tag_redraw()
             matching = [row for row in matching if center_visible(row, 13)]
@@ -304,7 +322,7 @@ def tick():
             matching = [row for row in matching if center_visible(row, 13) and 12 in row['frames']]
         elif phase in ('forward_ready', 'backward_ready'):
             matching = [row for row in matching if abs(row['center'] - target) < 1e-5]
-        elif phase == 'fractional':
+        elif phase in ('fractional', 'world_fractional'):
             matching = [row for row in matching if 13 in row['frames']]
         else:
             matching = [row for row in matching if center_visible(row, 13)]
@@ -312,17 +330,28 @@ def tick():
             assert now < state['deadline'], 'No matching native stable-timeline draw: ' + phase
             return 0.04
         row = matching[-1]
-        if phase in ('normal', 'reverse'):
+        if phase in ('normal', 'reverse', 'world_normal', 'world_reverse', 'world_zoom',
+                     'world_perspective', 'world_perspective_far', 'world_orbit'):
             image = state['pixels'].get(phase)
             if image is None:
                 assert now < state['deadline'], 'Colored native ghosts were not observed: ' + phase
                 return 0.04
             check(phase + ' renders past/future ghosts on correct screen sides',
-                  image['past_x'] < image['future_x'] if phase == 'normal' else image['past_x'] > image['future_x'])
+                  image['past_x'] > image['future_x'] if row['reverse'] else image['past_x'] < image['future_x'])
             row['viewport_pixels'] = image
-            with bpy.context.temp_override(window=window, area=area, region=region):
-                bpy.ops.screen.screenshot(filepath=str(args.output / (phase + '.png')))
+            if phase in ('normal', 'reverse', 'world_normal', 'world_orbit'):
+                with bpy.context.temp_override(window=window, area=area, region=region):
+                    bpy.ops.screen.screenshot(filepath=str(args.output / (phase + '.png')))
         check(phase + ' submits correct signed native pixels', pixel_law(row))
+        check(phase + ' submits correct signed scene distances', world_law(row))
+        if phase.startswith('world_') and phase != 'world_setup':
+            initial = report['observations']['zoom']
+            check(phase + ' reuses immutable geometry', same_payloads(initial, row))
+            check(phase + ' does not upload geometry', row['vbo_uploads'] == initial['vbo_uploads'])
+            check(phase + ' does not request another evaluation', row['generation'] == initial['generation'])
+            if phase != 'world_fractional':
+                check(phase + ' keeps centered geometry undisplaced',
+                      center_visible(row, 13) and samples(row)[13]['world_offset'] == 0)
         report['observations'][phase] = row
         if phase == 'normal':
             check('timeline retains the aligned zero-offset current pose', center_visible(row, 13))
@@ -345,6 +374,63 @@ def tick():
             transition('zoom')
         elif phase == 'zoom':
             check('zoom preserves pixel displacement', row['pixels'] == report['observations']['spacing']['pixels'])
+            rv3d = view.region_3d
+            state['world_view'] = {'rotation': rv3d.view_rotation.copy(),
+                                   'perspective': rv3d.view_perspective,
+                                   'distance': rv3d.view_distance}
+            overlay.mesh_onion_skin_screen_offset_world_space = True
+            rv3d.view_perspective = 'ORTHO'
+            transition('world_setup')
+        elif phase == 'world_setup':
+            rv3d = view.region_3d
+            location = rv3d.view_location.copy()
+            right = (rv3d.view_rotation @ Vector((1, 0, 0))).normalized()
+            center = view3d_utils.location_3d_to_region_2d(region, rv3d, location)
+            displaced = view3d_utils.location_3d_to_region_2d(region, rv3d, location + right)
+            check('native viewer horizontal projection is available',
+                  center is not None and displaced is not None and displaced.x > center.x)
+            overlay.mesh_onion_skin_screen_offset_distance = 75.0 / (displaced.x - center.x)
+            transition('world_normal')
+        elif phase == 'world_normal':
+            overlay.mesh_onion_skin_screen_offset_reverse = True
+            transition('world_reverse')
+        elif phase == 'world_reverse':
+            overlay.mesh_onion_skin_screen_offset_reverse = False
+            view.region_3d.view_distance *= 2.0
+            transition('world_zoom')
+        elif phase == 'world_zoom':
+            ratio = row['viewport_pixels']['separation'] / report['observations']['world_normal']['viewport_pixels']['separation']
+            check('orthographic zoom halves rendered scene-distance separation', 0.4 < ratio < 0.6)
+            row['separation_ratio'] = ratio
+            view.region_3d.view_distance = state['world_view']['distance']
+            view.region_3d.view_perspective = 'PERSP'
+            transition('world_perspective')
+        elif phase == 'world_perspective':
+            view.region_3d.view_distance *= 2.0
+            transition('world_perspective_far')
+        elif phase == 'world_perspective_far':
+            ratio = row['viewport_pixels']['separation'] / report['observations']['world_perspective']['viewport_pixels']['separation']
+            check('perspective camera distance reduces rendered separation', 0.25 < ratio < 0.8)
+            row['separation_ratio'] = ratio
+            view.region_3d.view_distance = state['world_view']['distance']
+            view.region_3d.view_rotation = Quaternion((0, 0, 1), 0.65) @ state['world_view']['rotation']
+            transition('world_orbit')
+        elif phase == 'world_orbit':
+            scene.frame_set(13, subframe=0.25)
+            transition('world_fractional')
+        elif phase == 'world_fractional':
+            pose = samples(row)[13]
+            check('fractional scene-distance scrolling retains the frame13 pose',
+                  pose['payload'] == samples(report['observations']['world_normal'])[13]['payload'])
+            check('fractional scene-distance scrolling moves by a quarter-frame',
+                  abs(pose['offset'] + 0.25) < 1e-5
+                  and abs(pose['world_offset'] + 0.25 * row['distance']) < 2e-4)
+            scene.frame_set(13)
+            rv3d = view.region_3d
+            rv3d.view_distance = state['world_view']['distance']
+            rv3d.view_rotation = state['world_view']['rotation']
+            rv3d.view_perspective = state['world_view']['perspective']
+            overlay.mesh_onion_skin_screen_offset_world_space = False
             scene.frame_set(13, subframe=0.25)
             transition('fractional')
         elif phase == 'fractional':

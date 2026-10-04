@@ -79,7 +79,9 @@ class MeshOnionSkin : Overlay {
   bool geometry_dump_enabled_ = false;
   bool screen_offset_enabled_ = false;
   bool screen_offset_reversed_ = false;
+  bool screen_offset_world_space_ = false;
   float screen_offset_spacing_ = 0.0f;
+  float screen_offset_distance_ = 0.0f;
   float playhead_frame_ = 0.0f;
   float native_frame_ = 0.0f;
   float playhead_rank_ = 0.0f;
@@ -134,7 +136,10 @@ class MeshOnionSkin : Overlay {
     screen_offset_enabled_ = state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET;
     screen_offset_reversed_ = state.overlay.flag &
                               V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET_REVERSE;
+    screen_offset_world_space_ = state.overlay.flag &
+                                 V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET_WORLD_SPACE;
     screen_offset_spacing_ = state.overlay.mesh_onion_skin_screen_offset_spacing;
+    screen_offset_distance_ = state.overlay.mesh_onion_skin_screen_offset_distance;
     DRWState draw_state = DRW_STATE_WRITE_COLOR | DRW_STATE_BLEND_ALPHA;
     if (!(state.overlay.flag & V3D_OVERLAY_MESH_ONION_SKIN_IN_FRONT)) {
       draw_state |= DRW_STATE_DEPTH_LESS_EQUAL;
@@ -373,6 +378,7 @@ class MeshOnionSkin : Overlay {
       sub.push_constant("ucolor", color);
       if (screen_offset_enabled_) {
         sub.push_constant("screen_offset", screen_pixel_offset(sample));
+        sub.push_constant("world_offset", screen_world_offset(sample));
       }
       const ResourceID handle = manager.resource_handle(sample.geometry->object_to_world);
       sub.draw(batches_[i].batch.get(), ResourceIDRange(handle));
@@ -453,6 +459,7 @@ class MeshOnionSkin : Overlay {
       printf(
           "mesh_onion_skin_screen generation=%llu epoch=%llu playhead=%.9g native_frame=%.9g "
           "center=%.9g enabled=%d reverse=%d spacing=%.9g vbo_uploads=%llu batch_creates=%llu "
+          "world_space=%d distance=%.9g "
           "frames=",
           static_cast<unsigned long long>(bundle_->generation),
           static_cast<unsigned long long>(bundle_->epoch),
@@ -463,7 +470,9 @@ class MeshOnionSkin : Overlay {
           int(screen_offset_reversed_),
           double(screen_offset_spacing_),
           static_cast<unsigned long long>(vbo_uploads_),
-          static_cast<unsigned long long>(batch_creates_));
+          static_cast<unsigned long long>(batch_creates_),
+          int(screen_offset_world_space_),
+          double(screen_offset_distance_));
       bool first = true;
       for (const int i : samples().index_range()) {
         printf("%s%.9g", first ? "" : ",", double(samples()[i].frame));
@@ -479,6 +488,12 @@ class MeshOnionSkin : Overlay {
       first = true;
       for (const int i : samples().index_range()) {
         printf("%s%.9g", first ? "" : ",", double(screen_pixel_offset(samples()[i])));
+        first = false;
+      }
+      printf(" world_offsets=");
+      first = true;
+      for (const int i : samples().index_range()) {
+        printf("%s%.9g", first ? "" : ",", double(screen_world_offset(samples()[i])));
         first = false;
       }
       printf(" alpha=");
@@ -661,10 +676,19 @@ class MeshOnionSkin : Overlay {
 
   float screen_pixel_offset(const ed::mesh_onion_skin::Sample &sample) const
   {
-    if (!screen_offset_enabled_) {
+    if (!screen_offset_enabled_ || screen_offset_world_space_) {
       return 0.0f;
     }
     return displayed_temporal_offset(sample) * screen_offset_spacing_ *
+           (screen_offset_reversed_ ? -1.0f : 1.0f);
+  }
+
+  float screen_world_offset(const ed::mesh_onion_skin::Sample &sample) const
+  {
+    if (!screen_offset_enabled_ || !screen_offset_world_space_) {
+      return 0.0f;
+    }
+    return displayed_temporal_offset(sample) * screen_offset_distance_ *
            (screen_offset_reversed_ ? -1.0f : 1.0f);
   }
 

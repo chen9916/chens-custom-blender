@@ -28,6 +28,8 @@ assert abs(value.mesh_onion_skin_fade_strength - 0.75) < 1e-6
 assert not value.mesh_onion_skin_screen_offset
 assert not value.mesh_onion_skin_screen_offset_reverse
 assert abs(value.mesh_onion_skin_screen_offset_spacing - 24.0) < 1e-6
+assert not value.mesh_onion_skin_screen_offset_world_space
+assert abs(value.mesh_onion_skin_screen_offset_distance - 0.1) < 1e-6
 value.show_mesh_onion_skin = True
 value.mesh_onion_skin_before = 3
 value.mesh_onion_skin_after = 1
@@ -41,6 +43,8 @@ value.mesh_onion_skin_fade_strength = 0.61
 value.mesh_onion_skin_screen_offset = True
 value.mesh_onion_skin_screen_offset_reverse = True
 value.mesh_onion_skin_screen_offset_spacing = 43.5
+value.mesh_onion_skin_screen_offset_world_space = True
+value.mesh_onion_skin_screen_offset_distance = 0.375
 path = Path(sys.argv[sys.argv.index('--') + 1]).resolve()
 bpy.ops.wm.save_as_mainfile(filepath=str(path))
 bpy.ops.wm.open_mainfile(filepath=str(path))
@@ -57,6 +61,8 @@ assert abs(value.mesh_onion_skin_fade_strength - 0.61) < 1e-6
 assert value.mesh_onion_skin_screen_offset
 assert value.mesh_onion_skin_screen_offset_reverse
 assert abs(value.mesh_onion_skin_screen_offset_spacing - 43.5) < 1e-6
+assert value.mesh_onion_skin_screen_offset_world_space
+assert abs(value.mesh_onion_skin_screen_offset_distance - 0.375) < 1e-6
 
 # Use a native posed armature to exercise sampling synchronization between enabled View3Ds.
 # No fixture mesh or worker is needed to check these RNA update semantics.
@@ -84,18 +90,27 @@ first.mesh_onion_skin_fade_strength = 0.13
 assert (second.mesh_onion_skin_distance_fade, second.mesh_onion_skin_fade_strength) == before
 screen_offset_before = (second.mesh_onion_skin_screen_offset,
                         second.mesh_onion_skin_screen_offset_reverse,
-                        second.mesh_onion_skin_screen_offset_spacing)
+                        second.mesh_onion_skin_screen_offset_spacing,
+                        second.mesh_onion_skin_screen_offset_world_space,
+                        second.mesh_onion_skin_screen_offset_distance)
 first.mesh_onion_skin_screen_offset = not screen_offset_before[0]
 first.mesh_onion_skin_screen_offset_reverse = not screen_offset_before[1]
 first.mesh_onion_skin_screen_offset_spacing = 12.5
+first.mesh_onion_skin_screen_offset_world_space = not screen_offset_before[3]
+first.mesh_onion_skin_screen_offset_distance = 0.25
 assert (second.mesh_onion_skin_screen_offset,
         second.mesh_onion_skin_screen_offset_reverse,
-        second.mesh_onion_skin_screen_offset_spacing) == screen_offset_before
+        second.mesh_onion_skin_screen_offset_spacing,
+        second.mesh_onion_skin_screen_offset_world_space,
+        second.mesh_onion_skin_screen_offset_distance) == screen_offset_before
 assert first.mesh_onion_skin_screen_offset != second.mesh_onion_skin_screen_offset
 assert first.mesh_onion_skin_screen_offset_reverse != second.mesh_onion_skin_screen_offset_reverse
 assert first.mesh_onion_skin_screen_offset_spacing != second.mesh_onion_skin_screen_offset_spacing
+assert first.mesh_onion_skin_screen_offset_world_space != second.mesh_onion_skin_screen_offset_world_space
+assert first.mesh_onion_skin_screen_offset_distance != second.mesh_onion_skin_screen_offset_distance
 for view in views:
     view.overlay.show_mesh_onion_skin = False
 print('ONION_SETTINGS_RESULT ' + json.dumps({'defaults': True, 'file_roundtrip': True,
                                            'shared_sampling': True, 'local_fade': True,
-                                           'local_screen_offset': True}))
+                                           'local_screen_offset': True,
+                                           'local_scene_distance': True}))
