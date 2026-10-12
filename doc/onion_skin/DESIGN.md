@@ -128,6 +128,13 @@ payloads reuse geometry buffers; tessellation changes rebuild triangle indices.
 The overlay alpha blends ghosts with optional depth testing and no depth writes
 or selection picking. CPU publication never owns GPU resources.
 
+Past and Future Color are local per-viewport appearance controls, defaulting to
+the familiar blue/orange pair used by the native overlay. Changing either color
+updates draw uniforms only; it does not rebuild the private evaluation capsule,
+invalidate frame caches or trigger a new rig solve. Sampling counts, frame step,
+keyed-only mode and looping remain shared between enabled viewports for the
+active scene/rig, while colors, opacity, fade, depth and spacing remain local.
+
 ## Supported edits and explicit limits
 
 Modal translation, rotation, trackball and scale capture authored control values
@@ -140,6 +147,15 @@ curves remain authoritative at sampled times; ghosts do not simulate a manual
 key insertion in that mode.
 Dense keys on neighboring sample frames can therefore correctly keep those
 ghosts unchanged when only the current frame's key changes.
+
+Native Auto Key and manual insertion share same-time replacement rules. Re-keying
+a channel that already contains colliding keys keeps one key with the newly
+inserted value, including with Only Insert Needed enabled. Collision detection
+uses Blender's existing key-time tolerance; distinct subframes, other channels
+and collisions at unrelated times are not cleaned up. Ordinary replacement
+preserves the chosen key's handles and interpolation. Private preview staging
+uses the same rule without repairing or otherwise editing source curves before
+native confirmation. Files are not automatically deduplicated on load.
 
 Drivers support native Average, Sum, Minimum and Maximum operations and scripted
 drivers accepted by Blender's simple-expression evaluator. Arbitrary Python
@@ -163,7 +179,7 @@ ghosts and expose a status rather than claim broader support.
 - [Overlay resources, clock and fades](../../source/blender/draw/engines/overlay/overlay_mesh_onion_skin.hh), [spacing shader](../../source/blender/draw/engines/overlay/shaders/overlay_mesh_onion_skin_screen_vert.glsl).
 - [Persisted DNA](../../source/blender/makesdna/DNA_view3d_types.h), [RNA/update policies](../../source/blender/makesrna/intern/rna_space.cc), [native UI](../../scripts/startup/bl_ui/space_view3d.py), [file migrations](../../source/blender/blenloader/intern/versioning_503.cc).
 - [Lifetime callbacks](../../source/blender/editors/util/ed_util.cc), [ID remapping hook](../../source/blender/windowmanager/intern/wm_event_system.cc).
-- [Native evaluation tests](../../source/blender/editors/animation/anim_mesh_onion_skin_test.cc), [preview tests](../../source/blender/editors/animation/anim_mesh_onion_skin_preview_test.cc), [frame selection tests](../../source/blender/editors/animation/anim_mesh_onion_skin_frames_test.cc).
+- [Native evaluation tests](../../source/blender/editors/animation/anim_mesh_onion_skin_test.cc), [preview tests](../../source/blender/editors/animation/anim_mesh_onion_skin_preview_test.cc), [frame selection tests](../../source/blender/editors/animation/anim_mesh_onion_skin_frames_test.cc), [key replacement tests](../../source/blender/blenkernel/intern/fcurve_test.cc).
 
 ## Release evidence and performance interpretation
 

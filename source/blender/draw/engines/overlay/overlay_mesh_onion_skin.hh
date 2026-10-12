@@ -367,8 +367,14 @@ class MeshOnionSkin : Overlay {
       if (opacity <= 0.0f) {
         continue;
       }
-      const float4 past_color(0.16f, 0.55f, 1.0f, opacity);
-      const float4 future_color(1.0f, 0.25f, 0.14f, opacity);
+      const float4 past_color(state.overlay.mesh_onion_skin_past_color[0],
+                              state.overlay.mesh_onion_skin_past_color[1],
+                              state.overlay.mesh_onion_skin_past_color[2],
+                              opacity);
+      const float4 future_color(state.overlay.mesh_onion_skin_future_color[0],
+                                state.overlay.mesh_onion_skin_future_color[1],
+                                state.overlay.mesh_onion_skin_future_color[2],
+                                opacity);
       const float transition = screen_offset_enabled_ ?
                                    smoothstep(std::clamp(
                                        sample.rank - playhead_rank_ + 0.5f, 0.0f, 1.0f)) :

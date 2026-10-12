@@ -162,6 +162,28 @@ static void replace_bezt_keyframe_ypos(BezTriple *dst, const BezTriple *bezt)
   /* TODO: perform some other operations? */
 }
 
+/** Keep the replaced key, removing only other keys that match this insertion time. */
+static int deduplicate_keys_at_frame(FCurve &fcu, const int index, const float frame)
+{
+  int first = index;
+  int last = index + 1;
+  while (first > 0 && IS_EQT(fcu.bezt[first - 1].vec[1][0], frame, BEZT_BINARYSEARCH_THRESH)) {
+    first--;
+  }
+  while (last < fcu.totvert && IS_EQT(fcu.bezt[last].vec[1][0], frame, BEZT_BINARYSEARCH_THRESH)) {
+    last++;
+  }
+  if (last - first == 1) {
+    return index;
+  }
+
+  /* Keep the updated key and its handles/interpolation. Stale keys must not affect evaluation. */
+  fcu.bezt[first] = fcu.bezt[index];
+  BKE_fcurve_delete_keys(fcu, {uint(first + 1), uint(last)});
+  BKE_fcurve_bezt_resize(fcu, fcu.totvert);
+  return first;
+}
+
 int insert_bezt_fcurve(FCurve *fcu, const BezTriple *bezt, eInsertKeyFlags flag)
 {
   int i = 0;
@@ -190,6 +212,7 @@ int insert_bezt_fcurve(FCurve *fcu, const BezTriple *bezt, eInsertKeyFlags flag)
             replace_bezt_keyframe_ypos(&fcu->bezt[i == 0 ? fcu->totvert - 1 : 0], bezt);
           }
         }
+        i = deduplicate_keys_at_frame(*fcu, i, bezt->vec[1][0]);
       }
     }
     /* Keyframing modes allow not replacing the keyframe. */
@@ -370,8 +393,12 @@ static bool new_key_needed(const FCurve &fcu, const float frame, const float val
       fcu.bezt, frame, fcu.totvert, &replace);
 
   if (replace) {
-    /* If there is already a key, we only need to modify it if the proposed value is different. */
-    return fcu.bezt[bezt_index].vec[1][1] != value;
+    /* Even a matching value needs insertion when colliding keys would retain a stale value. */
+    return fcu.bezt[bezt_index].vec[1][1] != value ||
+           (bezt_index > 0 &&
+            IS_EQT(fcu.bezt[bezt_index - 1].vec[1][0], frame, BEZT_BINARYSEARCH_THRESH)) ||
+           (bezt_index + 1 < fcu.totvert &&
+            IS_EQT(fcu.bezt[bezt_index + 1].vec[1][0], frame, BEZT_BINARYSEARCH_THRESH));
   }
 
   const int diff_ulp = 32;

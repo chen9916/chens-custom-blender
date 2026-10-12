@@ -161,6 +161,29 @@ TEST_F(MeshOnionPreviewTest, PreviewMatchesNativeConfirmation)
   expect_same_curves(*proposal->channelbag, source_bag());
 }
 
+TEST_F(MeshOnionPreviewTest, StackedKeysReplacePrivatelyAndMatchConfirmation)
+{
+  insert_location(5.0f, 3.0f);
+  FCurve &curve = *animrig::channelbag_for_action_slot(rig->adt->action->wrap(),
+                                                       rig->adt->slot_handle)
+                       ->fcurve(0);
+  ASSERT_EQ(curve.totvert, 3);
+  BKE_fcurve_bezt_resize(curve, 4);
+  curve.bezt[3] = curve.bezt[2];
+  curve.bezt[2] = curve.bezt[1];
+  BKE_fcurve_keyframe_move_value_with_handles(&curve.bezt[2], 30.0f);
+  const animrig::Channelbag baseline(source_bag());
+  PosePreviewInput proposal = input(8.0f);
+  proposal.key_flags = INSERTKEY_NEEDED;
+  const auto prepared = preview_prepare(*bmain, *scene, *rig, proposal);
+  ASSERT_NE(prepared, nullptr);
+  expect_same_curves(baseline, source_bag());
+  ASSERT_EQ(prepared->channelbag->fcurve(0)->totvert, 3);
+  EXPECT_FLOAT_EQ(prepared->channelbag->fcurve(0)->bezt[1].vec[1][1], 8.0f);
+  insert_location(5.0f, 8.0f, INSERTKEY_NEEDED);
+  expect_same_curves(*prepared->channelbag, source_bag());
+}
+
 TEST_F(MeshOnionPreviewTest, RepeatedProposalsResetBaselineAndUnkeyedInputDoesNotCreateKeys)
 {
   const animrig::Channelbag baseline(source_bag());

@@ -114,6 +114,9 @@ bool delete_keyframe_fcurve_legacy(AnimData *adt, FCurve *fcu, float cfra);
  * This function adds a given #BezTriple to an F-Curve. It will allocate
  * memory for the array if needed, and will insert the #BezTriple into a
  * suitable place in chronological order.
+ * Replacing a key removes other matches at the insertion
+ * time, using the native tolerance.
+ * Collisions at unrelated times are preserved.
  *
  * \returns The index of the keyframe array into which the bezt has been added.
  *

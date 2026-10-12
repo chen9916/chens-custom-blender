@@ -67,6 +67,16 @@ then run all native onion skin sampling, evaluation and preview fixtures::
 
   <blender_test> --gtest_filter="MeshOnion*"
 
+For same-time key replacement, include the native F-Curve regressions::
+
+  <blender_test> --gtest_filter="FCurveKeyReplacementTest.*:KeyframingTest.*:MeshOnionPreviewTest.*"
+
+They cover stacked keys at endpoints/interior times, Only Insert Needed, full
+overwrite, handle/interpolation preservation, distinct subframes, unrelated
+collisions and private-preview/source-preservation parity. The tests explicitly
+seed existing collisions; they do not establish how duplicates originated in a
+particular production file.
+
 They check source preservation, native key insertion policies, private provisional
 curve replacement, authored IK deformation parity, constructive modifiers,
 native drivers/NLA ownership, keyed/looped sampling and unsupported evaluation.
@@ -74,6 +84,26 @@ Run the UI defaults/file round-trip and split-view appearance/sampling test
 in a disposable interactive process::
 
   <blender> --factory-startup --python-exit-code 1 --python tests/onion_skin/check_settings.py -- <settings-roundtrip.blend>
+
+Exercise real modal Auto Key and manual insertion on an occupied frame with the
+focused disposable key-replacement check::
+
+  <blender> --factory-startup --disable-autoexec --enable-event-simulate --python-exit-code 1 --python tests/onion_skin/check_key_replacement.py -- --output <auto-clean-results>
+  <blender> --factory-startup --disable-autoexec --enable-event-simulate --python-exit-code 1 --python tests/onion_skin/check_key_replacement.py -- --output <auto-stacked-results> --stacked
+  <blender> --factory-startup --disable-autoexec --enable-event-simulate --python-exit-code 1 --python tests/onion_skin/check_key_replacement.py -- --output <manual-clean-results> --method manual
+  <blender> --factory-startup --disable-autoexec --enable-event-simulate --python-exit-code 1 --python tests/onion_skin/check_key_replacement.py -- --output <manual-stacked-results> --method manual --stacked
+
+Each process creates a small rig and directly skinned mesh, enables native onion
+skins, checks modal cancel/source preservation, keys the same frame twice, checks
+the latest stored value and interpolation, revisits the frame, then checks native
+undo/redo. A successful ``report.json`` contains only passed checks and no
+``error``. The script quits without saving the fixture or preferences, and records
+the runtime's actual build hash. These are correctness checks, not viewport
+rendering or latency measurements.
+
+The settings check also verifies the local past/future color controls survive a
+file round-trip and stay independent between split viewports. These appearance
+changes must not change the shared sampling policy or start a geometry rebuild.
 
 Run native job lifecycle checks using the imported fixture's rig name::
 

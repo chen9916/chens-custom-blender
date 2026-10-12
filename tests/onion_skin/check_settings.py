@@ -21,6 +21,10 @@ assert not value.show_mesh_onion_skin
 assert (value.mesh_onion_skin_before, value.mesh_onion_skin_after,
         value.mesh_onion_skin_step) == (2, 2, 1)
 assert abs(value.mesh_onion_skin_opacity - 0.15) < 1e-6
+assert tuple(round(channel, 6) for channel in value.mesh_onion_skin_past_color) == (
+    0.16, 0.55, 1.0)
+assert tuple(round(channel, 6) for channel in value.mesh_onion_skin_future_color) == (
+    1.0, 0.25, 0.14)
 assert not value.mesh_onion_skin_keyed_frames_only
 assert not value.mesh_onion_skin_loop_frame_range
 assert not value.mesh_onion_skin_distance_fade
@@ -35,6 +39,8 @@ value.mesh_onion_skin_before = 3
 value.mesh_onion_skin_after = 1
 value.mesh_onion_skin_step = 4
 value.mesh_onion_skin_opacity = 0.22
+value.mesh_onion_skin_past_color = (0.05, 0.35, 0.9)
+value.mesh_onion_skin_future_color = (0.95, 0.12, 0.05)
 value.mesh_onion_skin_in_front = True
 value.mesh_onion_skin_keyed_frames_only = True
 value.mesh_onion_skin_loop_frame_range = True
@@ -53,6 +59,10 @@ assert value.show_mesh_onion_skin
 assert (value.mesh_onion_skin_before, value.mesh_onion_skin_after,
         value.mesh_onion_skin_step) == (3, 1, 4)
 assert abs(value.mesh_onion_skin_opacity - 0.22) < 1e-6
+assert tuple(round(channel, 6) for channel in value.mesh_onion_skin_past_color) == (
+    0.05, 0.35, 0.9)
+assert tuple(round(channel, 6) for channel in value.mesh_onion_skin_future_color) == (
+    0.95, 0.12, 0.05)
 assert value.mesh_onion_skin_in_front
 assert value.mesh_onion_skin_keyed_frames_only
 assert value.mesh_onion_skin_loop_frame_range
@@ -88,6 +98,12 @@ before = (second.mesh_onion_skin_distance_fade, second.mesh_onion_skin_fade_stre
 first.mesh_onion_skin_distance_fade = not before[0]
 first.mesh_onion_skin_fade_strength = 0.13
 assert (second.mesh_onion_skin_distance_fade, second.mesh_onion_skin_fade_strength) == before
+colors_before = (tuple(second.mesh_onion_skin_past_color),
+                 tuple(second.mesh_onion_skin_future_color))
+first.mesh_onion_skin_past_color = (0.2, 0.4, 0.8)
+first.mesh_onion_skin_future_color = (0.9, 0.15, 0.05)
+assert (tuple(second.mesh_onion_skin_past_color),
+        tuple(second.mesh_onion_skin_future_color)) == colors_before
 screen_offset_before = (second.mesh_onion_skin_screen_offset,
                         second.mesh_onion_skin_screen_offset_reverse,
                         second.mesh_onion_skin_screen_offset_spacing,
@@ -112,5 +128,5 @@ for view in views:
     view.overlay.show_mesh_onion_skin = False
 print('ONION_SETTINGS_RESULT ' + json.dumps({'defaults': True, 'file_roundtrip': True,
                                            'shared_sampling': True, 'local_fade': True,
-                                           'local_screen_offset': True,
+                                           'local_colors': True, 'local_screen_offset': True,
                                            'local_scene_distance': True}))

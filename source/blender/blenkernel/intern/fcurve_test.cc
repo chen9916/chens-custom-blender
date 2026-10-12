@@ -235,6 +235,144 @@ TEST_F(EvaluateFCurveTest, ExtrapolationBezierKeys)
   BKE_fcurve_free(fcu);
 }
 
+class FCurveKeyReplacementTest : public BlenderGTestBase {
+ protected:
+  FCurve *fcu;
+  KeyframeSettings settings;
+
+  void SetUp() override
+  {
+    fcu = BKE_fcurve_create();
+    settings = get_keyframe_settings(false);
+    settings.interpolation = BEZT_IPO_LIN;
+    settings.handle = HD_FREE;
+  }
+
+  void TearDown() override
+  {
+    BKE_fcurve_free(fcu);
+  }
+
+  void set_keys(const Span<float2> points)
+  {
+    /* Raw key arrays can contain collisions from imports or animation edits. */
+    BKE_fcurve_bezt_resize(*fcu, points.size());
+    for (const int index : points.index_range()) {
+      initialize_bezt(&fcu->bezt[index], points[index], settings, eFCurve_Flags(fcu->flag));
+    }
+  }
+};
+
+TEST_F(FCurveKeyReplacementTest, StackedMiddleKeysKeepNewestValue)
+{
+  set_keys({{1.0f, 1.0f},
+            {5.0f, 5.0f},
+            {5.0f, 50.0f},
+            {5.0f, 500.0f},
+            {10.0f, 10.0f},
+            {12.0f, 12.0f},
+            {12.0f, 13.0f}});
+  EXPECT_EQ(insert_vert_fcurve(fcu, {5.0f, 8.0f}, settings, INSERTKEY_NOFLAGS),
+            SingleKeyingResult::SUCCESS);
+  ASSERT_EQ(fcu->totvert, 5);
+  EXPECT_EQ(BKE_fcurve_active_keyframe_index(fcu), 1);
+  EXPECT_FLOAT_EQ(fcu->bezt[1].vec[1][0], 5.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[1].vec[1][1], 8.0f);
+  EXPECT_NEAR(evaluate_fcurve(fcu, 4.9f), 7.825f, 1e-5f);
+  EXPECT_NEAR(evaluate_fcurve(fcu, 5.1f), 8.04f, 1e-5f);
+  /* Do not clean up unrelated authored collisions as a side effect of keying frame five. */
+  EXPECT_FLOAT_EQ(fcu->bezt[3].vec[1][0], 12.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[3].vec[1][1], 12.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[4].vec[1][0], 12.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[4].vec[1][1], 13.0f);
+}
+
+TEST_F(FCurveKeyReplacementTest, StackedEndpointKeys)
+{
+  for (const float frame : {1.0f, 3.0f}) {
+    SCOPED_TRACE(frame);
+    set_keys(frame == 1.0f ? Span<float2>{{1.0f, 1.0f}, {1.0f, 50.0f}, {3.0f, 3.0f}} :
+                             Span<float2>{{1.0f, 1.0f}, {3.0f, 3.0f}, {3.0f, 50.0f}});
+    EXPECT_EQ(insert_vert_fcurve(fcu, {frame, 8.0f}, settings, INSERTKEY_REPLACE),
+              SingleKeyingResult::SUCCESS);
+    ASSERT_EQ(fcu->totvert, 2);
+    EXPECT_FLOAT_EQ(evaluate_fcurve(fcu, frame), 8.0f);
+    EXPECT_NEAR(
+        evaluate_fcurve(fcu, frame == 1.0f ? 1.1f : 2.9f), frame == 1.0f ? 7.75f : 7.65f, 1e-5f);
+  }
+}
+
+TEST_F(FCurveKeyReplacementTest, OnlyNeededStillRemovesStackedKeys)
+{
+  for (const float stale_value : {8.0f, 50.0f}) {
+    SCOPED_TRACE(stale_value);
+    set_keys({{1.0f, 8.0f}, {1.0f, stale_value}, {3.0f, 10.0f}});
+    EXPECT_EQ(insert_vert_fcurve(fcu, {1.0f, 8.0f}, settings, INSERTKEY_NEEDED),
+              SingleKeyingResult::SUCCESS);
+    ASSERT_EQ(fcu->totvert, 2);
+    EXPECT_FLOAT_EQ(fcu->bezt[0].vec[1][1], 8.0f);
+    EXPECT_NEAR(evaluate_fcurve(fcu, 1.1f), 8.1f, 1e-5f);
+    EXPECT_EQ(insert_vert_fcurve(fcu, {1.0f, 8.0f}, settings, INSERTKEY_NEEDED),
+              SingleKeyingResult::NO_KEY_NEEDED);
+  }
+}
+
+TEST_F(FCurveKeyReplacementTest, PreserveDistinctSubframes)
+{
+  const float threshold = BEZT_BINARYSEARCH_THRESH;
+  set_keys({{1.0f - 2.0f * threshold, 2.0f},
+            {1.0f - 0.5f * threshold, 3.0f},
+            {1.0f, 4.0f},
+            {1.0f + 0.5f * threshold, 5.0f},
+            {1.0f + 2.0f * threshold, 6.0f}});
+  EXPECT_EQ(insert_vert_fcurve(fcu, {1.0f, 8.0f}, settings, INSERTKEY_NOFLAGS),
+            SingleKeyingResult::SUCCESS);
+  ASSERT_EQ(fcu->totvert, 3);
+  EXPECT_FLOAT_EQ(fcu->bezt[0].vec[1][0], 1.0f - 2.0f * threshold);
+  EXPECT_FLOAT_EQ(fcu->bezt[0].vec[1][1], 2.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[1].vec[1][0], 1.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[1].vec[1][1], 8.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[2].vec[1][0], 1.0f + 2.0f * threshold);
+  EXPECT_FLOAT_EQ(fcu->bezt[2].vec[1][1], 6.0f);
+}
+
+TEST_F(FCurveKeyReplacementTest, PreserveReplacementHandlesAndInterpolation)
+{
+  set_keys({{1.0f, 1.0f}, {5.0f, 5.0f}, {5.0f, 50.0f}, {10.0f, 10.0f}});
+  /* The native binary search chooses the second colliding key in this array. */
+  BezTriple &existing = fcu->bezt[2];
+  existing.ipo = BEZT_IPO_BEZ;
+  existing.vec[0][0] = 4.5f;
+  existing.vec[0][1] = 45.0f;
+  existing.vec[2][0] = 5.5f;
+  existing.vec[2][1] = 55.0f;
+  EXPECT_EQ(insert_vert_fcurve(fcu, {5.0f, 8.0f}, settings, INSERTKEY_FAST),
+            SingleKeyingResult::SUCCESS);
+  ASSERT_EQ(fcu->totvert, 3);
+  const BezTriple &retained = fcu->bezt[1];
+  EXPECT_EQ(retained.ipo, BEZT_IPO_BEZ);
+  EXPECT_EQ(retained.h1, HD_FREE);
+  EXPECT_EQ(retained.h2, HD_FREE);
+  EXPECT_FLOAT_EQ(retained.vec[0][0], 4.5f);
+  EXPECT_FLOAT_EQ(retained.vec[0][1], 3.0f);
+  EXPECT_FLOAT_EQ(retained.vec[2][0], 5.5f);
+  EXPECT_FLOAT_EQ(retained.vec[2][1], 13.0f);
+}
+
+TEST_F(FCurveKeyReplacementTest, FullOverwriteOfStackedKeys)
+{
+  set_keys({{1.0f - 0.5f * BEZT_BINARYSEARCH_THRESH, 1.0f}, {1.0f, 50.0f}, {3.0f, 3.0f}});
+  settings.interpolation = BEZT_IPO_CONST;
+  settings.keyframe_type = BEZT_KEYTYPE_BREAKDOWN;
+  EXPECT_EQ(insert_vert_fcurve(fcu, {1.0f, 8.0f}, settings, INSERTKEY_OVERWRITE_FULL),
+            SingleKeyingResult::SUCCESS);
+  ASSERT_EQ(fcu->totvert, 2);
+  EXPECT_FLOAT_EQ(fcu->bezt[0].vec[1][0], 1.0f);
+  EXPECT_FLOAT_EQ(fcu->bezt[0].vec[1][1], 8.0f);
+  EXPECT_EQ(fcu->bezt[0].ipo, BEZT_IPO_CONST);
+  EXPECT_EQ(BEZKEYTYPE(&fcu->bezt[0]), BEZT_KEYTYPE_BREAKDOWN);
+}
+
 class FCurveSubdivideTest : public BlenderGTestBase {};
 
 TEST_F(FCurveSubdivideTest, BKE_fcurve_bezt_subdivide_handles)

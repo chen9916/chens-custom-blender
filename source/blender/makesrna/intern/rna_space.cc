@@ -5577,6 +5577,24 @@ static void rna_def_space_view3d_overlay(BlenderRNA *brna)
                            "faintly visible at maximum strength");
   RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
 
+  prop = RNA_def_property(srna, "mesh_onion_skin_past_color", PROP_FLOAT, PROP_COLOR);
+  RNA_def_property_float_sdna(prop, nullptr, "overlay.mesh_onion_skin_past_color");
+  RNA_def_property_array(prop, 3);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(
+      prop, "Past Color", "Color used for mesh onion skin poses before the current frame");
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
+  prop = RNA_def_property(srna, "mesh_onion_skin_future_color", PROP_FLOAT, PROP_COLOR);
+  RNA_def_property_float_sdna(prop, nullptr, "overlay.mesh_onion_skin_future_color");
+  RNA_def_property_array(prop, 3);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_ui_text(
+      prop, "Future Color", "Color used for mesh onion skin poses after the current frame");
+  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
   prop = RNA_def_property(srna, "mesh_onion_skin_screen_offset", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(
       prop, nullptr, "overlay.flag", V3D_OVERLAY_MESH_ONION_SKIN_SCREEN_OFFSET);
@@ -5636,7 +5654,7 @@ static void rna_def_space_view3d_overlay(BlenderRNA *brna)
   RNA_def_property_range(prop, 0, 4);
   RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
   RNA_def_property_ui_text(
-      prop, "Before", "Number of mesh onion skin samples before the current frame");
+      prop, "Past Poses", "Number of mesh onion skin poses before the current frame");
   RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
   RNA_def_property_update(
       prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_mesh_onion_skin_samples_update");
@@ -5646,7 +5664,7 @@ static void rna_def_space_view3d_overlay(BlenderRNA *brna)
   RNA_def_property_range(prop, 0, 4);
   RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
   RNA_def_property_ui_text(
-      prop, "After", "Number of mesh onion skin samples after the current frame");
+      prop, "Future Poses", "Number of mesh onion skin poses after the current frame");
   RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
   RNA_def_property_update(
       prop, NC_SPACE | ND_SPACE_VIEW3D, "rna_View3D_mesh_onion_skin_samples_update");

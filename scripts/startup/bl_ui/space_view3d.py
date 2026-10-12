@@ -7768,20 +7768,30 @@ class VIEW3D_PT_overlay_mesh_onion_skin(Panel):
         layout.prop(overlay, "show_mesh_onion_skin")
         col = layout.column()
         col.active = overlay.show_overlays and overlay.show_mesh_onion_skin
-        col.label(text="Sampling is shared between viewports", icon='INFO')
+        col.label(text="Sampling (shared between viewports)", icon='INFO')
         col.label(text="Geometry: Deformation Cage")
-        col.prop(overlay, "mesh_onion_skin_before")
-        col.prop(overlay, "mesh_onion_skin_after")
+        row = col.row(align=True)
+        row.prop(overlay, "mesh_onion_skin_before", text="Past Poses")
+        row.prop(overlay, "mesh_onion_skin_after", text="Future Poses")
         col.prop(overlay, "mesh_onion_skin_keyed_frames_only")
         col.prop(overlay, "mesh_onion_skin_loop_frame_range")
         sub = col.column()
         sub.active = not overlay.mesh_onion_skin_keyed_frames_only
         sub.prop(overlay, "mesh_onion_skin_step")
+
+        col.separator()
+        col.label(text="Appearance (per viewport)")
+        row = col.row(align=True)
+        row.prop(overlay, "mesh_onion_skin_past_color", text="Past Color")
+        row.prop(overlay, "mesh_onion_skin_future_color", text="Future Color")
         col.prop(overlay, "mesh_onion_skin_opacity")
         col.prop(overlay, "mesh_onion_skin_distance_fade")
         sub = col.column()
         sub.active = overlay.mesh_onion_skin_distance_fade
         sub.prop(overlay, "mesh_onion_skin_fade_strength", slider=True)
+
+        col.separator()
+        col.label(text="Placement (per viewport)")
         col.prop(overlay, "mesh_onion_skin_screen_offset")
         sub = col.column()
         sub.active = overlay.mesh_onion_skin_screen_offset

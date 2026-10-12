@@ -690,6 +690,9 @@ struct View3DOverlay {
   int mesh_onion_skin_step = 1;
   float mesh_onion_skin_opacity = 0.15f;
   float mesh_onion_skin_fade_strength = 0.75f;
+  /** Local viewport colors for past and future mesh onion skin poses. */
+  float mesh_onion_skin_past_color[3] = {0.16f, 0.55f, 1.0f};
+  float mesh_onion_skin_future_color[3] = {1.0f, 0.25f, 0.14f};
   /** Horizontal screen pixels per frame from the current pose. */
   float mesh_onion_skin_screen_offset_spacing = 24.0f;
   /** Scene distance along the viewer's horizontal axis per frame from the current pose. */
