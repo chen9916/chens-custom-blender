@@ -35,6 +35,8 @@
 #include "GPU_immediate.hh"
 #include "GPU_state.hh"
 
+#include "IMB_imbuf.hh"
+
 #include "MEM_guardedalloc.h"
 
 #include "RNA_access.hh"
@@ -140,6 +142,9 @@ void ImagePaintStroke::update_step(wmOperator *op, const StrokeStep &stroke_step
 
   float distance = this->stroke_distance();
   int eraser = RNA_boolean_get(op->ptr, "pen_flip");
+  if (this->stroke_inverted() && brush->image_brush_type == IMAGE_PAINT_BRUSH_TYPE_DRAW) {
+    eraser = (brush->blend != IMB_BLEND_ERASE_ALPHA);
+  }
 
   float mouse[2];
   copy_v2_v2(mouse, stroke_step.mouse);
@@ -314,6 +319,9 @@ void TexturePaintStroke::update_step(wmOperator *op, const StrokeStep &stroke_st
 
   float distance = this->stroke_distance();
   int eraser = RNA_boolean_get(op->ptr, "pen_flip");
+  if (this->stroke_inverted() && brush->image_brush_type == IMAGE_PAINT_BRUSH_TYPE_DRAW) {
+    eraser = (brush->blend != IMB_BLEND_ERASE_ALPHA);
+  }
 
   float mouse[2];
   copy_v2_v2(mouse, stroke_step.mouse);
@@ -422,9 +430,24 @@ bool TexturePaintStroke::test_start(wmOperator *op, const float2 mouse)
 
   bool uvs, mat, tex, stencil;
   if (!ED_paint_proj_mesh_data_check(*scene, *ob, &uvs, &mat, &tex, &stencil)) {
-    ED_paint_data_warning(op->reports, uvs, mat, tex, stencil);
-    WM_event_add_notifier(evil_C, NC_SCENE | ND_TOOLSETTINGS, nullptr);
-    return false;
+    if (settings->imapaint.mode == IMAGEPAINT_MODE_MATERIAL && stencil) {
+      if (!uvs) {
+        WM_operator_name_call(
+            evil_C, "PAINT_OT_add_simple_uvs", wm::OpCallContext::ExecDefault, nullptr, nullptr);
+      }
+      if (!mat || !tex) {
+        WM_operator_name_call(evil_C,
+                              "NODE_OT_tex_paint_canvas_new",
+                              wm::OpCallContext::ExecDefault,
+                              nullptr,
+                              nullptr);
+      }
+    }
+    if (!ED_paint_proj_mesh_data_check(*scene, *ob, &uvs, &mat, &tex, &stencil)) {
+      ED_paint_data_warning(op->reports, uvs, mat, tex, stencil);
+      WM_event_add_notifier(evil_C, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+      return false;
+    }
   }
 
   Brush *brush = BKE_paint_brush(&settings->imapaint.paint);
@@ -794,9 +817,24 @@ static bool check_preconditions(bContext *C, wmOperator *op)
 
   bool uvs, mat, tex, stencil;
   if (!ED_paint_proj_mesh_data_check(scene, ob, &uvs, &mat, &tex, &stencil)) {
-    ED_paint_data_warning(op->reports, uvs, mat, tex, stencil);
-    WM_event_add_notifier(C, NC_SCENE | ND_TOOLSETTINGS, nullptr);
-    return false;
+    if (scene.toolsettings->imapaint.mode == IMAGEPAINT_MODE_MATERIAL && stencil) {
+      if (!uvs) {
+        WM_operator_name_call(
+            C, "PAINT_OT_add_simple_uvs", wm::OpCallContext::ExecDefault, nullptr, nullptr);
+      }
+      if (!mat || !tex) {
+        WM_operator_name_call(C,
+                              "NODE_OT_tex_paint_canvas_new",
+                              wm::OpCallContext::ExecDefault,
+                              nullptr,
+                              nullptr);
+      }
+    }
+    if (!ED_paint_proj_mesh_data_check(scene, ob, &uvs, &mat, &tex, &stencil)) {
+      ED_paint_data_warning(op->reports, uvs, mat, tex, stencil);
+      WM_event_add_notifier(C, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+      return false;
+    }
   }
   return true;
 }

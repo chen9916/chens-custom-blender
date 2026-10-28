@@ -3063,7 +3063,7 @@ static void image_walk_ntree_all_users(
     case NTREE_SHADER:
       for (bNode *node : ntree->all_nodes()) {
         if (node->id) {
-          if (node->type_legacy == SH_NODE_TEX_IMAGE) {
+          if (ELEM(node->type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_PAINT)) {
             NodeTexImage *tex = static_cast<NodeTexImage *>(node->storage);
             Image *ima = id_cast<Image *>(node->id);
             callback(ima, id, &tex->iuser, customdata);

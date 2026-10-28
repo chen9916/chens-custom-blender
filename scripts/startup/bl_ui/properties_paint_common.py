@@ -376,6 +376,16 @@ class UnifiedPaintPanel:
         prop_owner = ups if brush.use_unified_color else brush
         parent.template_color_picker(prop_owner, prop_name, value_slider=value_slider)
 
+    @staticmethod
+    def prop_unified_color_hsv_sliders(parent, context, brush):
+        ups = UnifiedPaintPanel.paint_settings_from_active_tool(context).unified_paint_settings
+        prop_owner = ups if brush.use_unified_color else brush
+        col = parent.column(align=True)
+        col.use_property_split = False
+        col.prop(prop_owner, "color_hue", text="Hue", slider=True)
+        col.prop(prop_owner, "color_saturation", text="Saturation", slider=True)
+        col.prop(prop_owner, "color_value", text="Value", slider=True)
+
 
 ### Classes to let various paint modes' panels share code, by sub-classing these classes. ###
 class BrushPanel(UnifiedPaintPanel):
@@ -1657,7 +1667,10 @@ def draw_color_settings(context, layout, brush, color_type=False):
         UnifiedPaintPanel.prop_unified_color(row, context, brush, "secondary_color", text="")
         row.separator()
         row.operator("paint.brush_colors_flip", icon='FILE_REFRESH', text="", emboss=False)
+        row.operator("paint.sample_color", icon='EYEDROPPER', text="", emboss=False)
         row.prop(brush, "use_unified_color", text="", icon='BRUSHES_ALL')
+
+        UnifiedPaintPanel.prop_unified_color_hsv_sliders(layout, context, brush)
 
         draw_color_jitter_panel(layout, context, brush)
 

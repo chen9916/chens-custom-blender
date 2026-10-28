@@ -192,6 +192,7 @@ void RNA_def_nla(BlenderRNA *brna);
 void RNA_def_nodetree(BlenderRNA *brna);
 void RNA_def_node_socket_subtypes(BlenderRNA *brna);
 void RNA_def_node_tree_interface(BlenderRNA *brna);
+void RNA_def_node_tex_paint(BlenderRNA *brna);
 void RNA_def_object(BlenderRNA *brna);
 void RNA_def_object_force(BlenderRNA *brna);
 void RNA_def_packedfile(BlenderRNA *brna);
@@ -436,6 +437,16 @@ bool rna_GPencil_datablocks_obdata_poll(PointerRNA *ptr, const PointerRNA value)
  * "Render Result" or "Viewer Node" images.
  */
 bool rna_Image_no_renderresult_or_viewer_poll(PointerRNA *ptr, const PointerRNA value);
+
+/* Layered Texture Paint node, see `rna_node_tex_paint.cc`. */
+void rna_def_sh_tex_paint(BlenderRNA *brna, StructRNA *srna);
+void rna_ShaderNodeTexPaint_active_layer_index_range(
+    PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax);
+void rna_ShaderNodeTexPaint_active_layer_index_set(PointerRNA *ptr, int value);
+PointerRNA rna_ShaderNodeTexPaint_active_layer_get(PointerRNA *ptr);
+void rna_ShaderNodeTexPaint_active_layer_set(PointerRNA *ptr,
+                                             PointerRNA value,
+                                             ReportList *reports);
 
 std::optional<std::string> rna_TextureSlot_path(const PointerRNA *ptr);
 std::optional<std::string> rna_Node_ImageUser_path(const PointerRNA *ptr);

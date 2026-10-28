@@ -97,6 +97,7 @@ set(SRC
   nodes/node_shader_tex_gabor.cc
   nodes/node_shader_tex_gradient.cc
   nodes/node_shader_tex_image.cc
+  nodes/node_shader_tex_paint.cc
   nodes/node_shader_tex_magic.cc
   nodes/node_shader_tex_noise.cc
   nodes/node_shader_tex_sky.cc

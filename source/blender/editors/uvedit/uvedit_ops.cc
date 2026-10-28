@@ -92,7 +92,7 @@ bool ED_uvedit_test(Object *obedit)
 
 static bool is_image_texture_node(bNode *node)
 {
-  return ELEM(node->type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_ENVIRONMENT);
+  return ELEM(node->type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_ENVIRONMENT, SH_NODE_TEX_PAINT);
 }
 
 bool ED_object_get_active_image(Object *ob,
@@ -112,7 +112,7 @@ bool ED_object_get_active_image(Object *ob,
       *r_ima = id_cast<Image *>(node->id);
     }
     if (r_iuser) {
-      if (node->type_legacy == SH_NODE_TEX_IMAGE) {
+      if (ELEM(node->type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_PAINT)) {
         *r_iuser = &(static_cast<NodeTexImage *>(node->storage))->iuser;
       }
       else if (node->type_legacy == SH_NODE_TEX_ENVIRONMENT) {

@@ -27,9 +27,13 @@
 #include "BKE_context.hh"
 #include "BKE_image.hh"
 #include "BKE_image_gpu.hh"
+#include "DNA_node_types.h"
+
+#include "BKE_main.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_types.hh"
 #include "BKE_report.hh"
+#include "BKE_tex_paint_layer.hh"
 
 #include "DEG_depsgraph.hh"
 
@@ -113,6 +117,7 @@ enum ImagePaintTileState {
 struct ImagePaintTile {
   ImageUser iuser;
   ImBuf *canvas = nullptr;
+  ImBuf *acquired_canvas = nullptr;
   float radius_fac = 0.0f;
   int size[2] = {};
   float uv_origin[2] = {}; /* Stores the position of this tile in UV space. */
@@ -136,6 +141,8 @@ struct ImagePaintState {
   short brush_type, blend;
   Image *image;
   ImBuf *clonecanvas;
+  bNode *tex_paint_node;
+  bool layer_alpha_lock;
 
   bool do_masking;
 
@@ -1336,6 +1343,68 @@ static void paint_2d_op_foreach_do(void *__restrict data_v,
                            iter);
 }
 
+static void paint_2d_restore_alpha(ImagePaintState *s,
+                                   ImagePaintTile *tile,
+                                   const ImagePaintRegion *region)
+{
+  ImBuf *canvas = tile->canvas;
+  PaintTileMap *undo_tiles = ED_image_paint_tile_map_get();
+  int tilex, tiley, tilew, tileh;
+  imapaint_region_tiles(canvas,
+                        region->destx,
+                        region->desty,
+                        region->width,
+                        region->height,
+                        &tilex,
+                        &tiley,
+                        &tilew,
+                        &tileh);
+  uint8_t *canvas_byte = canvas->byte_data_for_write();
+  float *canvas_float = canvas->float_data_for_write();
+
+  for (int ty = tiley; ty <= tileh; ty++) {
+    for (int tx = tilex; tx <= tilew; tx++) {
+      const ImBuf *orig_tile = ED_image_paint_tile_find(
+          undo_tiles, s->image, canvas, &tile->iuser, tx, ty, nullptr, false);
+      if (orig_tile == nullptr) {
+        continue;
+      }
+      const int x0 = std::max(region->destx, tx * ED_IMAGE_UNDO_TILE_SIZE);
+      const int y0 = std::max(region->desty, ty * ED_IMAGE_UNDO_TILE_SIZE);
+      const int x1 = std::min(
+          {region->destx + region->width, (tx + 1) * ED_IMAGE_UNDO_TILE_SIZE, canvas->x});
+      const int y1 = std::min(
+          {region->desty + region->height, (ty + 1) * ED_IMAGE_UNDO_TILE_SIZE, canvas->y});
+      if (canvas_float && orig_tile->float_data()) {
+        const float *orig_float = orig_tile->float_data();
+        for (int y = y0; y < y1; y++) {
+          const int oy = y - ty * ED_IMAGE_UNDO_TILE_SIZE;
+          for (int x = x0; x < x1; x++) {
+            const int ox = x - tx * ED_IMAGE_UNDO_TILE_SIZE;
+            float *dst = canvas_float + (size_t(y) * canvas->x + x) * 4;
+            const float *src = orig_float + (size_t(oy) * ED_IMAGE_UNDO_TILE_SIZE + ox) * 4;
+            float straight[4];
+            premul_to_straight_v4_v4(straight, dst);
+            straight[3] = src[3];
+            straight_to_premul_v4_v4(dst, straight);
+          }
+        }
+      }
+      else if (canvas_byte && orig_tile->byte_data()) {
+        const uint8_t *orig_byte = orig_tile->byte_data();
+        for (int y = y0; y < y1; y++) {
+          const int oy = y - ty * ED_IMAGE_UNDO_TILE_SIZE;
+          for (int x = x0; x < x1; x++) {
+            const int ox = x - tx * ED_IMAGE_UNDO_TILE_SIZE;
+            canvas_byte[(size_t(y) * canvas->x + x) * 4 + 3] =
+                orig_byte[(size_t(oy) * ED_IMAGE_UNDO_TILE_SIZE + ox) * 4 + 3];
+          }
+        }
+      }
+    }
+  }
+}
+
 static int paint_2d_op(void *state,
                        ImagePaintTile *tile,
                        const float lastpos[2],
@@ -1472,6 +1541,12 @@ static int paint_2d_op(void *state,
     }
   }
 
+  if (s->layer_alpha_lock) {
+    for (a = 0; a < tot; a++) {
+      paint_2d_restore_alpha(s, tile, &region[a]);
+    }
+  }
+
   if (clonebuf) {
     IMB_freeImBuf(clonebuf);
   }
@@ -1512,7 +1587,10 @@ static int paint_2d_canvas_set(ImagePaintState *s, const Paint *paint)
 static void paint_2d_canvas_free(ImagePaintState *s)
 {
   for (int i = 0; i < s->num_tiles; i++) {
-    BKE_image_release_ibuf(s->image, s->tiles[i].canvas, nullptr);
+    BKE_image_release_ibuf(
+        s->image,
+        s->tiles[i].acquired_canvas ? s->tiles[i].acquired_canvas : s->tiles[i].canvas,
+        nullptr);
   }
   const ImagePaintSettings &image_paint_settings = s->scene->toolsettings->imapaint;
   BKE_image_release_ibuf(image_paint_settings.clone, s->clonecanvas, nullptr);
@@ -1698,6 +1776,19 @@ void *paint_2d_new_stroke(bContext *C, wmOperator *op, const BrushStrokeMode mod
     return nullptr;
   }
 
+  s->tiles[0].acquired_canvas = ibuf;
+  s->tex_paint_node = BKE_tex_paint_node_find_in_main(*CTX_data_main(C), s->image);
+  if (s->tex_paint_node) {
+    s->layer_alpha_lock = BKE_tex_paint_stroke_locks_alpha(*s->tex_paint_node);
+    ibuf = BKE_tex_paint_stroke_begin(*s->tex_paint_node, ibuf);
+    if (ibuf == nullptr) {
+      BKE_image_release_ibuf(s->image, s->tiles[0].acquired_canvas, nullptr);
+      MEM_delete(s->tiles);
+      MEM_delete(s);
+      return nullptr;
+    }
+  }
+
   s->tiles[0].size[0] = ibuf->x;
   s->tiles[0].size[1] = ibuf->y;
   s->tiles[0].radius_fac = 1.0f;
@@ -1740,11 +1831,17 @@ void paint_2d_redraw(const bContext *C, void *ps, bool final)
   bool had_redraw = false;
   for (int i = 0; i < s->num_tiles; i++) {
     if (s->tiles[i].need_redraw) {
-      ImBuf *ibuf = BKE_image_acquire_ibuf(s->image, &s->tiles[i].iuser, nullptr);
+      if (s->tex_paint_node && i == 0) {
+        BKE_tex_paint_stroke_update(
+            *s->tex_paint_node, s->tiles[i].canvas, get_imapaintpartial()->dirty_region);
+      }
+      else {
+        ImBuf *ibuf = BKE_image_acquire_ibuf(s->image, &s->tiles[i].iuser, nullptr);
 
-      imapaint_image_update(ibuf);
+        imapaint_image_update(ibuf);
 
-      BKE_image_release_ibuf(s->image, ibuf, nullptr);
+        BKE_image_release_ibuf(s->image, ibuf, nullptr);
+      }
 
       s->tiles[i].need_redraw = false;
       had_redraw = true;
@@ -1909,9 +2006,18 @@ void paint_2d_bucket_fill(const bContext *C,
     iuser->tile = tile_number;
   }
 
-  ibuf = BKE_image_acquire_ibuf(ima, iuser, nullptr);
-  if (!ibuf) {
+  ImBuf *acquired_ibuf = BKE_image_acquire_ibuf(ima, iuser, nullptr);
+  if (!acquired_ibuf) {
     return;
+  }
+  ibuf = acquired_ibuf;
+  bNode *tex_paint_node = BKE_tex_paint_node_find_in_main(*CTX_data_main(C), ima);
+  if (tex_paint_node) {
+    ibuf = BKE_tex_paint_stroke_begin(*tex_paint_node, acquired_ibuf);
+    if (!ibuf) {
+      BKE_image_release_ibuf(ima, acquired_ibuf, nullptr);
+      return;
+    }
   }
 
   do_float = (ibuf->float_data() != nullptr);
@@ -1969,7 +2075,7 @@ void paint_2d_bucket_fill(const bContext *C,
     y_px = image_init[1] * ibuf->y;
 
     if (x_px >= ibuf->x || x_px < 0 || y_px > ibuf->y || y_px < 0) {
-      BKE_image_release_ibuf(ima, ibuf, nullptr);
+      BKE_image_release_ibuf(ima, acquired_ibuf, nullptr);
       return;
     }
 
@@ -2060,10 +2166,15 @@ void paint_2d_bucket_fill(const bContext *C,
     BLI_stack_free(stack);
   }
 
-  imapaint_image_update(ibuf);
+  if (tex_paint_node) {
+    BKE_tex_paint_stroke_update(*tex_paint_node, ibuf, get_imapaintpartial()->dirty_region);
+  }
+  else {
+    imapaint_image_update(ibuf);
+  }
   ED_imapaint_clear_partial_redraw();
 
-  BKE_image_release_ibuf(ima, ibuf, nullptr);
+  BKE_image_release_ibuf(ima, acquired_ibuf, nullptr);
 
   WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, ima);
 }
@@ -2097,9 +2208,18 @@ void paint_2d_gradient_fill(
     return;
   }
 
-  ibuf = BKE_image_acquire_ibuf(ima, iuser, nullptr);
-  if (ibuf == nullptr) {
+  ImBuf *acquired_ibuf = BKE_image_acquire_ibuf(ima, iuser, nullptr);
+  if (acquired_ibuf == nullptr) {
     return;
+  }
+  ibuf = acquired_ibuf;
+  bNode *tex_paint_node = BKE_tex_paint_node_find_in_main(*CTX_data_main(C), ima);
+  if (tex_paint_node) {
+    ibuf = BKE_tex_paint_stroke_begin(*tex_paint_node, acquired_ibuf);
+    if (ibuf == nullptr) {
+      BKE_image_release_ibuf(ima, acquired_ibuf, nullptr);
+      return;
+    }
   }
 
   paint_2d_transform_mouse(s->v2d, mouse_final, image_final);
@@ -2184,10 +2304,15 @@ void paint_2d_gradient_fill(
     }
   }
 
-  imapaint_image_update(ibuf);
+  if (tex_paint_node) {
+    BKE_tex_paint_stroke_update(*tex_paint_node, ibuf, get_imapaintpartial()->dirty_region);
+  }
+  else {
+    imapaint_image_update(ibuf);
+  }
   ED_imapaint_clear_partial_redraw();
 
-  BKE_image_release_ibuf(ima, ibuf, nullptr);
+  BKE_image_release_ibuf(ima, acquired_ibuf, nullptr);
 
   WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, ima);
 }

@@ -59,6 +59,7 @@ _modules = [
     "properties_scene",
     "properties_compositor",
     "properties_texture",
+    "properties_tex_paint_layers",
     "properties_world",
     "properties_collection",
     "properties_strip",
@@ -126,6 +127,7 @@ def register():
 
     space_filebrowser.register_props()
     properties_paint_common.register()
+    properties_tex_paint_layers.register()
 
     from bpy.props import (
         EnumProperty,
@@ -183,6 +185,7 @@ def register():
 def unregister():
     from bpy.utils import unregister_class
 
+    properties_tex_paint_layers.unregister()
     properties_paint_common.unregister()
 
     for mod in reversed(_modules_loaded):

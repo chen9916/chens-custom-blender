@@ -8949,6 +8949,7 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'WINDOW'
     bl_label = "Texture Paint"
+    bl_ui_units_x = 14
 
     @classmethod
     def poll(cls, context):
@@ -8964,24 +8965,57 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
         paint = context.tool_settings.image_paint
         space = context.space_data
         brush = paint.brush
+        if brush is None:
+            return
         capabilities = brush.image_paint_capabilities
 
         if capabilities.has_color:
-            split = layout.split(factor=0.1)
-            UnifiedPaintPanel.prop_unified_color(split, context, brush, "color", text="")
-            UnifiedPaintPanel.prop_unified_color_picker(split, context, brush, "color", value_slider=True)
-            layout.prop(brush, "blend", text="")
+            col = layout.column(align=True)
+            type_row = col.row(align=True)
+            type_row.prop(brush, "color_type", expand=True)
+            col.separator(factor=0.4)
+
+            if brush.color_type == 'COLOR':
+                UnifiedPaintPanel.prop_unified_color_picker(col, context, brush, "color", value_slider=True)
+
+                swatch_row = col.row(align=True)
+                UnifiedPaintPanel.prop_unified_color(swatch_row, context, brush, "color", text="")
+                UnifiedPaintPanel.prop_unified_color(swatch_row, context, brush, "secondary_color", text="")
+                swatch_row.separator()
+                swatch_row.operator("paint.brush_colors_flip", icon='FILE_REFRESH', text="", emboss=False)
+                swatch_row.operator("paint.sample_color", icon='EYEDROPPER', text="", emboss=False)
+                swatch_row.prop(brush, "use_unified_color", text="", icon='BRUSHES_ALL')
+
+                col.separator(factor=0.5)
+                UnifiedPaintPanel.prop_unified_color_hsv_sliders(col, context, brush)
+
+                # Quick Color Palette access
+                pal_row = col.row(align=True)
+                pal_row.template_ID(paint, "palette", new="palette.new")
+                if paint.palette:
+                    col.template_palette(paint, "palette", color=True)
+            elif brush.color_type == 'GRADIENT':
+                col.template_color_ramp(brush, "gradient", expand=True)
+                if brush.image_brush_type == 'DRAW':
+                    col.prop(brush, "gradient_stroke_mode", text="Mapping")
+                    if brush.gradient_stroke_mode in {'SPACING_REPEAT', 'SPACING_CLAMP'}:
+                        col.prop(brush, "grad_spacing", text="Spacing")
+
+            blend_row = layout.row(align=True)
+            blend_row.prop(brush, "blend", text="")
+            blend_row.prop(brush, "use_alpha", text="Affect Alpha", toggle=True, icon='IMAGE_ALPHA')
 
         if capabilities.has_radius:
             size = "size"
-            if space.type == 'VIEW_3D' and show_experimental_texture_paint(brush):
+            if space is not None and space.type == 'VIEW_3D' and show_experimental_texture_paint(brush):
                 ups = paint.unified_paint_settings
                 size_owner = ups if brush.use_unified_size else brush
                 if size_owner.use_locked_size == 'SCENE':
                     size = "unprojected_size"
 
+            col_brush = layout.column(align=True)
             UnifiedPaintPanel.prop_unified(
-                layout,
+                col_brush,
                 context,
                 brush,
                 size,
@@ -8991,7 +9025,7 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
                 slider=True,
             )
             UnifiedPaintPanel.prop_unified(
-                layout,
+                col_brush,
                 context,
                 brush,
                 "strength",
@@ -9000,6 +9034,127 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
                 slider=True,
             )
 
+        # Tool-specific settings (Soften / Mask / Fill)
+        if brush.image_brush_type == 'SOFTEN':
+            soft_col = layout.column(align=True)
+            soft_col.row(align=True).prop(brush, "direction", expand=True)
+            soft_col.prop(brush, "sharp_threshold", slider=True)
+            soft_col.prop(brush, "blur_mode", text="")
+        elif brush.image_brush_type == 'MASK':
+            layout.prop(brush, "weight", text="Mask Value", slider=True)
+        elif brush.image_brush_type == 'FILL' and space is not None and space.type == 'IMAGE_EDITOR':
+            layout.prop(brush, "fill_threshold", text="Fill Threshold", slider=True)
+
+        # Brush Falloff Curve Presets
+        if brush.curve_distance_falloff:
+            falloff_col = layout.column(align=True)
+            falloff_row = falloff_col.row(align=True)
+            falloff_row.prop(brush, "curve_distance_falloff_preset", expand=True)
+            if brush.curve_distance_falloff_preset == 'CUSTOM':
+                falloff_col.template_curve_mapping(
+                    brush,
+                    "curve_distance_falloff",
+                    brush=True,
+                    use_negative_slope=True,
+                    show_presets=True,
+                )
+
+        # Stroke Method, Spacing, Jitter & Brush Behavior
+        stroke_col = layout.column(align=True)
+        stroke_row = stroke_col.row(align=True)
+        stroke_row.prop(brush, "stroke_method", text="")
+        if brush.stroke_method in {'SPACE', 'LINE', 'CURVE'}:
+            stroke_row.prop(brush, "spacing", text="Spacing", slider=True)
+            stroke_row.prop(brush, "use_pressure_spacing", text="", toggle=True, icon='STYLUS_PRESSURE')
+        elif brush.stroke_method == 'AIRBRUSH':
+            stroke_row.prop(brush, "rate", text="Rate", slider=True)
+
+        jitter_row = stroke_col.row(align=True)
+        if brush.jitter_unit == 'BRUSH':
+            jitter_row.prop(brush, "jitter", text="Jitter", slider=True)
+        else:
+            jitter_row.prop(brush, "jitter_absolute", text="Jitter")
+        jitter_row.prop(brush, "use_pressure_jitter", text="", toggle=True, icon='STYLUS_PRESSURE')
+
+        beh_row = stroke_col.row(align=True)
+        if capabilities.has_accumulate:
+            beh_row.prop(brush, "use_accumulate", text="Accumulate", toggle=True)
+        beh_row.prop(brush, "use_smooth_stroke", text="Stabilize", toggle=True)
+        beh_row.prop(brush, "use_paint_antialiasing", text="Anti-Alias", toggle=True)
+        if brush.use_smooth_stroke:
+            stab_row = stroke_col.row(align=True)
+            stab_row.prop(brush, "smooth_stroke_radius", text="Radius", slider=True)
+            stab_row.prop(brush, "smooth_stroke_factor", text="Factor", slider=True)
+
+        # Brush Alpha (Mask Texture) & Brush Tip Texture
+        tex_box = layout.box()
+        tex_col = tex_box.column(align=True)
+        mask_tex_slot = brush.mask_texture_slot
+        alpha_row = tex_col.row(align=True)
+        alpha_row.label(text="Brush Alpha:", icon='IMAGE_ALPHA')
+        alpha_row.template_ID(mask_tex_slot, "texture", new="texture.new")
+        mask_tex = mask_tex_slot.texture
+        if mask_tex is not None:
+            mt_row = tex_col.row(align=True)
+            mt_row.prop(mask_tex, "type", text="")
+            if mask_tex.type == 'IMAGE':
+                mt_row.template_ID(mask_tex, "image", new="image.new", open="image.open")
+            m_row = tex_col.row(align=True)
+            m_row.prop(mask_tex_slot, "mask_map_mode", text="")
+            m_row.prop(brush, "use_pressure_masking", text="", icon='STYLUS_PRESSURE', toggle=True)
+            if mask_tex_slot.has_texture_angle:
+                ma_row = tex_col.row(align=True)
+                ma_row.prop(mask_tex_slot, "angle", text="Angle")
+                if mask_tex_slot.has_texture_angle_source:
+                    ma_row.prop(mask_tex_slot, "use_rake", text="Rake", toggle=True)
+                    if brush.brush_capabilities.has_random_texture_angle and mask_tex_slot.has_random_texture_angle:
+                        ma_row.prop(mask_tex_slot, "use_random", text="Rand", toggle=True)
+            if mask_tex_slot.map_mode == 'STENCIL':
+                ms_row = tex_col.row(align=True)
+                if mask_tex.type == 'IMAGE':
+                    ms_row.operator("brush.stencil_fit_image_aspect", text="Fit Aspect").mask = True
+                ms_row.operator("brush.stencil_reset_transform", text="Reset Stencil").mask = True
+
+        tex_col.separator(factor=0.5)
+        tex_slot = brush.texture_slot
+        tex_row = tex_col.row(align=True)
+        tex_row.label(text="Brush Tex:", icon='TEXTURE')
+        tex_row.template_ID(tex_slot, "texture", new="texture.new")
+        b_tex = tex_slot.texture
+        if b_tex is not None:
+            bt_row = tex_col.row(align=True)
+            bt_row.prop(b_tex, "type", text="")
+            if b_tex.type == 'IMAGE':
+                bt_row.template_ID(b_tex, "image", new="image.new", open="image.open")
+            t_row = tex_col.row(align=True)
+            t_row.prop(tex_slot, "map_mode", text="")
+            if tex_slot.has_texture_angle:
+                ta_row = tex_col.row(align=True)
+                ta_row.prop(tex_slot, "angle", text="Angle")
+                if tex_slot.has_texture_angle_source:
+                    ta_row.prop(tex_slot, "use_rake", text="Rake", toggle=True)
+                    if brush.brush_capabilities.has_random_texture_angle and tex_slot.has_random_texture_angle:
+                        ta_row.prop(tex_slot, "use_random", text="Rand", toggle=True)
+            if tex_slot.map_mode == 'STENCIL':
+                ts_row = tex_col.row(align=True)
+                if b_tex.type == 'IMAGE':
+                    ts_row.operator("brush.stencil_fit_image_aspect", text="Fit Aspect").mask = False
+                ts_row.operator("brush.stencil_reset_transform", text="Reset Stencil").mask = False
+
+        # 3D Projection & Mirror Symmetry
+        ob = context.active_object
+        if space is not None and space.type == 'VIEW_3D':
+            proj_col = layout.column(align=True)
+            proj_row = proj_col.row(align=True)
+            proj_row.prop(paint, "use_occlude", text="Occlude", toggle=True)
+            proj_row.prop(paint, "use_backface_culling", text="Backface", toggle=True)
+            proj_row.prop(paint, "use_normal_falloff", text="Normal Falloff", toggle=True)
+            if ob is not None:
+                symm_row = proj_col.row(align=True)
+                symm_row.label(text="Mirror:")
+                symm_row.prop(ob, "use_mesh_mirror_x", text="X", toggle=True)
+                symm_row.prop(ob, "use_mesh_mirror_y", text="Y", toggle=True)
+                symm_row.prop(ob, "use_mesh_mirror_z", text="Z", toggle=True)
 
 class VIEW3D_PT_paint_weight_context_menu(Panel):
     # Only for popover, these are dummy values.

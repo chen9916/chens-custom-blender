@@ -24,6 +24,8 @@ namespace ed::space_node {
 
 void node_operatortypes()
 {
+  node_tex_paint_operatortypes();
+
   WM_operatortype_append(NODE_OT_select);
   WM_operatortype_append(NODE_OT_select_all);
   WM_operatortype_append(NODE_OT_select_linked_to);

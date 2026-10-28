@@ -907,7 +907,10 @@ static ShaderNode *add_node(Scene *scene,
     (void)b_ntree;
 #endif
   }
-  else if (b_node.is_type("ShaderNodeTexImage"_ustr)) {
+  /* The layered Texture Paint node samples its composited image like an Image Texture node, its
+   * storage starts with #NodeTexImage. */
+  else if (b_node.is_type("ShaderNodeTexImage"_ustr) || b_node.is_type("ShaderNodeTexPaint"_ustr))
+  {
     const auto &storage = *static_cast<blender::NodeTexImage *>(b_node.storage);
     blender::Image *b_image = blender::id_cast<blender::Image *>(b_node.id);
     blender::ImageUser &b_image_user = const_cast<blender::ImageUser &>(storage.iuser);

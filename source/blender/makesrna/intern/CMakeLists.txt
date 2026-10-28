@@ -66,6 +66,7 @@ set(DEFSRC
   rna_movieclip.cc
   rna_nla.cc
   rna_node_socket.cc
+  rna_node_tex_paint.cc
   rna_node_tree_interface.cc
   rna_nodetree.cc
   rna_object.cc

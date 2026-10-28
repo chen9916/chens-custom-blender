@@ -402,6 +402,10 @@ static EnumPropertyItem rna_enum_gpencil_brush_modes_items[] = {
 #  include "BKE_paint_types.hh"
 #  include "BKE_preview_image.hh"
 
+#  include "BLI_math_color.hh"
+#  include "BLI_math_vector.hh"
+#  include "IMB_colormanagement.hh"
+
 #  include "WM_api.hh"
 
 #  define GPENCIL_USE_VERTEX_COLOR(toolsettings) \
@@ -758,6 +762,60 @@ static void rna_Brush_size_update(Main *bmain, Scene *scene, PointerRNA *ptr)
 {
   bke::paint::invalidate_overlay_all(*scene);
   rna_Brush_update(bmain, scene, ptr);
+}
+
+static float g_brush_cached_hsv[3] = {0.0f, 0.0f, 1.0f};
+
+static float rna_Brush_color_hsv_component_get(PointerRNA *ptr, const int index)
+{
+  const Brush *br = static_cast<const Brush *>(ptr->data);
+  float rgb[3];
+  copy_v3_v3(rgb, br->color);
+  IMB_colormanagement_scene_linear_to_color_picking_v3(rgb, rgb);
+  rgb_to_hsv_compat_v(rgb, g_brush_cached_hsv);
+  return g_brush_cached_hsv[index];
+}
+
+static void rna_Brush_color_hsv_component_set(PointerRNA *ptr, const int index, const float value)
+{
+  Brush *br = static_cast<Brush *>(ptr->data);
+  float rgb[3];
+  copy_v3_v3(rgb, br->color);
+  IMB_colormanagement_scene_linear_to_color_picking_v3(rgb, rgb);
+  rgb_to_hsv_compat_v(rgb, g_brush_cached_hsv);
+  g_brush_cached_hsv[index] = clamp_f(value, 0.0f, 1.0f);
+  hsv_to_rgb_v(g_brush_cached_hsv, rgb);
+  IMB_colormanagement_color_picking_to_scene_linear_v3(br->color, rgb);
+}
+
+static float rna_Brush_color_hue_get(PointerRNA *ptr)
+{
+  return rna_Brush_color_hsv_component_get(ptr, 0);
+}
+
+static void rna_Brush_color_hue_set(PointerRNA *ptr, float value)
+{
+  rna_Brush_color_hsv_component_set(ptr, 0, value);
+}
+
+static float rna_Brush_color_saturation_get(PointerRNA *ptr)
+{
+  return rna_Brush_color_hsv_component_get(ptr, 1);
+}
+
+static void rna_Brush_color_saturation_set(PointerRNA *ptr, float value)
+{
+  rna_Brush_color_hsv_component_set(ptr, 1, value);
+}
+
+static float rna_Brush_color_value_get(PointerRNA *ptr)
+{
+  return rna_Brush_color_hsv_component_get(ptr, 2);
+}
+
+static void rna_Brush_color_value_set(PointerRNA *ptr, float value)
+{
+  rna_Brush_color_hsv_component_set(ptr, 2, value);
 }
 
 static void rna_Brush_stroke_update(Main *bmain, Scene *scene, PointerRNA *ptr)
@@ -3104,6 +3162,30 @@ static void rna_def_brush(BlenderRNA *brna)
   RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.001, 3);
   RNA_def_property_float_sdna(prop, nullptr, "secondary_color");
   RNA_def_property_ui_text(prop, "Secondary Color", "");
+  RNA_def_property_update(prop, 0, "rna_Brush_color_update");
+
+  prop = RNA_def_property(srna, "color_hue", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.01, 3);
+  RNA_def_property_float_funcs(
+      prop, "rna_Brush_color_hue_get", "rna_Brush_color_hue_set", nullptr);
+  RNA_def_property_ui_text(prop, "Hue", "Hue of the brush color");
+  RNA_def_property_update(prop, 0, "rna_Brush_color_update");
+
+  prop = RNA_def_property(srna, "color_saturation", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.01, 3);
+  RNA_def_property_float_funcs(
+      prop, "rna_Brush_color_saturation_get", "rna_Brush_color_saturation_set", nullptr);
+  RNA_def_property_ui_text(prop, "Saturation", "Saturation of the brush color");
+  RNA_def_property_update(prop, 0, "rna_Brush_color_update");
+
+  prop = RNA_def_property(srna, "color_value", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.01, 3);
+  RNA_def_property_float_funcs(
+      prop, "rna_Brush_color_value_get", "rna_Brush_color_value_set", nullptr);
+  RNA_def_property_ui_text(prop, "Value", "Brightness value of the brush color");
   RNA_def_property_update(prop, 0, "rna_Brush_color_update");
 
   prop = RNA_def_property(srna, "weight", PROP_FLOAT, PROP_FACTOR);
