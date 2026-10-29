@@ -46,11 +46,15 @@
 #include "IMB_imbuf_types.hh"
 #include "IMB_partial_update.hh"
 
+#include "DNA_node_types.h"
+
 #include "BKE_context.hh"
+#include "BKE_global.hh"
 #include "BKE_image.hh"
 #include "BKE_image_gpu.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_types.hh"
+#include "BKE_tex_paint_layer.hh"
 #include "BKE_undo_system.hh"
 
 #include "DEG_depsgraph.hh"
@@ -294,7 +298,16 @@ static void ptile_restore_runtime_map(PaintTileMap *paint_tile_map)
 {
   for (PaintTile *ptile : paint_tile_map->map.values()) {
     Image *image = ptile->image;
-    ImBuf *ibuf = BKE_image_acquire_ibuf(image, &ptile->iuser, nullptr);
+    bNode *tex_paint_node = nullptr;
+    const bool is_layer_buf = ptile->ibuf &&
+                              BKE_tex_paint_is_layer_buffer_name(ptile->ibuf->filepath.c_str());
+    ImBuf *ibuf = is_layer_buf ?
+                      BKE_tex_paint_undo_buffer_find(
+                          *G_MAIN, image, ptile->ibuf->filepath.c_str(), &tex_paint_node) :
+                      BKE_image_acquire_ibuf(image, &ptile->iuser, nullptr);
+    if (ibuf == nullptr) {
+      continue;
+    }
 
     int2 tile_pos;
     int2 tile_copy_size;
@@ -320,9 +333,14 @@ static void ptile_restore_runtime_map(PaintTileMap *paint_tile_map)
                     tile_copy_size);
     }
 
-    IMB_partial_update_mark_region(ibuf, calc_tile_region(*ibuf, ptile->x_tile, ptile->y_tile));
-
-    BKE_image_release_ibuf(image, ibuf, nullptr);
+    const rcti region = calc_tile_region(*ibuf, ptile->x_tile, ptile->y_tile);
+    if (tex_paint_node) {
+      BKE_tex_paint_undo_buffer_restored(*tex_paint_node, ibuf, region);
+    }
+    else {
+      IMB_partial_update_mark_region(ibuf, region);
+      BKE_image_release_ibuf(image, ibuf, nullptr);
+    }
   }
 }
 
@@ -585,15 +603,21 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
     /* Tiles only added to second set of tiles. */
     Image *image = uh.image_ref.ptr;
 
-    ImBuf *ibuf = BKE_image_acquire_ibuf(image, &uh.iuser, nullptr);
-    if (ibuf == nullptr) [[unlikely]] {
-      CLOG_ERROR(&LOG, "Unable to get buffer for image '%s'", image->id.name + 2);
-      continue;
-    }
     bool changed = false;
     for (UndoImageBuf &ubuf_iter : uh.buffers) {
       UndoImageBuf *ubuf = use_init ? &ubuf_iter : ubuf_iter.post;
       const UndoImageBuf *ubuf_other = use_init ? ubuf_iter.post : &ubuf_iter;
+
+      bNode *tex_paint_node = nullptr;
+      const bool is_layer_buf = BKE_tex_paint_is_layer_buffer_name(ubuf->ibuf_filepath.c_str());
+      ImBuf *ibuf = is_layer_buf ?
+                        BKE_tex_paint_undo_buffer_find(
+                            *G_MAIN, image, ubuf->ibuf_filepath.c_str(), &tex_paint_node) :
+                        BKE_image_acquire_ibuf(image, &uh.iuser, nullptr);
+      if (ibuf == nullptr) [[unlikely]] {
+        CLOG_ERROR(&LOG, "Unable to get buffer for image '%s'", image->id.name + 2);
+        continue;
+      }
 
       /* Check if we need to restore all because of modified image dimensions or image
        * buffer, or if we can do a partial restore and update. */
@@ -607,20 +631,30 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
         for (uint x_tile = 0; x_tile < ubuf->tiles_dims[0]; x_tile += 1) {
           if (restore_all || ubuf->tiles[i] != ubuf_other->tiles[i]) {
             utile_restore(ubuf->tiles[i], x_tile, y_tile, ibuf);
-            IMB_partial_update_mark_region(ibuf, calc_tile_region(*ibuf, x_tile, y_tile));
+            const rcti region = calc_tile_region(*ibuf, x_tile, y_tile);
+            if (tex_paint_node) {
+              BKE_tex_paint_undo_buffer_restored(*tex_paint_node, ibuf, region);
+            }
+            else {
+              IMB_partial_update_mark_region(ibuf, region);
+            }
             changed = true;
           }
           i += 1;
         }
       }
+
+      if (changed && !is_layer_buf) {
+        IMB_mark_dirty(ibuf);
+      }
+      if (!is_layer_buf) {
+        BKE_image_release_ibuf(image, ibuf, nullptr);
+      }
     }
 
     if (changed) {
-      IMB_mark_dirty(ibuf);
-
       DEG_id_tag_update(&image->id, 0);
     }
-    BKE_image_release_ibuf(image, ibuf, nullptr);
   }
 }
 
@@ -820,8 +854,15 @@ static bool image_undosys_step_encode(bContext *C, Main * /*bmain*/, UndoStep *u
 
     for (UndoImageHandle &uh : us->handles) {
       for (UndoImageBuf &ubuf_pre : uh.buffers) {
-
-        ImBuf *ibuf = BKE_image_acquire_ibuf(uh.image_ref.ptr, &uh.iuser, nullptr);
+        bNode *tex_paint_node = nullptr;
+        const bool is_layer_buf = BKE_tex_paint_is_layer_buffer_name(
+            ubuf_pre.ibuf_filepath.c_str());
+        ImBuf *ibuf = is_layer_buf ?
+                          BKE_tex_paint_undo_buffer_find(*G_MAIN,
+                                                         uh.image_ref.ptr,
+                                                         ubuf_pre.ibuf_filepath.c_str(),
+                                                         &tex_paint_node) :
+                          BKE_image_acquire_ibuf(uh.image_ref.ptr, &uh.iuser, nullptr);
 
         const bool has_float = ibuf->float_data();
 
@@ -892,7 +933,9 @@ static bool image_undosys_step_encode(bContext *C, Main * /*bmain*/, UndoStep *u
                 }
               });
         }
-        BKE_image_release_ibuf(uh.image_ref.ptr, ibuf, nullptr);
+        if (!is_layer_buf) {
+          BKE_image_release_ibuf(uh.image_ref.ptr, ibuf, nullptr);
+        }
       }
     }
 

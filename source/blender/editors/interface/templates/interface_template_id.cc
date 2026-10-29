@@ -315,23 +315,40 @@ void context_active_but_prop_get_templateID(const bContext *C,
                                             PointerRNA *r_ptr,
                                             PropertyRNA **r_prop)
 {
-  Button *but = context_active_but_get(C);
+  Button *but = context_active_but_get_respect_popup(C);
+  if (!but) {
+    but = context_active_but_get(C);
+  }
 
   *r_ptr = {};
   *r_prop = nullptr;
-  if (!but || !but->context) {
+
+  PointerRNA ptr_copy = {};
+  std::string prop_name_str;
+
+  if (but && but->context) {
+    const PointerRNA *ptr = CTX_store_ptr_lookup(but->context, "template_id_ptr");
+    std::optional<StringRefNull> prop_name = CTX_store_string_lookup(but->context,
+                                                                     "template_id_prop");
+    if (ptr && prop_name) {
+      ptr_copy = *ptr;
+      prop_name_str = prop_name->c_str();
+    }
+  }
+
+  if (!ptr_copy.data || prop_name_str.empty()) {
+    ptr_copy = CTX_data_pointer_get(C, "template_id_ptr");
+    std::optional<StringRefNull> ctx_prop = CTX_data_string_get(C, "template_id_prop");
+    if (ctx_prop) {
+      prop_name_str = ctx_prop->c_str();
+    }
+  }
+
+  if (!ptr_copy.data || prop_name_str.empty()) {
     return;
   }
-  const PointerRNA *ptr = CTX_store_ptr_lookup(but->context, "template_id_ptr");
-  std::optional<StringRefNull> prop_name = CTX_store_string_lookup(but->context,
-                                                                   "template_id_prop");
 
-  if (!ptr || !prop_name) {
-    return;
-  }
-
-  PointerRNA ptr_copy = *ptr;
-  PropertyRNA *prop = RNA_struct_find_property(&ptr_copy, prop_name->c_str());
+  PropertyRNA *prop = RNA_struct_find_property(&ptr_copy, prop_name_str.c_str());
 
   if (!prop || RNA_property_type(prop) != PROP_POINTER) {
     return;

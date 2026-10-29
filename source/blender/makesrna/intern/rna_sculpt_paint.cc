@@ -124,6 +124,10 @@ const EnumPropertyItem rna_enum_symmetrize_direction_items[] = {
 #  include "ED_paint.hh"
 #  include "ED_particle.hh"
 
+#  include "BLI_math_color.hh"
+#  include "BLI_math_vector.hh"
+#  include "IMB_colormanagement.hh"
+
 namespace blender {
 
 const EnumPropertyItem rna_enum_particle_edit_disconnected_hair_brush_items[] = {
@@ -589,6 +593,62 @@ static void rna_UnifiedPaintSettings_color_update(bContext *C, PointerRNA *ptr)
   BKE_brush_color_sync_legacy(ups);
 }
 
+static float g_ups_cached_hsv[3] = {0.0f, 0.0f, 1.0f};
+
+static float rna_UnifiedPaintSettings_color_hsv_component_get(PointerRNA *ptr, const int index)
+{
+  const UnifiedPaintSettings *ups = static_cast<const UnifiedPaintSettings *>(ptr->data);
+  float rgb[3];
+  copy_v3_v3(rgb, ups->color);
+  IMB_colormanagement_scene_linear_to_color_picking_v3(rgb, rgb);
+  rgb_to_hsv_compat_v(rgb, g_ups_cached_hsv);
+  return g_ups_cached_hsv[index];
+}
+
+static void rna_UnifiedPaintSettings_color_hsv_component_set(PointerRNA *ptr,
+                                                             const int index,
+                                                             const float value)
+{
+  UnifiedPaintSettings *ups = static_cast<UnifiedPaintSettings *>(ptr->data);
+  float rgb[3];
+  copy_v3_v3(rgb, ups->color);
+  IMB_colormanagement_scene_linear_to_color_picking_v3(rgb, rgb);
+  rgb_to_hsv_compat_v(rgb, g_ups_cached_hsv);
+  g_ups_cached_hsv[index] = clamp_f(value, 0.0f, 1.0f);
+  hsv_to_rgb_v(g_ups_cached_hsv, rgb);
+  IMB_colormanagement_color_picking_to_scene_linear_v3(ups->color, rgb);
+}
+
+static float rna_UnifiedPaintSettings_color_hue_get(PointerRNA *ptr)
+{
+  return rna_UnifiedPaintSettings_color_hsv_component_get(ptr, 0);
+}
+
+static void rna_UnifiedPaintSettings_color_hue_set(PointerRNA *ptr, float value)
+{
+  rna_UnifiedPaintSettings_color_hsv_component_set(ptr, 0, value);
+}
+
+static float rna_UnifiedPaintSettings_color_saturation_get(PointerRNA *ptr)
+{
+  return rna_UnifiedPaintSettings_color_hsv_component_get(ptr, 1);
+}
+
+static void rna_UnifiedPaintSettings_color_saturation_set(PointerRNA *ptr, float value)
+{
+  rna_UnifiedPaintSettings_color_hsv_component_set(ptr, 1, value);
+}
+
+static float rna_UnifiedPaintSettings_color_value_get(PointerRNA *ptr)
+{
+  return rna_UnifiedPaintSettings_color_hsv_component_get(ptr, 2);
+}
+
+static void rna_UnifiedPaintSettings_color_value_set(PointerRNA *ptr, float value)
+{
+  rna_UnifiedPaintSettings_color_hsv_component_set(ptr, 2, value);
+}
+
 static void rna_UnifiedPaintSettings_size_set(PointerRNA *ptr, int value)
 {
   UnifiedPaintSettings *ups = static_cast<UnifiedPaintSettings *>(ptr->data);
@@ -950,6 +1010,39 @@ static void rna_def_unified_paint_settings(BlenderRNA *brna)
   RNA_def_property_range(prop, 0.0, 1.0);
   RNA_def_property_float_sdna(prop, nullptr, "secondary_color");
   RNA_def_property_ui_text(prop, "Secondary Color", "");
+  RNA_def_property_update(prop, 0, "rna_UnifiedPaintSettings_color_update");
+
+  prop = RNA_def_property(srna, "color_hue", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.01, 3);
+  RNA_def_property_float_funcs(prop,
+                               "rna_UnifiedPaintSettings_color_hue_get",
+                               "rna_UnifiedPaintSettings_color_hue_set",
+                               nullptr);
+  RNA_def_property_ui_text(prop, "Hue", "Hue of the active brush color");
+  RNA_def_property_update(prop, 0, "rna_UnifiedPaintSettings_color_update");
+
+  prop = RNA_def_property(srna, "color_saturation", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.01, 3);
+  RNA_def_property_float_funcs(prop,
+                               "rna_UnifiedPaintSettings_color_saturation_get",
+                               "rna_UnifiedPaintSettings_color_saturation_set",
+                               nullptr);
+  RNA_def_property_ui_text(prop, "Saturation", "Saturation of the active brush color");
+  RNA_def_property_update(prop, 0, "rna_UnifiedPaintSettings_color_update");
+
+  prop = RNA_def_property(srna, "color_value", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.01, 3);
+  RNA_def_property_float_funcs(prop,
+                               "rna_UnifiedPaintSettings_color_value_get",
+                               "rna_UnifiedPaintSettings_color_value_set",
+                               nullptr);
+  RNA_def_property_ui_text(prop, "Value", "Brightness value of the active brush color");
   RNA_def_property_update(prop, 0, "rna_UnifiedPaintSettings_color_update");
 
   prop = RNA_def_property(srna, "use_color_jitter", PROP_BOOLEAN, PROP_NONE);

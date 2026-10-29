@@ -99,6 +99,7 @@ void register_node_type_sh_tex_gabor();
 void register_node_type_sh_tex_gradient();
 void register_node_type_sh_tex_ies();
 void register_node_type_sh_tex_image();
+void register_node_type_sh_tex_paint();
 void register_node_type_sh_tex_magic();
 void register_node_type_sh_tex_noise();
 void register_node_type_sh_tex_sky();

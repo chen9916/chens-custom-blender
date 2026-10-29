@@ -383,6 +383,8 @@ float2 node_from_view(const float2 &co);
 /* `node_ops.cc` */
 
 void node_operatortypes();
+/** Layered Texture Paint node operators, see `node_tex_paint_ops.cc`. */
+void node_tex_paint_operatortypes();
 void node_keymap(wmKeyConfig *keyconf);
 
 /* `node_select.cc` */

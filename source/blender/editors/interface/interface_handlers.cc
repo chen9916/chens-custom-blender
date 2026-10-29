@@ -1035,7 +1035,9 @@ static void apply_but_func(bContext *C, Button *but)
     after->context = *but->context;
   }
   if (but->block->handle) {
-    after->region_popup = but->block->handle->ctx_region_popup;
+    after->region_popup = but->block->handle->ctx_region_popup ?
+                              but->block->handle->ctx_region_popup :
+                              but->block->handle->region;
   }
 
   after->drawstr = button_drawstr_without_sep_char(but);

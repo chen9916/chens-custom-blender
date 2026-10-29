@@ -1083,6 +1083,38 @@ class VIEW3D_HT_header(Header):
 
             row = layout.row()
             row.popover(panel="VIEW3D_PT_slots_projectpaint", icon=icon)
+            from bl_ui.properties_tex_paint_layers import tex_paint_node_from_context
+            tp_node = tex_paint_node_from_context(context)
+            tp_layer = tp_node.active_layer if (tp_node and tp_node.image) else None
+            l_row = layout.row(align=True)
+            l_row.popover(
+                panel="VIEW3D_PT_tex_paint_layers_popover",
+                text=tp_layer.name if tp_layer else "Paint Layers",
+                icon='RENDERLAYERS',
+            )
+            if tp_layer is not None and tp_layer.use_mask:
+                paint_target = getattr(tp_node, "paint_target", 'COLOR')
+                op_c = l_row.operator(
+                    "node.tex_paint_layer_target_select",
+                    text="",
+                    icon='BRUSH_DATA',
+                    depress=(paint_target == 'COLOR'),
+                )
+                op_c.layer_index = tp_node.active_layer_index
+                op_c.target = 'COLOR'
+                op_m = l_row.operator(
+                    "node.tex_paint_layer_target_select",
+                    text="",
+                    icon='MOD_MASK',
+                    depress=(paint_target == 'MASK'),
+                )
+                op_m.layer_index = tp_node.active_layer_index
+                op_m.target = 'MASK'
+                if hasattr(tp_layer, "preview_mask"):
+                    l_row.prop(tp_layer, "preview_mask", text="", toggle=True, icon='HIDE_OFF')
+                if paint_target == 'MASK':
+                    l_row.operator("node.tex_paint_mask_brush_color", text="", icon='LIGHT_SUN').value = 1.0
+                    l_row.operator("node.tex_paint_mask_brush_color", text="", icon='SHADING_SOLID').value = 0.0
             row.popover(
                 panel="VIEW3D_PT_mask",
                 icon=VIEW3D_HT_header._texture_mask_icon(tool_settings.image_paint),
@@ -9011,6 +9043,7 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'WINDOW'
     bl_label = "Texture Paint"
+    bl_ui_units_x = 14
 
     @classmethod
     def poll(cls, context):
@@ -9026,24 +9059,101 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
         paint = context.tool_settings.image_paint
         space = context.space_data
         brush = paint.brush
+        if brush is None:
+            return
         capabilities = brush.image_paint_capabilities
 
-        if capabilities.has_color:
-            split = layout.split(factor=0.1)
-            UnifiedPaintPanel.prop_unified_color(split, context, brush, "color", text="")
-            UnifiedPaintPanel.prop_unified_color_picker(split, context, brush, "color", value_slider=True)
-            layout.prop(brush, "blend", text="")
+        # 1. Unified Single-Row Active Paint Layer & Mask Target Bar at the top of the Right-Click menu
+        from bl_ui.properties_tex_paint_layers import tex_paint_node_from_context, _is_layer_soloed
+        tp_node = tex_paint_node_from_context(context)
+        tp_layer = tp_node.active_layer if (tp_node and tp_node.image) else None
+        if tp_layer is not None:
+            l_row = layout.row(align=True)
+            l_row.popover(
+                panel="VIEW3D_PT_tex_paint_layers_popover",
+                text=tp_layer.name,
+                icon='RENDERLAYERS',
+            )
+            if tp_layer.use_mask:
+                p_tgt = getattr(tp_node, "paint_target", 'COLOR')
+                op_tc = l_row.operator(
+                    "node.tex_paint_layer_target_select",
+                    text="",
+                    icon='BRUSH_DATA',
+                    depress=(p_tgt == 'COLOR'),
+                )
+                op_tc.layer_index = tp_node.active_layer_index
+                op_tc.target = 'COLOR'
+                op_tm = l_row.operator(
+                    "node.tex_paint_layer_target_select",
+                    text="",
+                    icon='MOD_MASK',
+                    depress=(p_tgt == 'MASK'),
+                )
+                op_tm.layer_index = tp_node.active_layer_index
+                op_tm.target = 'MASK'
+                if p_tgt == 'MASK':
+                    l_row.operator("node.tex_paint_mask_brush_color", text="", icon='LIGHT_SUN').value = 1.0
+                    l_row.operator("node.tex_paint_mask_brush_color", text="", icon='SHADING_SOLID').value = 0.0
+                if hasattr(tp_layer, "preview_mask"):
+                    l_row.prop(tp_layer, "preview_mask", text="", toggle=True, icon='HIDE_OFF')
+            else:
+                l_row.prop(tp_layer, "use_mask", text="", toggle=True, icon='MOD_MASK')
+            if tp_layer.type == 'PAINT':
+                l_row.prop(tp_layer, "lock_alpha", text="", toggle=True, icon='IMAGE_ALPHA')
+            is_solo = _is_layer_soloed(tp_node, tp_layer)
+            op_solo = l_row.operator(
+                "node.tex_paint_layer_solo",
+                text="",
+                icon='SOLO_ON' if is_solo else 'SOLO_OFF',
+                depress=is_solo,
+            )
+            op_solo.layer_index = tp_node.active_layer_index
 
+        # 2. Color Picker, Swatches, Blend Mode & Palette
+        if capabilities.has_color:
+            col = layout.column(align=True)
+            if brush.color_type == 'COLOR':
+                UnifiedPaintPanel.prop_unified_color_picker(col, context, brush, "color", value_slider=True)
+
+                # Single unified row: Primary/Secondary Swatches + Flip + Eyedropper + Blend Mode + Affect Alpha
+                swatch_row = col.row(align=True)
+                sw_sub = swatch_row.row(align=True)
+                sw_sub.scale_x = 0.65
+                UnifiedPaintPanel.prop_unified_color(sw_sub, context, brush, "color", text="")
+                UnifiedPaintPanel.prop_unified_color(sw_sub, context, brush, "secondary_color", text="")
+                swatch_row.operator("paint.brush_colors_flip", icon='FILE_REFRESH', text="")
+                swatch_row.operator("paint.sample_color", icon='EYEDROPPER', text="")
+                swatch_row.prop(brush, "blend", text="")
+                swatch_row.prop(brush, "use_alpha", text="", toggle=True, icon='IMAGE_ALPHA')
+                swatch_row.prop(brush, "color_type", text="", icon='COLOR', icon_only=True)
+
+                if paint.palette:
+                    col.template_palette(paint, "palette", color=True)
+            elif brush.color_type == 'GRADIENT':
+                g_hdr = col.row(align=True)
+                g_hdr.prop(brush, "color_type", expand=True)
+                g_hdr.prop(brush, "blend", text="")
+                g_hdr.prop(brush, "use_alpha", text="", toggle=True, icon='IMAGE_ALPHA')
+                col.template_color_ramp(brush, "gradient", expand=True)
+                if brush.image_brush_type == 'DRAW':
+                    gm_row = col.row(align=True)
+                    gm_row.prop(brush, "gradient_stroke_mode", text="")
+                    if brush.gradient_stroke_mode in {'SPACING_REPEAT', 'SPACING_CLAMP'}:
+                        gm_row.prop(brush, "grad_spacing", text="Spacing")
+
+        # 3. Core Brush Size & Strength Sliders
         if capabilities.has_radius:
             size = "size"
-            if space.type == 'VIEW_3D' and show_experimental_texture_paint(brush):
+            if space is not None and space.type == 'VIEW_3D' and show_experimental_texture_paint(brush):
                 ups = paint.unified_paint_settings
                 size_owner = ups if brush.use_unified_size else brush
                 if size_owner.use_locked_size == 'SCENE':
                     size = "unprojected_size"
 
+            col_brush = layout.column(align=True)
             UnifiedPaintPanel.prop_unified(
-                layout,
+                col_brush,
                 context,
                 brush,
                 size,
@@ -9053,7 +9163,7 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
                 slider=True,
             )
             UnifiedPaintPanel.prop_unified(
-                layout,
+                col_brush,
                 context,
                 brush,
                 "strength",
@@ -9062,6 +9172,103 @@ class VIEW3D_PT_paint_texture_context_menu(Panel):
                 slider=True,
             )
 
+        # Tool-specific settings (Soften / Mask / Fill)
+        if brush.image_brush_type == 'SOFTEN':
+            soft_row = layout.row(align=True)
+            soft_row.prop(brush, "direction", expand=True)
+            soft_row.prop(brush, "blur_mode", text="")
+            layout.prop(brush, "sharp_threshold", slider=True)
+        elif brush.image_brush_type == 'MASK':
+            layout.prop(brush, "weight", text="Mask Value", slider=True)
+        elif brush.image_brush_type == 'FILL' and space is not None and space.type == 'IMAGE_EDITOR':
+            layout.prop(brush, "fill_threshold", text="Fill Threshold", slider=True)
+
+        # 4. Compact Falloff & Stroke Bar
+        if brush.curve_distance_falloff:
+            falloff_col = layout.column(align=True)
+            falloff_row = falloff_col.row(align=True)
+            falloff_row.prop(brush, "curve_distance_falloff_preset", expand=True)
+            if brush.curve_distance_falloff_preset == 'CUSTOM':
+                falloff_col.template_curve_mapping(
+                    brush,
+                    "curve_distance_falloff",
+                    brush=True,
+                    use_negative_slope=True,
+                    show_presets=True,
+                )
+
+        stroke_col = layout.column(align=True)
+        # Single row for Stroke Method + Spacing/Rate + Jitter
+        stroke_row = stroke_col.row(align=True)
+        stroke_row.prop(brush, "stroke_method", text="")
+        if brush.stroke_method in {'SPACE', 'LINE', 'CURVE'}:
+            stroke_row.prop(brush, "spacing", text="Space", slider=True)
+        elif brush.stroke_method == 'AIRBRUSH':
+            stroke_row.prop(brush, "rate", text="Rate", slider=True)
+        if brush.jitter_unit == 'BRUSH':
+            stroke_row.prop(brush, "jitter", text="Jitter", slider=True)
+        else:
+            stroke_row.prop(brush, "jitter_absolute", text="Jitter")
+
+        beh_row = stroke_col.row(align=True)
+        if capabilities.has_accumulate:
+            beh_row.prop(brush, "use_accumulate", text="Accumulate", toggle=True)
+        beh_row.prop(brush, "use_smooth_stroke", text="Stabilize", toggle=True)
+        beh_row.prop(brush, "use_paint_antialiasing", text="Anti-Alias", toggle=True)
+        if brush.use_smooth_stroke:
+            stab_row = stroke_col.row(align=True)
+            stab_row.prop(brush, "smooth_stroke_radius", text="Radius", slider=True)
+            stab_row.prop(brush, "smooth_stroke_factor", text="Factor", slider=True)
+
+        # 5. Compact Side-by-Side Brush Alpha & Tip Texture Selectors (only expands details when assigned)
+        tex_col = layout.column(align=True)
+        mask_tex_slot = brush.mask_texture_slot
+        tex_slot = brush.texture_slot
+        slot_row = tex_col.row(align=True)
+        slot_split = slot_row.split(factor=0.5, align=True)
+        a_sub = slot_split.row(align=True)
+        a_sub.template_ID(mask_tex_slot, "texture", new="texture.new")
+        t_sub = slot_split.row(align=True)
+        t_sub.template_ID(tex_slot, "texture", new="texture.new")
+
+        mask_tex = mask_tex_slot.texture
+        if mask_tex is not None:
+            m_row = tex_col.row(align=True)
+            if mask_tex.type == 'IMAGE':
+                m_row.template_ID(mask_tex, "image", open="image.open")
+            m_row.prop(mask_tex_slot, "mask_map_mode", text="")
+            if mask_tex_slot.has_texture_angle:
+                m_row.prop(mask_tex_slot, "angle", text="")
+                if mask_tex_slot.has_texture_angle_source:
+                    m_row.prop(mask_tex_slot, "use_rake", text="", icon='TRACKING', toggle=True)
+            if mask_tex_slot.map_mode == 'STENCIL':
+                m_row.operator("brush.stencil_reset_transform", text="", icon='LOOP_BACK').mask = True
+
+        b_tex = tex_slot.texture
+        if b_tex is not None:
+            t_row = tex_col.row(align=True)
+            if b_tex.type == 'IMAGE':
+                t_row.template_ID(b_tex, "image", open="image.open")
+            t_row.prop(tex_slot, "map_mode", text="")
+            if tex_slot.has_texture_angle:
+                t_row.prop(tex_slot, "angle", text="")
+                if tex_slot.has_texture_angle_source:
+                    t_row.prop(tex_slot, "use_rake", text="", icon='TRACKING', toggle=True)
+            if tex_slot.map_mode == 'STENCIL':
+                t_row.operator("brush.stencil_reset_transform", text="", icon='LOOP_BACK').mask = False
+
+        # 6. Single-Row 3D Projection & Mirror Symmetry Bar
+        ob = context.active_object
+        if space is not None and space.type == 'VIEW_3D':
+            proj_row = layout.row(align=True)
+            proj_row.prop(paint, "use_occlude", text="Occlude", toggle=True)
+            proj_row.prop(paint, "use_backface_culling", text="Backface", toggle=True)
+            proj_row.prop(paint, "use_normal_falloff", text="Normal", toggle=True)
+            if ob is not None:
+                proj_row.separator()
+                proj_row.prop(ob, "use_mesh_mirror_x", text="X", toggle=True)
+                proj_row.prop(ob, "use_mesh_mirror_y", text="Y", toggle=True)
+                proj_row.prop(ob, "use_mesh_mirror_z", text="Z", toggle=True)
 
 class VIEW3D_PT_paint_weight_context_menu(Panel):
     # Only for popover, these are dummy values.

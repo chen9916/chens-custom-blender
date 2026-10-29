@@ -1632,7 +1632,7 @@ static bool ntree_foreach_texnode_recursive(bNodeTree *nodetree,
   const bool do_color_attributes = (slot_filter & PAINT_SLOT_COLOR_ATTRIBUTE) != 0;
   for (bNode *node : nodetree->all_nodes()) {
     if (do_image_nodes && node->typeinfo->nclass == NODE_CLASS_TEXTURE &&
-        node->typeinfo->type_legacy == SH_NODE_TEX_IMAGE && node->id)
+        ELEM(node->typeinfo->type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_PAINT) && node->id)
     {
       if (!callback(nodetree, node, userdata)) {
         return false;
@@ -1690,6 +1690,7 @@ static bool fill_texpaint_slots_cb(bNodeTree * /*nodetree*/, bNode *node, void *
   }
 
   switch (node->type_legacy) {
+    case SH_NODE_TEX_PAINT: /* Storage starts with #NodeTexImage. */
     case SH_NODE_TEX_IMAGE: {
       TexPaintSlot *slot = &ma->texpaintslot[index];
       slot->ima = id_cast<Image *>(node->id);
@@ -1833,7 +1834,7 @@ struct FindTexPaintNodeData {
 static bool texpaint_slot_node_find_cb(bNodeTree *nodetree, bNode *node, void *userdata)
 {
   FindTexPaintNodeData *find_data = static_cast<FindTexPaintNodeData *>(userdata);
-  if (find_data->slot->ima && node->type_legacy == SH_NODE_TEX_IMAGE) {
+  if (find_data->slot->ima && ELEM(node->type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_PAINT)) {
     Image *node_ima = id_cast<Image *>(node->id);
     if (find_data->slot->ima == node_ima) {
       find_data->r_nodetree = nodetree;

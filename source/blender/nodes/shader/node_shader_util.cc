@@ -429,7 +429,7 @@ bool bke::node_supports_active_flag(const bNode &node, int sub_activity)
     case NODE_ACTIVE_TEXTURE:
       return node.typeinfo->nclass == NODE_CLASS_TEXTURE;
     case NODE_ACTIVE_PAINT_CANVAS:
-      return ELEM(node.type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_ATTRIBUTE);
+      return ELEM(node.type_legacy, SH_NODE_TEX_IMAGE, SH_NODE_TEX_PAINT, SH_NODE_ATTRIBUTE);
   }
   return false;
 }

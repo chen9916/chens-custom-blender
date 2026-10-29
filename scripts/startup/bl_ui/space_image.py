@@ -905,6 +905,47 @@ class IMAGE_HT_header(Header):
 
         layout.template_ID(sima, "image", new="image.new", open="image.open")
 
+        if sima.mode == 'PAINT':
+            from bl_ui.properties_tex_paint_layers import tex_paint_node_from_context
+            tp_node = tex_paint_node_from_context(context)
+            tp_row = layout.row(align=True)
+            if tp_node is not None and tp_node.image is not None:
+                tp_layer = tp_node.active_layer
+                tp_row.popover(
+                    panel="VIEW3D_PT_tex_paint_layers_popover",
+                    text=tp_layer.name if tp_layer else "Layers",
+                    icon='RENDERLAYERS',
+                )
+                if tp_layer is not None and tp_layer.use_mask:
+                    p_tgt = getattr(tp_node, "paint_target", 'COLOR')
+                    op_c = tp_row.operator(
+                        "node.tex_paint_layer_target_select",
+                        text="",
+                        icon='BRUSH_DATA',
+                        depress=(p_tgt == 'COLOR'),
+                    )
+                    op_c.layer_index = tp_node.active_layer_index
+                    op_c.target = 'COLOR'
+                    op_m = tp_row.operator(
+                        "node.tex_paint_layer_target_select",
+                        text="",
+                        icon='MOD_MASK',
+                        depress=(p_tgt == 'MASK'),
+                    )
+                    op_m.layer_index = tp_node.active_layer_index
+                    op_m.target = 'MASK'
+            elif sima.image is not None:
+                tp_row.operator(
+                    "image.tex_paint_2d_layer_mode",
+                    text="2D Layers",
+                    icon='RENDERLAYERS',
+                ).action = 'ENABLE_LAYERS'
+            tp_row.popover(
+                panel="IMAGE_PT_2d_canvas_studio_popover",
+                text="2D Studio",
+                icon='SHADERFX',
+            )
+
         if show_maskedit:
             layout.template_ID(sima, "mask", new="mask.new")
             layout.prop(sima, "pivot_point", icon_only=True)

@@ -17,6 +17,7 @@
 
 #include "BLT_translation.hh"
 
+#include "DNA_node_tex_paint_types.h"
 #include "DNA_node_types.h"
 #include "DNA_object_types.h"
 #include "DNA_texture_types.h"
@@ -10926,6 +10927,7 @@ static void rna_def_nodes(BlenderRNA *brna)
   define("ShaderNode", "ShaderNodeTexGradient", def_sh_tex_gradient);
   define("ShaderNode", "ShaderNodeTexIES", def_sh_tex_ies);
   define("ShaderNode", "ShaderNodeTexImage", def_sh_tex_image);
+  define("ShaderNode", "ShaderNodeTexPaint", rna_def_sh_tex_paint);
   define("ShaderNode", "ShaderNodeTexMagic", def_sh_tex_magic);
   define("ShaderNode", "ShaderNodeTexNoise", def_sh_tex_noise);
   define("ShaderNode", "ShaderNodeTexSky", def_sh_tex_sky);
