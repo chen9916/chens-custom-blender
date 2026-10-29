@@ -210,11 +210,20 @@ static NodeTexPaint &storage(bNode &node)
 /** Composite after a layer stack change and redraw, without re-evaluating the node tree. */
 static void tex_paint_layers_changed(bContext *C, bNode &node)
 {
-  BKE_tex_paint_cache_invalidate(storage(node));
+  NodeTexPaint &data = storage(node);
+  BKE_tex_paint_cache_invalidate(data);
   BKE_tex_paint_composite_full(node);
   if (node.id) {
     DEG_id_tag_update(node.id, ID_RECALC_EDITORS);
     WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, node.id);
+  }
+  if (data.pbr_image) {
+    DEG_id_tag_update(&data.pbr_image->id, ID_RECALC_EDITORS);
+    WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, data.pbr_image);
+  }
+  if (data.emission_image) {
+    DEG_id_tag_update(&data.emission_image->id, ID_RECALC_EDITORS);
+    WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, data.emission_image);
   }
   WM_event_add_notifier(C, NC_NODE | NA_EDITED, nullptr);
   WM_event_add_notifier(C, NC_SCENE | ND_OB_ACTIVE, nullptr);
@@ -274,21 +283,45 @@ static wmOperatorStatus tex_paint_canvas_new_exec(bContext *C, wmOperator *op)
     return OPERATOR_CANCELLED;
   }
 
-  /* Auto-link Color -> Principled BSDF Base Color when Base Color is unconnected and this node is for Base Color. */
-  if (node->label[0] == '\0' || STREQ(node->label, "Base Color")) {
+  /* Auto-link all PBR sockets (Color, Roughness, Metallic, Normal, Emission) of the single
+   * Multi-Channel Texture Paint node to Principled BSDF when unconnected. */
+  if (node->label[0] == '\0' || STREQ(node->label, "Base Color") ||
+      STREQ(node->label, "PBR Material"))
+  {
+    bke::node_declaration_ensure(*ntree, *node);
     ntree->ensure_topology_cache();
     const Span<bNode *> bsdf_nodes = ntree->nodes_by_type("ShaderNodeBsdfPrincipled"_ustr);
     if (!bsdf_nodes.is_empty()) {
       bNode *bsdf = bsdf_nodes.first();
-      bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, "Color"_ustr);
-      bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, "Base Color"_ustr);
-      if (out_sock != nullptr && in_sock != nullptr && in_sock->link == nullptr) {
-        if (node->label[0] == '\0') {
-          STRNCPY_UTF8(node->label, "Base Color");
+      auto link_if_free = [&](const UString out_name, const UString in_name) {
+        bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, out_name);
+        bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, in_name);
+        if (out_sock != nullptr && in_sock != nullptr && in_sock->link == nullptr) {
+          bke::node_add_link(*ntree, *node, *out_sock, *bsdf, *in_sock);
+          return true;
         }
-        bke::node_add_link(*ntree, *node, *out_sock, *bsdf, *in_sock);
-        bke::node_position_relative(*node, *bsdf, out_sock, *in_sock);
-        bke::node_position_propagate(*node);
+        return false;
+      };
+      const bool linked_base = link_if_free("Color"_ustr, "Base Color"_ustr);
+      link_if_free("Roughness"_ustr, "Roughness"_ustr);
+      link_if_free("Metallic"_ustr, "Metallic"_ustr);
+      link_if_free("Normal"_ustr, "Normal"_ustr);
+      if (link_if_free("Emission"_ustr, "Emission Color"_ustr)) {
+        if (bNodeSocket *em_str = bke::node_find_socket(*bsdf, SOCK_IN, "Emission Strength"_ustr))
+        {
+          bNodeSocketValueFloat *val = em_str->default_value_typed<bNodeSocketValueFloat>();
+          if (val && val->value <= 0.0f) {
+            val->value = 1.0f;
+          }
+        }
+      }
+      if (linked_base) {
+        bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, "Color"_ustr);
+        bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, "Base Color"_ustr);
+        if (out_sock && in_sock) {
+          bke::node_position_relative(*node, *bsdf, out_sock, *in_sock);
+          bke::node_position_propagate(*node);
+        }
       }
     }
   }

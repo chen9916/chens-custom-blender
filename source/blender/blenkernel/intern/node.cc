@@ -27,6 +27,8 @@
 #include "DNA_linestyle_types.h"
 #include "DNA_mask_types.h"
 #include "DNA_material_types.h"
+#include "DNA_image_types.h"
+#include "DNA_node_tex_paint_types.h"
 #include "DNA_node_types.h"
 #include "DNA_scene_types.h"
 #include "DNA_sound_types.h"
@@ -404,6 +406,11 @@ static void library_foreach_node_socket(bNodeSocket *sock, LibraryForeachIDData 
 void node_node_foreach_id(bNode *node, LibraryForeachIDData *data)
 {
   BKE_LIB_FOREACHID_PROCESS_ID(data, node->id, IDWALK_CB_USER);
+  if (node->type_legacy == SH_NODE_TEX_PAINT && node->storage != nullptr) {
+    NodeTexPaint *tex_paint = static_cast<NodeTexPaint *>(node->storage);
+    BKE_LIB_FOREACHID_PROCESS_IDSUPER(data, tex_paint->pbr_image, IDWALK_CB_USER);
+    BKE_LIB_FOREACHID_PROCESS_IDSUPER(data, tex_paint->emission_image, IDWALK_CB_USER);
+  }
 
   BKE_LIB_FOREACHID_PROCESS_FUNCTION_CALL(
       data, IDP_foreach_property(node->prop, IDP_TYPE_FILTER_ID, [&](IDProperty *prop) {

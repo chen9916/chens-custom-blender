@@ -21,6 +21,7 @@
 
 namespace blender {
 
+struct Image;
 struct ImBuf;
 struct PackedFile;
 
@@ -47,6 +48,20 @@ enum eTexPaintLayerFlag {
   TEXPAINT_LAYER_SHOW_WIDGET = (1 << 6),
   /** Temporarily preview this layer's grayscale mask directly on the composited master image. */
   TEXPAINT_LAYER_PREVIEW_MASK = (1 << 7),
+  /** Set once `channel_flags` has been explicitly initialized on this layer. */
+  TEXPAINT_LAYER_CHANNELS_INIT = (1 << 8),
+};
+
+/** #TexPaintLayer::channel_flags (Substance Painter per-layer PBR channel toggles). */
+enum eTexPaintChannelFlag {
+  TEXPAINT_CHAN_COLOR = (1 << 0),
+  TEXPAINT_CHAN_ROUGHNESS = (1 << 1),
+  TEXPAINT_CHAN_METALLIC = (1 << 2),
+  TEXPAINT_CHAN_HEIGHT = (1 << 3),
+  TEXPAINT_CHAN_EMISSION = (1 << 4),
+  TEXPAINT_CHAN_SPECULAR = (1 << 5),
+  TEXPAINT_CHAN_NORMAL = (1 << 6),
+  TEXPAINT_CHAN_ALPHA = (1 << 7),
 };
 
 /** #NodeTexPaint::paint_target */
@@ -139,6 +154,19 @@ struct TexPaintLayer {
   /** Runtime: the buffers changed since the packed data was last encoded. */
   int runtime_dirty = 0;
   char _pad2[4] = {};
+
+  /* Substance-Painter-style Multi-Channel PBR parameters & optional textured PBR buffer. */
+  /** Bitmask of #eTexPaintChannelFlag enabled on this layer. */
+  int channel_flags = TEXPAINT_CHAN_COLOR;
+  float fill_roughness = 0.45f;
+  float fill_metallic = 0.0f;
+  /** Signed height offset in [-1.0, 1.0] (0.0 = flat neutral 0.5). */
+  float fill_height = 0.0f;
+  float fill_specular = 0.5f;
+  float fill_emission[3] = {1.0f, 0.45f, 0.1f};
+  /** Optional packed PBR pixel buffer (R=Roughness, G=Metallic, B=Height, A=Coverage). */
+  PackedFile *pbr_pf = nullptr;
+  ImBuf *pbr_ibuf = nullptr;
 };
 
 struct NodeTexPaint {
@@ -164,6 +192,17 @@ struct NodeTexPaint {
 
   /** Runtime composite cache, `blender::bke::tex_paint::TexPaintRuntime`. */
   void *runtime = nullptr;
+
+  /** Derived master image for packed PBR channels (R=Roughness, G=Metallic, B=Height, A=Specular). */
+  Image *pbr_image = nullptr;
+  /** Derived master image for Emission RGB. */
+  Image *emission_image = nullptr;
+  ImageUser pbr_iuser;
+  ImageUser emission_iuser;
+  float base_roughness = 0.5f;
+  float base_metallic = 0.0f;
+  float base_specular = 0.5f;
+  float bump_strength = 1.0f;
 };
 
 }  // namespace blender

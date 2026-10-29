@@ -792,6 +792,7 @@ extern FunctionRNA *rna_Node_draw_buttons_ext_func;
 extern FunctionRNA *rna_Node_draw_label_func;
 
 void rna_Node_socket_update(Main *bmain, Scene * /*scene*/, PointerRNA *ptr);
+void rna_ShaderNodeTexPaint_pbr_update(Main *bmain, Scene *scene, PointerRNA *ptr);
 
 int rna_node_tree_idname_to_enum(const char *idname)
 {

@@ -28,6 +28,7 @@
 
 #  include <fmt/format.h>
 
+#  include "DNA_image_types.h"
 #  include "DNA_material_types.h"
 #  include "DNA_mesh_types.h"
 #  include "DNA_object_types.h"
@@ -56,6 +57,16 @@ static void tex_paint_tag_redraw(bNode &node)
   if (node.id) {
     DEG_id_tag_update(node.id, ID_RECALC_EDITORS);
     WM_main_add_notifier(NC_IMAGE | NA_EDITED, node.id);
+  }
+  if (NodeTexPaint *data = static_cast<NodeTexPaint *>(node.storage)) {
+    if (data->pbr_image) {
+      DEG_id_tag_update(&data->pbr_image->id, ID_RECALC_EDITORS);
+      WM_main_add_notifier(NC_IMAGE | NA_EDITED, data->pbr_image);
+    }
+    if (data->emission_image) {
+      DEG_id_tag_update(&data->emission_image->id, ID_RECALC_EDITORS);
+      WM_main_add_notifier(NC_IMAGE | NA_EDITED, data->emission_image);
+    }
   }
   WM_main_add_notifier(NC_NODE | NA_EDITED, nullptr);
   WM_main_add_notifier(NC_SCENE | ND_OB_ACTIVE, nullptr);
@@ -133,6 +144,21 @@ void rna_ShaderNodeTexPaint_active_layer_set(PointerRNA *ptr,
   }
 }
 
+void rna_ShaderNodeTexPaint_pbr_update(Main *bmain, Scene * /*scene*/, PointerRNA *ptr)
+{
+  bNode *node = ptr->data_as<bNode>();
+  if (node == nullptr || node->storage == nullptr) {
+    return;
+  }
+  NodeTexPaint *data = static_cast<NodeTexPaint *>(node->storage);
+  if (bmain != nullptr && (data->pbr_image == nullptr || data->emission_image == nullptr)) {
+    BKE_tex_paint_ensure_pbr_images(*bmain, *node);
+  }
+  BKE_tex_paint_cache_invalidate(*data);
+  BKE_tex_paint_composite_full(*node);
+  tex_paint_tag_redraw(*node);
+}
+
 static bNode *rna_TexPaintLayer_node(const PointerRNA *ptr)
 {
   bNodeTree *ntree = reinterpret_cast<bNodeTree *>(ptr->owner_id);
@@ -179,13 +205,16 @@ static void rna_TexPaintLayer_name_set(PointerRNA *ptr, const char *value)
 }
 
 /** Composite after a layer property change, reusing the below-active cache when possible. */
-static void rna_TexPaintLayer_update(Main * /*bmain*/, Scene * /*scene*/, PointerRNA *ptr)
+static void rna_TexPaintLayer_update(Main *bmain, Scene * /*scene*/, PointerRNA *ptr)
 {
   bNode *node = rna_TexPaintLayer_node(ptr);
   if (node == nullptr) {
     return;
   }
   NodeTexPaint *data = static_cast<NodeTexPaint *>(node->storage);
+  if (bmain != nullptr && (data->pbr_image == nullptr || data->emission_image == nullptr)) {
+    BKE_tex_paint_ensure_pbr_images(*bmain, *node);
+  }
   TexPaintLayer *layer = ptr->data_as<TexPaintLayer>();
   const int index = BLI_findindex(&data->layers, ptr->data);
   if (index < data->active_layer_index) {
@@ -669,6 +698,91 @@ static void rna_def_tex_paint_layer(BlenderRNA *brna)
   RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
   RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
 
+  /* Substance Painter-style multi-channel flags and values on each layer. */
+  prop = RNA_def_property(srna, "use_channel_color", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_COLOR);
+  RNA_def_property_ui_text(prop, "Color Channel", "Affect the Base Color channel on this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "use_channel_roughness", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_ROUGHNESS);
+  RNA_def_property_ui_text(prop, "Roughness Channel", "Affect the Roughness channel on this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "use_channel_metallic", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_METALLIC);
+  RNA_def_property_ui_text(prop, "Metallic Channel", "Affect the Metallic channel on this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "use_channel_height", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_HEIGHT);
+  RNA_def_property_ui_text(
+      prop, "Height Channel", "Affect the Height / Normal Bump channel on this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "use_channel_normal", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_NORMAL);
+  RNA_def_property_ui_text(
+      prop,
+      "Normal Channel",
+      "Affect the Normal channel on this layer (flattens or replaces underlying height bump)");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "use_channel_emission", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_EMISSION);
+  RNA_def_property_ui_text(prop, "Emission Channel", "Affect the Emission channel on this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "use_channel_specular", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "channel_flags", TEXPAINT_CHAN_SPECULAR);
+  RNA_def_property_ui_text(prop, "Specular Channel", "Affect the Specular channel on this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "fill_roughness", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "fill_roughness");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Roughness", "Roughness value for this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "fill_metallic", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "fill_metallic");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Metallic", "Metallic value for this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "fill_height", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "fill_height");
+  RNA_def_property_range(prop, -1.0f, 1.0f);
+  RNA_def_property_ui_text(
+      prop, "Height", "Signed height / bump offset (-1 recessed to +1 raised) for this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "fill_specular", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "fill_specular");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Specular", "Specular IOR level for this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "fill_emission", PROP_FLOAT, PROP_COLOR);
+  RNA_def_property_float_sdna(prop, nullptr, "fill_emission");
+  RNA_def_property_array(prop, 3);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 1, 3);
+  RNA_def_property_ui_text(prop, "Emission", "Emission color for this layer");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
   prop = RNA_def_property(srna, "adjust_hsv", PROP_FLOAT, PROP_NONE);
   RNA_def_property_array(prop, 3);
   RNA_def_property_ui_range(prop, -1.0f, 1.0f, 1, 3);
@@ -905,6 +1019,52 @@ void rna_def_sh_tex_paint(BlenderRNA * /*brna*/, StructRNA *srna)
   RNA_def_property_ui_text(prop, "Paint Target", "Part of the active layer that brushes paint");
   RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
   RNA_def_property_update(prop, NC_NODE | NA_EDITED, nullptr);
+
+  prop = RNA_def_property(srna, "pbr_image", PROP_POINTER, PROP_NONE);
+  RNA_def_property_pointer_sdna(prop, nullptr, "pbr_image");
+  RNA_def_property_struct_type(prop, "Image");
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(
+      prop,
+      "PBR Packed Image",
+      "Packed Non-Color RGBA image holding Roughness (R), Metallic (G), Height (B), Specular (A)");
+
+  prop = RNA_def_property(srna, "emission_image", PROP_POINTER, PROP_NONE);
+  RNA_def_property_pointer_sdna(prop, nullptr, "emission_image");
+  RNA_def_property_struct_type(prop, "Image");
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "Emission Image", "Composited Emission image");
+
+  prop = RNA_def_property(srna, "base_roughness", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "base_roughness");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(
+      prop, "Base Roughness", "Default roughness where no layer overrides Roughness");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_ShaderNodeTexPaint_pbr_update");
+
+  prop = RNA_def_property(srna, "base_metallic", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "base_metallic");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(
+      prop, "Base Metallic", "Default metallic value where no layer overrides Metallic");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_ShaderNodeTexPaint_pbr_update");
+
+  prop = RNA_def_property(srna, "base_specular", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "base_specular");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(
+      prop, "Base Specular", "Default specular value where no layer overrides Specular");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_ShaderNodeTexPaint_pbr_update");
+
+  prop = RNA_def_property(srna, "bump_strength", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "bump_strength");
+  RNA_def_property_range(prop, 0.0f, 2.0f);
+  RNA_def_property_ui_text(
+      prop, "Height Bump Strength", "Strength of the 3D normal bump generated from the Height channel");
+  RNA_def_property_update(prop, 0, "rna_Node_update");
 }
 
 void RNA_def_node_tex_paint(BlenderRNA *brna)

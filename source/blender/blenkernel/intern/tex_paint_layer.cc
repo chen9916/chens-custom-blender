@@ -110,6 +110,7 @@ struct TexPaintRuntime {
    */
   const ImBuf *composited_ibuf = nullptr;
   const void *composited_data = nullptr;
+  const ImBuf *pbr_composited_ibuf = nullptr;
 
   /**
    * Pre-baked 32x32 UV-space mesh position/normal/curvature/AO tiles for real-time multi-threaded
@@ -188,6 +189,10 @@ static void layer_free_buffers(TexPaintLayer &layer)
     IMB_freeImBuf(layer.mask_ibuf);
     layer.mask_ibuf = nullptr;
   }
+  if (layer.pbr_ibuf) {
+    IMB_freeImBuf(layer.pbr_ibuf);
+    layer.pbr_ibuf = nullptr;
+  }
 }
 
 static void layer_free_packed(TexPaintLayer &layer)
@@ -199,6 +204,10 @@ static void layer_free_packed(TexPaintLayer &layer)
   if (layer.mask_pf) {
     BKE_packedfile_free(layer.mask_pf);
     layer.mask_pf = nullptr;
+  }
+  if (layer.pbr_pf) {
+    BKE_packedfile_free(layer.pbr_pf);
+    layer.pbr_pf = nullptr;
   }
 }
 
@@ -349,15 +358,19 @@ void BKE_tex_paint_storage_copy_contents(NodeTexPaint &dst,
     layer->next = layer->prev = nullptr;
     layer->pf = nullptr;
     layer->mask_pf = nullptr;
+    layer->pbr_pf = nullptr;
     layer->ibuf = nullptr;
     layer->mask_ibuf = nullptr;
+    layer->pbr_ibuf = nullptr;
     layer->runtime_dirty = 0;
     if (copy_pixels) {
       /* Packed data is implicitly shared, so this is cheap. */
       layer->pf = src_layer.pf ? BKE_packedfile_duplicate(src_layer.pf) : nullptr;
       layer->mask_pf = src_layer.mask_pf ? BKE_packedfile_duplicate(src_layer.mask_pf) : nullptr;
+      layer->pbr_pf = src_layer.pbr_pf ? BKE_packedfile_duplicate(src_layer.pbr_pf) : nullptr;
       layer->ibuf = src_layer.ibuf ? IMB_dupImBuf(src_layer.ibuf) : nullptr;
       layer->mask_ibuf = src_layer.mask_ibuf ? IMB_dupImBuf(src_layer.mask_ibuf) : nullptr;
+      layer->pbr_ibuf = src_layer.pbr_ibuf ? IMB_dupImBuf(src_layer.pbr_ibuf) : nullptr;
       layer->runtime_dirty = src_layer.runtime_dirty;
     }
     BLI_addtail(&dst.layers, layer);
@@ -386,6 +399,14 @@ static void layer_update_packed(const NodeTexPaint &data, TexPaintLayer &layer)
       layer.mask_pf = pf;
     }
   }
+  if (layer.pbr_ibuf) {
+    if (PackedFile *pf = pack_buffer(*layer.pbr_ibuf, data.is_float)) {
+      if (layer.pbr_pf) {
+        BKE_packedfile_free(layer.pbr_pf);
+      }
+      layer.pbr_pf = pf;
+    }
+  }
   layer.runtime_dirty = 0;
 }
 
@@ -403,6 +424,9 @@ void BKE_tex_paint_blend_write(BlendWriter &writer, const NodeTexPaint &data)
     if (layer.mask_pf) {
       BKE_packedfile_blend_write(&writer, layer.mask_pf);
     }
+    if (layer.pbr_pf) {
+      BKE_packedfile_blend_write(&writer, layer.pbr_pf);
+    }
   }
 }
 
@@ -410,13 +434,33 @@ void BKE_tex_paint_blend_read_data(BlendDataReader &reader, NodeTexPaint &data)
 {
   data.runtime = nullptr;
   data.image.iuser.scene = nullptr;
+  data.pbr_iuser.scene = nullptr;
+  data.emission_iuser.scene = nullptr;
+  if (data.bump_strength <= 0.0f && data.base_roughness <= 0.0f && data.base_specular <= 0.0f) {
+    data.base_roughness = 0.5f;
+    data.base_specular = 0.5f;
+    data.bump_strength = 1.0f;
+  }
   BLO_read_struct_list(&reader, TexPaintLayer, &data.layers);
   for (TexPaintLayer &layer : data.layers) {
     layer.ibuf = nullptr;
     layer.mask_ibuf = nullptr;
+    layer.pbr_ibuf = nullptr;
     layer.runtime_dirty = 0;
+    if ((layer.flag & TEXPAINT_LAYER_CHANNELS_INIT) == 0) {
+      layer.flag |= TEXPAINT_LAYER_CHANNELS_INIT;
+      layer.channel_flags = TEXPAINT_CHAN_COLOR;
+      layer.fill_roughness = 0.45f;
+      layer.fill_metallic = 0.0f;
+      layer.fill_height = 0.0f;
+      layer.fill_specular = 0.5f;
+      layer.fill_emission[0] = 1.0f;
+      layer.fill_emission[1] = 0.45f;
+      layer.fill_emission[2] = 0.1f;
+    }
     BKE_packedfile_blend_read(&reader, &layer.pf, layer.name);
     BKE_packedfile_blend_read(&reader, &layer.mask_pf, layer.name);
+    BKE_packedfile_blend_read(&reader, &layer.pbr_pf, layer.name);
   }
   const int count = data.layers.count();
   data.active_layer_index = count ? std::clamp(data.active_layer_index, 0, count - 1) : 0;
@@ -505,6 +549,11 @@ static TexPaintLayer *layer_new(NodeTexPaint &data, const char *name, const int 
   TexPaintLayer *layer = MEM_new<TexPaintLayer>(__func__);
   layer->uid = data.next_layer_uid++;
   layer->type = type;
+  layer->flag |= TEXPAINT_LAYER_CHANNELS_INIT;
+  layer->channel_flags = (type == TEXPAINT_LAYER_FILL) ?
+                             (TEXPAINT_CHAN_COLOR | TEXPAINT_CHAN_ROUGHNESS |
+                              TEXPAINT_CHAN_METALLIC | TEXPAINT_CHAN_HEIGHT) :
+                             TEXPAINT_CHAN_COLOR;
   STRNCPY_UTF8(layer->name, name ? name : DATA_("Layer"));
   return layer;
 }
@@ -538,8 +587,10 @@ TexPaintLayer *BKE_tex_paint_layer_duplicate(NodeTexPaint &data, const TexPaintL
   layer->uid = data.next_layer_uid++;
   layer->pf = src.pf ? BKE_packedfile_duplicate(src.pf) : nullptr;
   layer->mask_pf = src.mask_pf ? BKE_packedfile_duplicate(src.mask_pf) : nullptr;
+  layer->pbr_pf = src.pbr_pf ? BKE_packedfile_duplicate(src.pbr_pf) : nullptr;
   layer->ibuf = src.ibuf ? IMB_dupImBuf(src.ibuf) : nullptr;
   layer->mask_ibuf = src.mask_ibuf ? IMB_dupImBuf(src.mask_ibuf) : nullptr;
+  layer->pbr_ibuf = src.pbr_ibuf ? IMB_dupImBuf(src.pbr_ibuf) : nullptr;
   layer->runtime_dirty = src.runtime_dirty;
   layer_insert_above_active(data, layer);
   return layer;
@@ -582,14 +633,58 @@ void BKE_tex_paint_layer_active_set(NodeTexPaint &data, const int index)
   if (new_index != data.active_layer_index) {
     data.active_layer_index = new_index;
     if (const TexPaintLayer *active = BKE_tex_paint_layer_active(data)) {
-      if (active->type != TEXPAINT_LAYER_PAINT && (active->flag & TEXPAINT_LAYER_USE_MASK)) {
-        data.paint_target = TEXPAINT_TARGET_MASK;
-      }
-      else if (!(active->flag & TEXPAINT_LAYER_USE_MASK)) {
+      if (!(active->flag & TEXPAINT_LAYER_USE_MASK)) {
         data.paint_target = TEXPAINT_TARGET_COLOR;
       }
     }
     BKE_tex_paint_cache_invalidate(data);
+  }
+}
+
+void BKE_tex_paint_ensure_pbr_images(Main &bmain, bNode &node)
+{
+  NodeTexPaint *data = static_cast<NodeTexPaint *>(node.storage);
+  if (data == nullptr || data->width <= 0 || data->height <= 0) {
+    return;
+  }
+  const char *base_name = node.id ? (node.id->name + 2) : "Paint";
+  if (data->pbr_image == nullptr) {
+    const float default_pbr[4] = {
+        data->base_roughness, data->base_metallic, 0.5f, data->base_specular};
+    const std::string pbr_name = fmt::format(".{}_PBR", base_name);
+    Image *pbr_img = BKE_image_add_generated(&bmain,
+                                             data->width,
+                                             data->height,
+                                             pbr_name.c_str(),
+                                             data->is_float ? 128 : 32,
+                                             data->is_float,
+                                             IMA_GENTYPE_BLANK,
+                                             default_pbr,
+                                             false,
+                                             true,
+                                             false);
+    if (pbr_img != nullptr) {
+      pbr_img->alpha_mode = IMA_ALPHA_CHANNEL_PACKED;
+      data->pbr_image = pbr_img;
+    }
+  }
+  if (data->emission_image == nullptr) {
+    const float default_em[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const std::string em_name = fmt::format(".{}_Emission", base_name);
+    Image *em_img = BKE_image_add_generated(&bmain,
+                                            data->width,
+                                            data->height,
+                                            em_name.c_str(),
+                                            data->is_float ? 128 : 32,
+                                            data->is_float,
+                                            IMA_GENTYPE_BLANK,
+                                            default_em,
+                                            false,
+                                            false,
+                                            false);
+    if (em_img != nullptr) {
+      data->emission_image = em_img;
+    }
   }
 }
 
@@ -635,6 +730,16 @@ Image *BKE_tex_paint_canvas_init(Main &bmain,
   data->active_layer_index = 0;
   data->paint_target = TEXPAINT_TARGET_COLOR;
 
+  if (data->pbr_image) {
+    id_us_min(&data->pbr_image->id);
+    data->pbr_image = nullptr;
+  }
+  if (data->emission_image) {
+    id_us_min(&data->emission_image->id);
+    data->emission_image = nullptr;
+  }
+  BKE_tex_paint_ensure_pbr_images(bmain, node);
+
   TexPaintLayer *base = BKE_tex_paint_layer_add(*data, DATA_("Base"), TEXPAINT_LAYER_PAINT);
   if (ImBuf *ibuf = BKE_tex_paint_layer_ensure_ibuf(*data, *base)) {
     canvas_buffer_fill(*ibuf, canvas_color_from_scene_linear(*data, color));
@@ -657,6 +762,9 @@ bool BKE_tex_paint_canvas_resize(NodeTexPaint &data, const int width, const int 
     }
     if (layer.mask_ibuf) {
       IMB_scale(layer.mask_ibuf, width, height, IMBScaleFilter::Bilinear);
+    }
+    if (layer.pbr_ibuf) {
+      IMB_scale(layer.pbr_ibuf, width, height, IMBScaleFilter::Bilinear);
     }
     layer.runtime_dirty = 1;
   }
@@ -688,7 +796,7 @@ static void layer_buffer_assign_colorspace(const ImBuf *master, ImBuf &ibuf)
 
 ImBuf *BKE_tex_paint_layer_ensure_ibuf(NodeTexPaint &data, TexPaintLayer &layer)
 {
-  if (layer.type != TEXPAINT_LAYER_PAINT) {
+  if (!ELEM(layer.type, TEXPAINT_LAYER_PAINT, TEXPAINT_LAYER_FILL)) {
     return nullptr;
   }
   if (layer.ibuf && !buffer_matches_canvas(data, layer.ibuf)) {
@@ -702,6 +810,26 @@ ImBuf *BKE_tex_paint_layer_ensure_ibuf(NodeTexPaint &data, TexPaintLayer &layer)
     layer.ibuf = canvas_buffer_alloc(data);
   }
   return layer.ibuf;
+}
+
+ImBuf *BKE_tex_paint_layer_ensure_pbr_ibuf(NodeTexPaint &data, TexPaintLayer &layer)
+{
+  if (!ELEM(layer.type, TEXPAINT_LAYER_PAINT, TEXPAINT_LAYER_FILL)) {
+    return nullptr;
+  }
+  if (layer.pbr_ibuf && !buffer_matches_canvas(data, layer.pbr_ibuf)) {
+    IMB_scale(layer.pbr_ibuf, data.width, data.height, IMBScaleFilter::Bilinear);
+  }
+  if (layer.pbr_ibuf == nullptr) {
+    layer.pbr_ibuf = unpack_buffer(data, layer.pbr_pf);
+  }
+  if (layer.pbr_ibuf == nullptr) {
+    layer.pbr_ibuf = canvas_buffer_alloc(data);
+    if (layer.pbr_ibuf) {
+      canvas_buffer_fill(*layer.pbr_ibuf, float4(0.5f, 0.0f, 0.5f, 0.0f));
+    }
+  }
+  return layer.pbr_ibuf;
 }
 
 ImBuf *BKE_tex_paint_layer_ensure_mask_ibuf(NodeTexPaint &data, TexPaintLayer &layer)
@@ -724,8 +852,11 @@ ImBuf *BKE_tex_paint_layer_ensure_mask_ibuf(NodeTexPaint &data, TexPaintLayer &l
 void BKE_tex_paint_ensure_all_ibufs(NodeTexPaint &data)
 {
   for (TexPaintLayer &layer : data.layers) {
-    if (layer.type == TEXPAINT_LAYER_PAINT && layer.ibuf == nullptr && layer.pf) {
+    if (layer.ibuf == nullptr && layer.pf) {
       BKE_tex_paint_layer_ensure_ibuf(data, layer);
+    }
+    if (layer.pbr_ibuf == nullptr && layer.pbr_pf) {
+      BKE_tex_paint_layer_ensure_pbr_ibuf(data, layer);
     }
     if (layer.mask_ibuf == nullptr && (layer.mask_pf || (layer.flag & TEXPAINT_LAYER_USE_MASK))) {
       BKE_tex_paint_layer_ensure_mask_ibuf(data, layer);
@@ -985,14 +1116,21 @@ struct PixelTarget {
 struct LayerEval {
   int type = TEXPAINT_LAYER_PAINT;
   int blend_mode = IMB_BLEND_MIX;
+  int channel_flags = TEXPAINT_CHAN_COLOR;
   bool visible = true;
   bool clipping = false;
   float opacity = 1.0f;
   PixelSource color;
+  PixelSource pbr;
   PixelSource mask;
   bool use_mask = false;
   bool mask_invert = false;
   float4 fill = float4(0.0f);
+  float fill_roughness = 0.45f;
+  float fill_metallic = 0.0f;
+  float fill_height = 0.0f;
+  float fill_specular = 0.5f;
+  float3 fill_emission = float3(1.0f, 0.45f, 0.1f);
   float hsv[3] = {0.0f, 0.0f, 0.0f};
   float bright_contrast[2] = {0.0f, 0.0f};
 
@@ -1015,7 +1153,7 @@ struct LayerEval {
       case TEXPAINT_LAYER_PAINT:
         return color.is_valid() ? color.read(i).w * mask_value(i) : 0.0f;
       case TEXPAINT_LAYER_FILL:
-        return fill.w * mask_value(i);
+        return (color.is_valid() ? color.read(i).w : fill.w) * mask_value(i);
       default:
         return mask_value(i);
     }
@@ -1023,6 +1161,9 @@ struct LayerEval {
 
   void apply(float4 &dst, const size_t i, const float clip) const
   {
+    if (type != TEXPAINT_LAYER_ADJUSTMENT && (channel_flags & TEXPAINT_CHAN_COLOR) == 0) {
+      return;
+    }
     switch (type) {
       case TEXPAINT_LAYER_PAINT: {
         if (!color.is_valid()) {
@@ -1032,9 +1173,11 @@ struct LayerEval {
         composite_over(dst, src.xyz(), src.w * opacity * mask_value(i) * clip, blend_mode);
         break;
       }
-      case TEXPAINT_LAYER_FILL:
-        composite_over(dst, fill.xyz(), fill.w * opacity * mask_value(i) * clip, blend_mode);
+      case TEXPAINT_LAYER_FILL: {
+        const float4 src = color.is_valid() ? (color.read(i) * fill) : fill;
+        composite_over(dst, src.xyz(), src.w * opacity * mask_value(i) * clip, blend_mode);
         break;
+      }
       case TEXPAINT_LAYER_ADJUSTMENT: {
         if (dst.w <= 0.0f) {
           return;
@@ -1046,6 +1189,94 @@ struct LayerEval {
         const float3 adjusted = adjust_color(dst.xyz(), hsv, bright_contrast);
         dst = float4(math::interpolate(dst.xyz(), adjusted, t), dst.w);
         break;
+      }
+    }
+  }
+
+  void apply_pbr_em(float4 &pbr_dst,
+                    float4 &em_dst,
+                    const size_t i,
+                    const float clip,
+                    const bool do_pbr,
+                    const bool do_em) const
+  {
+    if (!visible || opacity <= 0.0f || type == TEXPAINT_LAYER_ADJUSTMENT) {
+      return;
+    }
+    const int pbr_mask = TEXPAINT_CHAN_ROUGHNESS | TEXPAINT_CHAN_METALLIC | TEXPAINT_CHAN_HEIGHT |
+                         TEXPAINT_CHAN_NORMAL | TEXPAINT_CHAN_SPECULAR;
+    if ((!do_pbr || (channel_flags & pbr_mask) == 0) &&
+        (!do_em || (channel_flags & TEXPAINT_CHAN_EMISSION) == 0))
+    {
+      return;
+    }
+    const float m = opacity * mask_value(i) * clip;
+    if (m <= 0.0f) {
+      return;
+    }
+
+    float stroke_a = 1.0f;
+    float tex_mod = 1.0f;
+    bool has_fill_tex = false;
+    if (type == TEXPAINT_LAYER_PAINT) {
+      if (!color.is_valid()) {
+        return;
+      }
+      stroke_a = color.read(i).w;
+    }
+    else if (type == TEXPAINT_LAYER_FILL) {
+      if (color.is_valid()) {
+        const float4 tc = color.read(i);
+        stroke_a = tc.w * fill.w;
+        tex_mod = lum(tc.xyz());
+        has_fill_tex = true;
+      }
+      else {
+        stroke_a = fill.w;
+      }
+    }
+    if (stroke_a <= 0.0f && !pbr.is_valid()) {
+      return;
+    }
+
+    if (do_pbr && (channel_flags & pbr_mask) != 0) {
+      float r_src = fill_roughness;
+      float m_src = fill_metallic;
+      const float eff_h = has_fill_tex ? (fill_height * (tex_mod * 2.0f - 1.0f)) : fill_height;
+      float h_src = std::clamp(0.5f + 0.5f * eff_h, 0.0f, 1.0f);
+      float s_src = fill_specular;
+      float cov = stroke_a * m;
+      if (pbr.is_valid()) {
+        const float4 ps = pbr.read(i);
+        r_src = ps.x;
+        m_src = ps.y;
+        h_src = ps.z;
+        cov = ps.w * m;
+      }
+      if (cov > 0.0f) {
+        if (channel_flags & TEXPAINT_CHAN_ROUGHNESS) {
+          pbr_dst.x = math::interpolate(pbr_dst.x, r_src, cov);
+        }
+        if (channel_flags & TEXPAINT_CHAN_METALLIC) {
+          pbr_dst.y = math::interpolate(pbr_dst.y, m_src, cov);
+        }
+        if (channel_flags & TEXPAINT_CHAN_NORMAL) {
+          const float target_h = (channel_flags & TEXPAINT_CHAN_HEIGHT) ? h_src : 0.5f;
+          pbr_dst.z = math::interpolate(pbr_dst.z, target_h, cov);
+        }
+        else if (channel_flags & TEXPAINT_CHAN_HEIGHT) {
+          pbr_dst.z = std::clamp(pbr_dst.z + (h_src - 0.5f) * cov, 0.0f, 1.0f);
+        }
+        if (channel_flags & TEXPAINT_CHAN_SPECULAR) {
+          pbr_dst.w = math::interpolate(pbr_dst.w, s_src, cov);
+        }
+      }
+    }
+
+    if (do_em && (channel_flags & TEXPAINT_CHAN_EMISSION) != 0) {
+      const float cov = stroke_a * m;
+      if (cov > 0.0f) {
+        composite_over(em_dst, fill_emission, cov, IMB_BLEND_ADD);
       }
     }
   }
@@ -1091,14 +1322,29 @@ static Vector<LayerEval> build_layer_evals(NodeTexPaint &data)
 
   Vector<LayerEval> evals;
   for (TexPaintLayer &layer : data.layers) {
+    if ((layer.flag & TEXPAINT_LAYER_CHANNELS_INIT) == 0) {
+      layer.flag |= TEXPAINT_LAYER_CHANNELS_INIT;
+      layer.channel_flags = (layer.type == TEXPAINT_LAYER_FILL) ?
+                                (TEXPAINT_CHAN_COLOR | TEXPAINT_CHAN_ROUGHNESS |
+                                 TEXPAINT_CHAN_METALLIC | TEXPAINT_CHAN_HEIGHT) :
+                                TEXPAINT_CHAN_COLOR;
+    }
     LayerEval eval;
     eval.type = layer.type;
     eval.blend_mode = layer.blend_mode;
+    eval.channel_flags = layer.channel_flags;
     eval.visible = (layer.flag & TEXPAINT_LAYER_VISIBLE) != 0;
     eval.clipping = (layer.flag & TEXPAINT_LAYER_CLIPPING) != 0;
     eval.opacity = std::clamp(layer.opacity, 0.0f, 1.0f);
-    if (layer.type == TEXPAINT_LAYER_PAINT && buffer_matches_canvas(data, layer.ibuf)) {
+    if (ELEM(layer.type, TEXPAINT_LAYER_PAINT, TEXPAINT_LAYER_FILL) &&
+        buffer_matches_canvas(data, layer.ibuf))
+    {
       eval.color = PixelSource(layer.ibuf);
+    }
+    if (ELEM(layer.type, TEXPAINT_LAYER_PAINT, TEXPAINT_LAYER_FILL) &&
+        buffer_matches_canvas(data, layer.pbr_ibuf))
+    {
+      eval.pbr = PixelSource(layer.pbr_ibuf);
     }
     eval.use_mask = (layer.flag & TEXPAINT_LAYER_USE_MASK) &&
                     buffer_matches_canvas(data, layer.mask_ibuf);
@@ -1107,6 +1353,13 @@ static Vector<LayerEval> build_layer_evals(NodeTexPaint &data)
       eval.mask_invert = (layer.flag & TEXPAINT_LAYER_MASK_INVERT) != 0;
     }
     eval.fill = canvas_color_from_scene_linear(data, layer.fill_color);
+    eval.fill_roughness = std::clamp(layer.fill_roughness, 0.0f, 1.0f);
+    eval.fill_metallic = std::clamp(layer.fill_metallic, 0.0f, 1.0f);
+    eval.fill_height = std::clamp(layer.fill_height, -1.0f, 1.0f);
+    eval.fill_specular = std::clamp(layer.fill_specular, 0.0f, 1.0f);
+    float em_rgba[4] = {
+        layer.fill_emission[0], layer.fill_emission[1], layer.fill_emission[2], 1.0f};
+    eval.fill_emission = canvas_color_from_scene_linear(data, em_rgba).xyz();
     copy_v3_v3(eval.hsv, layer.adjust_hsv);
     copy_v2_v2(eval.bright_contrast, layer.adjust_bright_contrast);
     evals.append(eval);
@@ -1283,6 +1536,141 @@ static bool runtime_is_composited(const NodeTexPaint &data, const ImBuf &master)
   return runtime->composited_data == pixels;
 }
 
+static ImBuf *aux_image_acquire(Image *image,
+                                ImageUser *iuser,
+                                const NodeTexPaint &data,
+                                void **r_lock)
+{
+  *r_lock = nullptr;
+  if (image == nullptr) {
+    return nullptr;
+  }
+  ImBuf *ibuf = BKE_image_acquire_ibuf(image, iuser, r_lock);
+  if (ibuf && (ibuf->x != data.width || ibuf->y != data.height)) {
+    IMB_scale(ibuf, data.width, data.height, IMBScaleFilter::Bilinear);
+  }
+  if (!buffer_matches_canvas(data, ibuf)) {
+    BKE_image_release_ibuf(image, ibuf, *r_lock);
+    *r_lock = nullptr;
+    return nullptr;
+  }
+  return ibuf;
+}
+
+static void composite_pbr_region(const NodeTexPaint &data,
+                                 const Span<LayerEval> layers,
+                                 const rcti &rect,
+                                 const PixelTarget &pbr_target,
+                                 const PixelTarget &em_target)
+{
+  const bool do_pbr = pbr_target.is_valid();
+  const bool do_em = em_target.is_valid();
+  if (!do_pbr && !do_em) {
+    return;
+  }
+  const int width = BLI_rcti_size_x(&rect);
+  const int height = BLI_rcti_size_y(&rect);
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+  const int canvas_width = data.width;
+  const float4 base_pbr(std::clamp(data.base_roughness, 0.0f, 1.0f),
+                        std::clamp(data.base_metallic, 0.0f, 1.0f),
+                        0.5f,
+                        std::clamp(data.base_specular, 0.0f, 1.0f));
+  const float4 base_em(0.0f, 0.0f, 0.0f, 1.0f);
+
+  const int64_t grain = std::max<int64_t>(8, 16384 / std::max(width, 1));
+  threading::parallel_for(IndexRange(height), grain, [&](const IndexRange rows) {
+    Array<float4> pbr_row(do_pbr ? width : 0);
+    Array<float4> em_row(do_em ? width : 0);
+    Array<float> base_alpha(width);
+    for (const int64_t row_i : rows) {
+      const int y = rect.ymin + int(row_i);
+      const size_t row_offset = size_t(y) * size_t(canvas_width) + size_t(rect.xmin);
+
+      if (do_pbr) {
+        pbr_row.fill(base_pbr);
+      }
+      if (do_em) {
+        em_row.fill(base_em);
+      }
+      base_alpha.fill(1.0f);
+
+      for (const LayerEval &layer : layers) {
+        if (!layer.clipping) {
+          for (int x = 0; x < width; x++) {
+            base_alpha[x] = layer.base_alpha(row_offset + x);
+          }
+        }
+        if (!layer.visible || layer.opacity <= 0.0f) {
+          continue;
+        }
+        for (int x = 0; x < width; x++) {
+          float4 dummy_pbr(0.0f), dummy_em(0.0f);
+          layer.apply_pbr_em(do_pbr ? pbr_row[x] : dummy_pbr,
+                             do_em ? em_row[x] : dummy_em,
+                             row_offset + x,
+                             layer.clipping ? base_alpha[x] : 1.0f,
+                             do_pbr,
+                             do_em);
+        }
+      }
+
+      if (do_pbr) {
+        for (int x = 0; x < width; x++) {
+          pbr_target.write(row_offset + x, pbr_row[x]);
+        }
+      }
+      if (do_em) {
+        for (int x = 0; x < width; x++) {
+          em_target.write(row_offset + x, em_row[x]);
+        }
+      }
+    }
+  });
+}
+
+static void composite_aux_targets(NodeTexPaint &data,
+                                  const Span<LayerEval> layers,
+                                  const rcti *rect)
+{
+  if (is_active_layer_previewing_mask(data)) {
+    return;
+  }
+  if (data.pbr_image == nullptr && data.emission_image == nullptr) {
+    return;
+  }
+  void *pbr_lock = nullptr;
+  void *em_lock = nullptr;
+  ImBuf *pbr_ibuf = aux_image_acquire(data.pbr_image, &data.pbr_iuser, data, &pbr_lock);
+  ImBuf *em_ibuf = aux_image_acquire(data.emission_image, &data.emission_iuser, data, &em_lock);
+  if (pbr_ibuf != nullptr || em_ibuf != nullptr) {
+    TexPaintRuntime &runtime = runtime_ensure(data);
+    const bool pbr_was_comp = (pbr_ibuf == nullptr) || (runtime.pbr_composited_ibuf == pbr_ibuf);
+    const rcti *eff_rect = pbr_was_comp ? rect : nullptr;
+    rcti region;
+    canvas_rect_clamp(data, eff_rect, region);
+    if (!BLI_rcti_is_empty(&region)) {
+      composite_pbr_region(
+          data, layers, region, PixelTarget(pbr_ibuf), PixelTarget(em_ibuf));
+      if (pbr_ibuf) {
+        runtime.pbr_composited_ibuf = pbr_ibuf;
+        master_mark_updated(*pbr_ibuf, eff_rect ? &region : nullptr);
+      }
+      if (em_ibuf) {
+        master_mark_updated(*em_ibuf, eff_rect ? &region : nullptr);
+      }
+    }
+  }
+  if (pbr_ibuf) {
+    BKE_image_release_ibuf(data.pbr_image, pbr_ibuf, pbr_lock);
+  }
+  if (em_ibuf) {
+    BKE_image_release_ibuf(data.emission_image, em_ibuf, em_lock);
+  }
+}
+
 bool BKE_tex_paint_composite_full(bNode &node)
 {
   if (!BKE_tex_paint_is_initialized(node)) {
@@ -1298,6 +1686,7 @@ bool BKE_tex_paint_composite_full(bNode &node)
   runtime_mark_composited(data, *master);
   master_mark_updated(*master, nullptr);
   BKE_image_release_ibuf(reinterpret_cast<Image *>(node.id), master, lock);
+  composite_aux_targets(data, build_layer_evals(data), nullptr);
   return true;
 }
 
@@ -1332,6 +1721,8 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
     composite_full_with_cache(data, *master);
     runtime_mark_composited(data, *master);
     master_mark_updated(*master, nullptr);
+    BKE_image_release_ibuf(reinterpret_cast<Image *>(node.id), master, lock);
+    composite_aux_targets(data, build_layer_evals(data), nullptr);
   }
   else {
     const Vector<LayerEval> layers = build_layer_evals(data);
@@ -1340,9 +1731,10 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
     composite_region(
         layers, region, data.width, backdrop, start, PixelTarget(), -1, PixelTarget(master));
     master_mark_updated(*master, &region);
+    BKE_image_release_ibuf(reinterpret_cast<Image *>(node.id), master, lock);
+    composite_aux_targets(data, layers, &region);
   }
 
-  BKE_image_release_ibuf(reinterpret_cast<Image *>(node.id), master, lock);
   return true;
 }
 
@@ -2708,9 +3100,22 @@ bool BKE_tex_paint_layer_reproject(Main &bmain,
                                    TexPaintLayer &layer,
                                    rcti *r_dirty_rect)
 {
-  if (layer.type != TEXPAINT_LAYER_PAINT || layer.proj_mode == TEXPAINT_PROJ_NONE ||
-      layer.proj_image_name[0] == '\0')
-  {
+  if (!ELEM(layer.type, TEXPAINT_LAYER_PAINT, TEXPAINT_LAYER_FILL)) {
+    return false;
+  }
+  if (layer.proj_mode == TEXPAINT_PROJ_NONE || layer.proj_image_name[0] == '\0') {
+    if (layer.type == TEXPAINT_LAYER_FILL && (layer.ibuf != nullptr || layer.pf != nullptr)) {
+      if (layer.ibuf) {
+        IMB_freeImBuf(layer.ibuf);
+        layer.ibuf = nullptr;
+      }
+      if (layer.pf) {
+        BKE_packedfile_free(layer.pf);
+        layer.pf = nullptr;
+      }
+      BKE_tex_paint_layer_pixels_changed(data, layer, nullptr);
+      return true;
+    }
     return false;
   }
 

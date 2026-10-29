@@ -175,6 +175,10 @@ bool BKE_tex_paint_layer_generate_mask(const Mesh *mesh,
 ImBuf *BKE_tex_paint_layer_ensure_ibuf(NodeTexPaint &data, TexPaintLayer &layer);
 /** Get the layer mask buffer, decoding it or allocating a white (opaque) buffer as needed. */
 ImBuf *BKE_tex_paint_layer_ensure_mask_ibuf(NodeTexPaint &data, TexPaintLayer &layer);
+/** Get the layer packed PBR buffer (R=Roughness, G=Metallic, B=Height, A=Coverage), allocating as needed. */
+ImBuf *BKE_tex_paint_layer_ensure_pbr_ibuf(NodeTexPaint &data, TexPaintLayer &layer);
+/** Ensure `node`'s derived `pbr_image` and `emission_image` exist and match the canvas size. */
+void BKE_tex_paint_ensure_pbr_images(Main &bmain, bNode &node);
 /** Decode all layers from packed data. */
 void BKE_tex_paint_ensure_all_ibufs(NodeTexPaint &data);
 
