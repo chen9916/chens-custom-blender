@@ -8095,9 +8095,36 @@ static bool proj_paint_add_slot(bContext *C, wmOperator *op)
     /* Create a new node. */
     switch (slot_type) {
       case PAINT_CANVAS_SOURCE_IMAGE: {
-        new_node = bke::node_add_static_node(C, *ntree, SH_NODE_TEX_IMAGE);
-        ima = proj_paint_image_create(op, bmain, is_data);
-        new_node->id = &ima->id;
+        const bool use_tiled = RNA_boolean_get(op->ptr, "tiled");
+        const int gen_type = RNA_enum_get(op->ptr, "generated_type");
+        if (!use_tiled && gen_type == IMA_GENTYPE_BLANK) {
+          char imagename[MAX_ID_NAME - 2] = "Material Base Color";
+          RNA_string_get(op->ptr, "name", imagename);
+          const int width = RNA_int_get(op->ptr, "width");
+          const int height = RNA_int_get(op->ptr, "height");
+          const bool use_float = RNA_boolean_get(op->ptr, "float");
+          float color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+          RNA_float_get_array(op->ptr, "color", color);
+          if (!RNA_boolean_get(op->ptr, "alpha")) {
+            color[3] = 1.0f;
+          }
+          new_node = bke::node_add_static_node(C, *ntree, SH_NODE_TEX_PAINT);
+          STRNCPY_UTF8(new_node->label, DATA_(layer_type_items[type].name));
+          if (BKE_tex_paint_canvas_init(
+                  *bmain, *new_node, imagename, width, height, use_float, color))
+          {
+            ima = reinterpret_cast<Image *>(new_node->id);
+            if (ima && is_data) {
+              STRNCPY_UTF8(ima->colorspace_settings.name,
+                           IMB_colormanagement_role_colorspace_name_get(COLOR_ROLE_DATA));
+            }
+          }
+        }
+        else {
+          new_node = bke::node_add_static_node(C, *ntree, SH_NODE_TEX_IMAGE);
+          ima = proj_paint_image_create(op, bmain, is_data);
+          new_node->id = &ima->id;
+        }
         break;
       }
       case PAINT_CANVAS_SOURCE_COLOR_ATTRIBUTE: {
@@ -8111,7 +8138,6 @@ static bool proj_paint_add_slot(bContext *C, wmOperator *op)
         BLI_assert_unreachable();
         return false;
     }
-    bke::node_set_active(*ntree, *new_node);
 
     /* Connect to first available principled BSDF node. */
     ntree->ensure_topology_cache();
@@ -8163,14 +8189,18 @@ static bool proj_paint_add_slot(bContext *C, wmOperator *op)
         }
       }
 
-      /* Check if the socket in already connected to something */
-      bNodeLink *link = in_sock ? in_sock->link : nullptr;
-      if (in_sock != nullptr && link == nullptr) {
+      /* Connect (or replace existing connection) on the target socket. */
+      if (in_sock != nullptr) {
+        if (in_sock->link != nullptr) {
+          bke::node_remove_socket_links(*ntree, *in_sock);
+        }
         bke::node_add_link(*ntree, *out_node, *out_sock, *in_node, *in_sock);
 
         bke::node_position_relative(*out_node, *in_node, out_sock, *in_sock);
       }
     }
+
+    bke::node_set_active(*ntree, *new_node);
 
     BKE_main_ensure_invariants(*bmain);
     /* In case we added more than one node, position them too. */

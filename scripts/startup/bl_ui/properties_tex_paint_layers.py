@@ -1678,6 +1678,31 @@ def _find_tex_paint_node_for_image(target_image, context=None):
     return None
 
 
+def _find_active_flat_paint_slot_node(mat):
+    """If mat.paint_active_slot points to a legacy flat ShaderNodeTexImage (and not a ShaderNodeTexPaint), return (flat_node, slot_image)."""
+    if mat is None or mat.node_tree is None:
+        return None, None
+    if not mat.texture_paint_slots or mat.paint_active_slot < 0 or mat.paint_active_slot >= len(mat.texture_paint_slots):
+        return None, None
+    slot_ima = (
+        mat.texture_paint_images[mat.paint_active_slot]
+        if mat.texture_paint_images and mat.paint_active_slot < len(mat.texture_paint_images)
+        else None
+    )
+    if slot_ima is None:
+        return None, None
+    active_node = mat.node_tree.nodes.active
+    if active_node is not None and active_node.bl_idname == "ShaderNodeTexPaint":
+        return None, None
+    for n in mat.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeTexPaint" and n.image == slot_ima:
+            return None, None
+    for n in mat.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeTexImage" and n.image == slot_ima:
+            return n, slot_ima
+    return None, None
+
+
 def _find_3d_object_tex_paint_node(context):
     """Find the active 3D mesh object's ShaderNodeTexPaint node (ignoring Image Editor space)."""
     if context is None:
@@ -1687,9 +1712,9 @@ def _find_3d_object_tex_paint_node(context):
     if mat is None or mat.node_tree is None:
         return None
     node = mat.node_tree.nodes.active
-    if node and node.bl_idname == "ShaderNodeTexPaint":
+    if node and node.bl_idname == "ShaderNodeTexPaint" and node.image is None:
         return node
-    if mat.texture_paint_slots and mat.paint_active_slot < len(mat.texture_paint_slots):
+    if mat.texture_paint_slots and 0 <= mat.paint_active_slot < len(mat.texture_paint_slots):
         image = (
             mat.texture_paint_images[mat.paint_active_slot]
             if mat.texture_paint_images and mat.paint_active_slot < len(mat.texture_paint_images)
@@ -1699,6 +1724,8 @@ def _find_3d_object_tex_paint_node(context):
             for candidate in mat.node_tree.nodes:
                 if candidate.bl_idname == "ShaderNodeTexPaint" and candidate.image == image:
                     return candidate
+    if node and node.bl_idname == "ShaderNodeTexPaint":
+        return node
     return _find_any_tex_paint_node(mat.node_tree)
 
 
@@ -4673,38 +4700,65 @@ _PBR_CHANNEL_DEFS = (
     ('BASE_COLOR', "Base Color", "Base Color", 'COLOR', (0.75, 0.75, 0.75, 1.0), False),
     ('ROUGHNESS', "Roughness", "Roughness", 'MATSPHERE', (0.5, 0.5, 0.5, 1.0), True),
     ('METALLIC', "Metallic", "Metallic", 'SHADING_RENDERED', (0.0, 0.0, 0.0, 1.0), True),
+    ('SPECULAR', "Specular", "Specular IOR Level", 'NODE_MATERIAL', (0.5, 0.5, 0.5, 1.0), True),
+    ('NORMAL', "Normal", "Normal", 'NORMALS_VERTEX_FACE', (0.5, 0.5, 1.0, 1.0), True),
     ('BUMP', "Bump / Height", "Normal", 'MOD_NORMALEDIT', (0.5, 0.5, 0.5, 1.0), True),
     ('EMISSION', "Emission", "Emission Color", 'LIGHT_SUN', (0.0, 0.0, 0.0, 1.0), False),
-    ('ALPHA', "Opacity / Alpha", "Alpha", 'IMAGE_ALPHA', (1.0, 1.0, 1.0, 1.0), True),
+    ('ALPHA', "Alpha / Opacity", "Alpha", 'IMAGE_ALPHA', (1.0, 1.0, 1.0, 1.0), True),
+    ('DISPLACEMENT', "Displacement", "Displacement", 'MOD_DISPLACE', (0.5, 0.5, 0.5, 1.0), True),
 )
 
 
 def _detect_node_pbr_channel(node):
-    """Return (channel_id, short_label, icon) for a ShaderNodeTexPaint based on its outgoing links or name."""
+    """Return (channel_id, short_label, icon) for a ShaderNodeTexPaint or ShaderNodeTexImage based on its outgoing links or name."""
     if node is None:
         return ('CUSTOM', "Layer Canvas", 'NODE_TEXTURE')
     out_sock = node.outputs.get("Color")
     if out_sock and out_sock.is_linked:
+        # First pass: check intermediate nodes and specific non-Base-Color sockets (so accidental dual Base Color links don't mask a Roughness/Bump node)
+        has_base_color_link = False
         for link in out_sock.links:
             to_node = link.to_node
             to_sock = link.to_socket.name if link.to_socket else ""
             if to_node.bl_idname == "ShaderNodeBump":
                 return ('BUMP', "Bump", 'MOD_NORMALEDIT')
+            if to_node.bl_idname == "ShaderNodeNormalMap":
+                return ('NORMAL', "Normal", 'NORMALS_VERTEX_FACE')
+            if to_node.bl_idname in {"ShaderNodeDisplacement", "ShaderNodeOutputMaterial"}:
+                return ('DISPLACEMENT', "Displacement", 'MOD_DISPLACE')
             if to_node.bl_idname == "ShaderNodeBsdfPrincipled":
-                if to_sock == "Base Color":
-                    return ('BASE_COLOR', "Base Color", 'COLOR')
                 if to_sock == "Roughness":
                     return ('ROUGHNESS', "Roughness", 'MATSPHERE')
                 if to_sock == "Metallic":
                     return ('METALLIC', "Metallic", 'SHADING_RENDERED')
+                if to_sock in {"Specular IOR Level", "Specular"}:
+                    return ('SPECULAR', "Specular", 'NODE_MATERIAL')
+                if to_sock == "Normal":
+                    return ('NORMAL', "Normal", 'NORMALS_VERTEX_FACE')
                 if to_sock in {"Emission Color", "Emission"}:
                     return ('EMISSION', "Emission", 'LIGHT_SUN')
                 if to_sock == "Alpha":
                     return ('ALPHA', "Alpha", 'IMAGE_ALPHA')
+                if to_sock == "Base Color":
+                    has_base_color_link = True
+        if has_base_color_link:
+            return ('BASE_COLOR', "Base Color", 'COLOR')
+    alpha_sock = node.outputs.get("Alpha")
+    if alpha_sock and alpha_sock.is_linked:
+        for link in alpha_sock.links:
+            to_node = link.to_node
+            to_sock = link.to_socket.name if link.to_socket else ""
+            if to_node.bl_idname == "ShaderNodeBsdfPrincipled" and to_sock == "Alpha":
+                return ('ALPHA', "Alpha", 'IMAGE_ALPHA')
     label_str = (node.label or (node.image.name if node.image else node.name)).lower()
+    norm_str = label_str.replace("_", "").replace(" ", "")
     for ch_id, ch_lbl, _sock, ch_icon, _col, _nc in _PBR_CHANNEL_DEFS:
-        if ch_id.lower().replace("_", "") in label_str.replace("_", "").replace(" ", ""):
-            return (ch_id, ch_lbl.split(" ")[0], ch_icon)
+        key = ch_id.lower().replace("_", "")
+        short_key = ch_lbl.split(" ")[0].lower()
+        if key in norm_str or short_key in norm_str:
+            return (ch_id, ch_lbl.split(" /")[0], ch_icon)
+    if norm_str == "paintedtexture":
+        return ('BASE_COLOR', "Base Color", 'COLOR')
     return ('CUSTOM', node.label or (node.image.name if node.image else node.name), 'NODE_TEXTURE')
 
 
@@ -4722,8 +4776,278 @@ def _get_material_tex_paint_channels(mat):
     return result
 
 
+def _wire_tex_paint_node_to_pbr_channel(ntree, bsdf, target_node, ch_id, sock_name):
+    """Ensure `target_node` (`ShaderNodeTexPaint`) is cleanly wired into `bsdf` / `Material Output` for `ch_id`."""
+    if ntree is None or target_node is None:
+        return
+    out_color = target_node.outputs.get("Color")
+    if out_color is None:
+        return
+    # Remove any accidental link from non-Base-Color channel to BSDF Base Color
+    if ch_id != 'BASE_COLOR' and bsdf is not None and "Base Color" in bsdf.inputs:
+        bc_sock = bsdf.inputs["Base Color"]
+        for lk in list(ntree.links):
+            if lk.from_node == target_node and lk.to_socket == bc_sock:
+                ntree.links.remove(lk)
+
+    if ch_id == 'BUMP' and bsdf is not None:
+        bump_node = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBump"), None)
+        if bump_node is None:
+            bump_node = ntree.nodes.new("ShaderNodeBump")
+            bump_node.location = (bsdf.location.x - 170, bsdf.location.y - 340)
+            bump_node.inputs["Distance"].default_value = 0.05
+            bump_node.inputs["Strength"].default_value = 0.65
+        ntree.links.new(out_color, bump_node.inputs["Height"])
+        if "Normal" in bsdf.inputs:
+            norm_sock = bsdf.inputs["Normal"]
+            if norm_sock.is_linked and norm_sock.links[0].from_node.bl_idname == "ShaderNodeNormalMap":
+                nmap_node = norm_sock.links[0].from_node
+                ntree.links.new(nmap_node.outputs["Normal"], bump_node.inputs["Normal"])
+            ntree.links.new(bump_node.outputs["Normal"], norm_sock)
+    elif ch_id == 'NORMAL' and bsdf is not None:
+        nmap_node = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeNormalMap"), None)
+        if nmap_node is None:
+            nmap_node = ntree.nodes.new("ShaderNodeNormalMap")
+            nmap_node.location = (bsdf.location.x - 170, bsdf.location.y - 240)
+        ntree.links.new(out_color, nmap_node.inputs["Color"])
+        if "Normal" in bsdf.inputs:
+            norm_sock = bsdf.inputs["Normal"]
+            if norm_sock.is_linked and norm_sock.links[0].from_node.bl_idname == "ShaderNodeBump":
+                bump_node = norm_sock.links[0].from_node
+                ntree.links.new(nmap_node.outputs["Normal"], bump_node.inputs["Normal"])
+            else:
+                ntree.links.new(nmap_node.outputs["Normal"], norm_sock)
+    elif ch_id == 'DISPLACEMENT':
+        out_mat = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
+        if out_mat is not None and "Displacement" in out_mat.inputs:
+            disp_node = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeDisplacement"), None)
+            if disp_node is None:
+                disp_node = ntree.nodes.new("ShaderNodeDisplacement")
+                disp_node.location = (out_mat.location.x - 200, out_mat.location.y - 180)
+            ntree.links.new(out_color, disp_node.inputs["Height"])
+            ntree.links.new(disp_node.outputs["Displacement"], out_mat.inputs["Displacement"])
+    elif ch_id == 'EMISSION' and bsdf is not None:
+        sock = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+        if sock is not None:
+            ntree.links.new(out_color, sock)
+        em_str = bsdf.inputs.get("Emission Strength")
+        if em_str is not None and em_str.default_value <= 0.0:
+            em_str.default_value = 1.0
+    elif ch_id == 'SPECULAR' and bsdf is not None:
+        sock = bsdf.inputs.get("Specular IOR Level") or bsdf.inputs.get("Specular")
+        if sock is not None:
+            ntree.links.new(out_color, sock)
+    elif bsdf is not None:
+        sock = bsdf.inputs.get(sock_name)
+        if sock is not None:
+            ntree.links.new(out_color, sock)
+
+
+def _upgrade_flat_tex_image_to_layered(context, mat, ntree, flat_node, ch_def=None):
+    """Convert a legacy flat ShaderNodeTexImage into a multi-layer ShaderNodeTexPaint in-place, preserving pixels and links."""
+    import numpy as np
+    if mat is None or ntree is None or flat_node is None or flat_node.bl_idname != "ShaderNodeTexImage":
+        return None
+
+    if ch_def is None:
+        det_id, _det_lbl, _det_icon = _detect_node_pbr_channel(flat_node)
+        ch_def = next((d for d in _PBR_CHANNEL_DEFS if d[0] == det_id), _PBR_CHANNEL_DEFS[0])
+    ch_id, ch_label, sock_name, _icon, def_color, is_non_color = ch_def
+
+    old_ima = flat_node.image
+    w, h = 2048, 2048
+    is_float = False
+    old_pixels = None
+    old_cs = None
+    if old_ima is not None:
+        try:
+            old_cs = old_ima.colorspace_settings.name
+        except Exception:
+            old_cs = None
+        if old_ima.size[0] > 0 and old_ima.size[1] > 0:
+            w, h = int(old_ima.size[0]), int(old_ima.size[1])
+            is_float = bool(getattr(old_ima, "is_float", False))
+            try:
+                old_pixels = np.empty(w * h * 4, dtype=np.float32)
+                old_ima.pixels.foreach_get(old_pixels)
+            except Exception:
+                old_pixels = None
+
+    loc = (float(flat_node.location.x), float(flat_node.location.y))
+    in_links = []
+    for in_s in flat_node.inputs:
+        for lk in in_s.links:
+            in_links.append((lk.from_socket, in_s.name))
+    out_links = []
+    for out_s in flat_node.outputs:
+        for lk in out_s.links:
+            out_links.append((out_s.name, lk.to_socket))
+
+    short_suffix = ch_label.split(" ")[0]
+    desired_name = f"{mat.name}_{short_suffix}"
+    ntree.nodes.remove(flat_node)
+    if old_ima is not None and old_ima.users == 0:
+        try:
+            bpy.data.images.remove(old_ima)
+        except Exception:
+            pass
+
+    new_node = ntree.nodes.new("ShaderNodeTexPaint")
+    new_node.label = ch_label.split(" /")[0]
+    new_node.location = loc
+
+    with context.temp_override(node=new_node):
+        bpy.ops.node.tex_paint_canvas_new(
+            name=desired_name,
+            width=w,
+            height=h,
+            float=is_float,
+            color=def_color,
+        )
+
+    if new_node.image is not None:
+        if is_non_color or old_cs == 'Non-Color':
+            try:
+                new_node.image.colorspace_settings.name = 'Non-Color'
+            except Exception:
+                pass
+        if old_pixels is not None and len(new_node.layers) > 0:
+            base_layer = new_node.layers[0]
+            try:
+                c_layer = _C_TexPaintLayer.from_address(base_layer.as_pointer())
+                if c_layer.ibuf:
+                    c_imb = _C_ImBuf.from_address(c_layer.ibuf)
+                    if int(c_imb.x) == w and int(c_imb.y) == h:
+                        if c_imb.byte_data:
+                            buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
+                            np.frombuffer(buf, dtype=np.uint8)[:] = np.clip(old_pixels * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+                        elif c_imb.float_data:
+                            buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
+                            np.frombuffer(buf, dtype=np.float32)[:] = old_pixels
+                        c_layer.runtime_dirty = 1
+                        base_layer.opacity = base_layer.opacity
+            except Exception:
+                pass
+
+    for from_sock, in_name in in_links:
+        dst_sock = new_node.inputs.get(in_name)
+        if dst_sock is not None and from_sock is not None:
+            try:
+                ntree.links.new(from_sock, dst_sock)
+            except Exception:
+                pass
+
+    if out_links:
+        for out_name, to_sock in out_links:
+            src_sock = new_node.outputs.get(out_name)
+            if src_sock is not None and to_sock is not None:
+                try:
+                    ntree.links.new(src_sock, to_sock)
+                except Exception:
+                    pass
+    else:
+        bsdf = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+        _wire_tex_paint_node_to_pbr_channel(ntree, bsdf, new_node, ch_id, sock_name)
+
+    return new_node
+
+
+class NODE_OT_tex_paint_convert_slot_to_layers(Operator):
+    """Convert a legacy flat Image Texture slot into a multi-layer Paint Canvas in-place, preserving its pixels and shader links"""
+    bl_idname = "node.tex_paint_convert_slot_to_layers"
+    bl_label = "Convert Flat Texture Slot to Layered Canvas"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    slot_index: IntProperty(name="Slot Index", default=-1, options={'SKIP_SAVE'})
+    convert_all: BoolProperty(name="Convert All Flat Slots", default=False, options={'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
+        mat = ob.active_material if (ob and ob.type == 'MESH') else None
+        return mat is not None and mat.node_tree is not None
+
+    def execute(self, context):
+        ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
+        mat = ob.active_material if (ob and ob.type == 'MESH') else None
+        if mat is None or mat.node_tree is None:
+            return {'CANCELLED'}
+        ntree = mat.node_tree
+
+        flat_nodes = []
+        if self.convert_all:
+            flat_nodes = [n for n in ntree.nodes if n.bl_idname == "ShaderNodeTexImage"]
+        else:
+            idx = self.slot_index if self.slot_index >= 0 else mat.paint_active_slot
+            target_ima = (
+                mat.texture_paint_images[idx]
+                if mat.texture_paint_images and 0 <= idx < len(mat.texture_paint_images)
+                else None
+            )
+            if target_ima is not None:
+                for n in ntree.nodes:
+                    if n.bl_idname == "ShaderNodeTexImage" and n.image == target_ima:
+                        flat_nodes.append(n)
+                        break
+            if not flat_nodes:
+                fn, _fima = _find_active_flat_paint_slot_node(mat)
+                if fn is not None:
+                    flat_nodes.append(fn)
+            if not flat_nodes:
+                for n in ntree.nodes:
+                    if n.bl_idname == "ShaderNodeTexImage":
+                        flat_nodes.append(n)
+                        break
+
+        if not flat_nodes:
+            self.report({'INFO'}, "All texture slots in this material are already multi-layer canvases")
+            return {'CANCELLED'}
+
+        last_new_node = None
+        converted_count = 0
+        for fn in list(flat_nodes):
+            det_id, _det_lbl, _det_icon = _detect_node_pbr_channel(fn)
+            existing_layered = next(
+                (n for n, cid, _l, _i in _get_material_tex_paint_channels(mat) if cid == det_id and cid != 'CUSTOM'),
+                None,
+            )
+            if existing_layered is not None:
+                # A layered canvas for this exact channel already exists; remove the duplicate flat node and select the layered one!
+                old_ima = fn.image
+                ntree.nodes.remove(fn)
+                if old_ima is not None and old_ima.users == 0:
+                    try:
+                        bpy.data.images.remove(old_ima)
+                    except Exception:
+                        pass
+                bsdf = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+                ch_def = next((d for d in _PBR_CHANNEL_DEFS if d[0] == det_id), _PBR_CHANNEL_DEFS[0])
+                _wire_tex_paint_node_to_pbr_channel(ntree, bsdf, existing_layered, ch_def[0], ch_def[2])
+                last_new_node = existing_layered
+                converted_count += 1
+            else:
+                new_node = _upgrade_flat_tex_image_to_layered(context, mat, ntree, fn)
+                if new_node is not None:
+                    last_new_node = new_node
+                    converted_count += 1
+
+        if last_new_node is not None:
+            for n in ntree.nodes:
+                n.select = (n == last_new_node)
+            ntree.nodes.active = last_new_node
+            if last_new_node.image is not None and hasattr(mat, "texture_paint_images"):
+                for slot_i, slot_ima in enumerate(mat.texture_paint_images):
+                    if slot_ima == last_new_node.image:
+                        mat.paint_active_slot = slot_i
+                        break
+
+        _tag_view3d_gizmo_refresh(context)
+        self.report({'INFO'}, f"Converted {converted_count} texture slot(s) to multi-layer canvas")
+        return {'FINISHED'}
+
+
 class NODE_OT_tex_paint_pbr_channel(Operator):
-    """Switch to or create a layered PBR Material Channel (Base Color, Roughness, Metallic, Bump/Height, Emission, Alpha)"""
+    """Switch to or create a layered PBR Material Channel (Base Color, Roughness, Metallic, Specular, Normal, Bump/Height, Emission, Alpha, Displacement)"""
     bl_idname = "node.tex_paint_pbr_channel"
     bl_label = "Select or Create PBR Paint Channel"
     bl_options = {'REGISTER', 'UNDO'}
@@ -4734,9 +5058,12 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
             ('BASE_COLOR', "Base Color (Albedo)", "Create or switch to the Base Color / Albedo layered canvas", 'COLOR', 0),
             ('ROUGHNESS', "Roughness", "Create or switch to a Non-Color Roughness layered canvas (0.5 mid-grey base)", 'MATSPHERE', 1),
             ('METALLIC', "Metallic", "Create or switch to a Non-Color Metallic layered canvas (0.0 black base)", 'SHADING_RENDERED', 2),
-            ('BUMP', "Bump / Height", "Create or switch to a Non-Color Height/Bump layered canvas auto-wired through a Bump node", 'MOD_NORMALEDIT', 3),
-            ('EMISSION', "Emission", "Create or switch to an Emission Color layered canvas", 'LIGHT_SUN', 4),
-            ('ALPHA', "Alpha / Opacity", "Create or switch to an Opacity / Alpha layered canvas", 'IMAGE_ALPHA', 5),
+            ('SPECULAR', "Specular IOR Level", "Create or switch to a Non-Color Specular IOR Level layered canvas (0.5 mid-grey base)", 'NODE_MATERIAL', 3),
+            ('NORMAL', "Normal", "Create or switch to a Non-Color Normal Map layered canvas auto-wired through a Normal Map node", 'NORMALS_VERTEX_FACE', 4),
+            ('BUMP', "Bump / Height", "Create or switch to a Non-Color Height/Bump layered canvas auto-wired through a Bump node", 'MOD_NORMALEDIT', 5),
+            ('EMISSION', "Emission", "Create or switch to an Emission Color layered canvas", 'LIGHT_SUN', 6),
+            ('ALPHA', "Alpha / Opacity", "Create or switch to an Opacity / Alpha layered canvas", 'IMAGE_ALPHA', 7),
+            ('DISPLACEMENT', "Displacement", "Create or switch to a Non-Color Displacement layered canvas auto-wired to Material Output", 'MOD_DISPLACE', 8),
         ),
         default='BASE_COLOR',
     )
@@ -4766,6 +5093,18 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
         if ntree is None:
             return {'CANCELLED'}
 
+        ch_def = next((d for d in _PBR_CHANNEL_DEFS if d[0] == self.channel), _PBR_CHANNEL_DEFS[0])
+        ch_id, ch_label, sock_name, _icon, def_color, is_non_color = ch_def
+
+        # Find or create Principled BSDF
+        bsdf = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+        if bsdf is None:
+            bsdf = ntree.nodes.new("ShaderNodeBsdfPrincipled")
+            bsdf.location = (0, 300)
+            out_node = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
+            if out_node is not None and "Surface" in out_node.inputs:
+                ntree.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+
         target_node = None
         if self.node_name:
             cand = ntree.nodes.get(self.node_name)
@@ -4773,24 +5112,34 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
                 target_node = cand
 
         if target_node is None:
-            for n, ch_id, _lbl, _icon in _get_material_tex_paint_channels(mat):
-                if ch_id == self.channel:
+            for n, cid, _lbl, _icon in _get_material_tex_paint_channels(mat):
+                if cid == self.channel:
                     target_node = n
                     break
 
+        # Check if any legacy flat ShaderNodeTexImage exists for this channel
+        matching_flat = [
+            n for n in ntree.nodes
+            if n.bl_idname == "ShaderNodeTexImage" and _detect_node_pbr_channel(n)[0] == self.channel
+        ]
+        if target_node is not None and matching_flat:
+            # Remove orphaned duplicate flat ShaderNodeTexImage nodes on the same channel so Texture Slots stays clean!
+            for fn in matching_flat:
+                old_ima = fn.image
+                ntree.nodes.remove(fn)
+                if old_ima is not None and old_ima.users == 0:
+                    try:
+                        bpy.data.images.remove(old_ima)
+                    except Exception:
+                        pass
+            _wire_tex_paint_node_to_pbr_channel(ntree, bsdf, target_node, ch_id, sock_name)
+        elif target_node is None and matching_flat:
+            # Upgrade the existing flat ShaderNodeTexImage in-place to a multi-layer ShaderNodeTexPaint!
+            target_node = _upgrade_flat_tex_image_to_layered(context, mat, ntree, matching_flat[0], ch_def=ch_def)
+            for fn in matching_flat[1:]:
+                ntree.nodes.remove(fn)
+
         if target_node is None:
-            # Find or create Principled BSDF
-            bsdf = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
-            if bsdf is None:
-                bsdf = ntree.nodes.new("ShaderNodeBsdfPrincipled")
-                bsdf.location = (0, 300)
-                out_node = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
-                if out_node is not None and "Surface" in out_node.inputs:
-                    ntree.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
-
-            ch_def = next((d for d in _PBR_CHANNEL_DEFS if d[0] == self.channel), _PBR_CHANNEL_DEFS[0])
-            ch_id, ch_label, sock_name, _icon, def_color, is_non_color = ch_def
-
             # Match resolution to existing canvas if present
             ref_node = _find_any_tex_paint_node(ntree)
             w = int(ref_node.canvas_width) if (ref_node and ref_node.image) else 2048
@@ -4816,28 +5165,7 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
                 except Exception:
                     pass
 
-            # Auto-wire into Principled BSDF
-            if ch_id == 'BUMP':
-                bump_node = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBump"), None)
-                if bump_node is None:
-                    bump_node = ntree.nodes.new("ShaderNodeBump")
-                    bump_node.location = (bsdf.location.x - 170, bsdf.location.y - 320)
-                    bump_node.inputs["Distance"].default_value = 0.05
-                    bump_node.inputs["Strength"].default_value = 0.65
-                ntree.links.new(target_node.outputs["Color"], bump_node.inputs["Height"])
-                if "Normal" in bsdf.inputs:
-                    ntree.links.new(bump_node.outputs["Normal"], bsdf.inputs["Normal"])
-            elif ch_id == 'EMISSION':
-                sock = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
-                if sock is not None:
-                    ntree.links.new(target_node.outputs["Color"], sock)
-                em_str = bsdf.inputs.get("Emission Strength")
-                if em_str is not None and em_str.default_value <= 0.0:
-                    em_str.default_value = 1.0
-            else:
-                sock = bsdf.inputs.get(sock_name)
-                if sock is not None:
-                    ntree.links.new(target_node.outputs["Color"], sock)
+            _wire_tex_paint_node_to_pbr_channel(ntree, bsdf, target_node, ch_id, sock_name)
 
         # Activate target_node in node_tree and sync paint_active_slot
         for n in ntree.nodes:
@@ -4851,7 +5179,7 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
                     break
 
         # If we added a non-Base-Color PBR channel while in Solid shading, switch to Material Preview so the artist sees it!
-        if self.channel in {'ROUGHNESS', 'METALLIC', 'BUMP', 'EMISSION'}:
+        if self.channel in {'ROUGHNESS', 'METALLIC', 'SPECULAR', 'NORMAL', 'BUMP', 'EMISSION', 'DISPLACEMENT'}:
             space = getattr(context, "space_data", None)
             if space and space.type == 'VIEW_3D' and getattr(space, "shading", None):
                 if space.shading.type == 'SOLID':
@@ -4862,7 +5190,7 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
 
 
 class TEXPAINT_MT_add_pbr_channel(Menu):
-    """Add or switch to a PBR Material Channel (Base Color, Roughness, Metallic, Bump/Height, Emission, Alpha)"""
+    """Add or switch to a PBR Material Channel (Base Color, Roughness, Metallic, Specular, Normal, Bump/Height, Emission, Alpha, Displacement)"""
     bl_idname = "TEXPAINT_MT_add_pbr_channel"
     bl_label = "PBR Material Channels"
 
@@ -5974,6 +6302,7 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             )
 
     # 0b. Unified Single-Row PBR Channel & Viewport Lighting Header (Substance Painter style)
+    flat_slot_node, flat_slot_ima = _find_active_flat_paint_slot_node(mat) if not is_2d_only else (None, None)
     if not is_2d_only and mat is not None:
         channels = _get_material_tex_paint_channels(mat)
         top_bar = layout.row(align=True)
@@ -5983,7 +6312,7 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
                 "node.tex_paint_pbr_channel",
                 text=ch_lbl if len(channels) <= 3 else "",
                 icon=ch_icon,
-                depress=(ch_node == node),
+                depress=(ch_node == node and flat_slot_node is None),
             )
             op_ch.channel = ch_id if ch_id != 'CUSTOM' else 'BASE_COLOR'
             op_ch.node_name = ch_node.name
@@ -6019,6 +6348,38 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
                     icon='SHADING_WIRE',
                     depress=bool(ov.show_wireframes),
                 ).mode = 'WIREFRAME'
+
+        if flat_slot_node is not None:
+            flat_box = layout.box()
+            flat_col = flat_box.column(align=True)
+            slot_lbl = flat_slot_ima.name if flat_slot_ima else flat_slot_node.name
+            flat_col.label(text=f"Selected Slot '{slot_lbl}' is a Flat Image", icon='IMAGE_DATA')
+            op_conv = flat_col.operator(
+                "node.tex_paint_convert_slot_to_layers",
+                text=f"Convert '{slot_lbl}' to Layered Canvas",
+                icon='RENDERLAYERS',
+            )
+            op_conv.slot_index = int(mat.paint_active_slot)
+            op_conv.convert_all = False
+            all_flat_count = len([n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeTexImage"]) if mat.node_tree else 0
+            if all_flat_count > 1:
+                op_all = flat_col.operator(
+                    "node.tex_paint_convert_slot_to_layers",
+                    text=f"Convert All {all_flat_count} Flat Slots in Material",
+                    icon='FILE_REFRESH',
+                )
+                op_all.convert_all = True
+            return
+        elif mat.node_tree is not None:
+            leftover_flats = [n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeTexImage" and n.image is not None]
+            if leftover_flats:
+                up_row = layout.row(align=True)
+                op_up = up_row.operator(
+                    "node.tex_paint_convert_slot_to_layers",
+                    text=f"Upgrade {len(leftover_flats)} Flat Texture Slot(s) to Layers",
+                    icon='FILE_REFRESH',
+                )
+                op_up.convert_all = True
 
     if node is not None:
         layout.context_pointer_set("node", node)
@@ -6094,7 +6455,7 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     op_solo_btn.layer_index = node.active_layer_index
     flag_row.prop(layer, "lock", text="", toggle=True, icon='LOCKED' if layer.lock else 'UNLOCKED')
     if not layer.use_mask:
-        op_bm = flag_row.operator("node.tex_paint_mask_stack_init", text="Black Mask", icon='SHADING_SOLID')
+        op_bm = flag_row.operator("node.tex_paint_mask_stack_init", text="Mask", icon='SHADING_SOLID')
         op_bm.mode = 'BLACK'
         op_wm = flag_row.operator("node.tex_paint_mask_stack_init", text="", icon='LIGHT_SUN')
         op_wm.mode = 'WHITE'
@@ -7826,6 +8187,7 @@ classes = (
     NODE_OT_tex_paint_layer_target_select,
     NODE_OT_tex_paint_layer_solo,
     NODE_OT_tex_paint_viewport_shading,
+    NODE_OT_tex_paint_convert_slot_to_layers,
     NODE_OT_tex_paint_pbr_channel,
     TEXPAINT_MT_add_pbr_channel,
     NODE_OT_tex_paint_layer_pixel_action,

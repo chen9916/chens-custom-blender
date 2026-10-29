@@ -226,11 +226,46 @@ class TEXTURE_UL_texpaintslots(UIList):
         # mat = data
 
         # Hint that painting on linked images is prohibited
-        ima = _data.texture_paint_images.get(item.name)
+        ima = (
+            _data.texture_paint_images[_index]
+            if hasattr(_data, "texture_paint_images") and 0 <= _index < len(_data.texture_paint_images)
+            else _data.texture_paint_images.get(item.name)
+        )
         if ima is not None and not ima.is_editable:
             layout.enabled = False
 
-        layout.label(text=item.name, icon_value=item.icon_value)
+        tp_node = None
+        flat_node = None
+        if getattr(_data, "node_tree", None) is not None and ima is not None:
+            for n in _data.node_tree.nodes:
+                if n.bl_idname == "ShaderNodeTexPaint" and n.image == ima:
+                    tp_node = n
+                    break
+                elif n.bl_idname == "ShaderNodeTexImage" and n.image == ima:
+                    flat_node = n
+
+        if tp_node is not None:
+            from bl_ui.properties_tex_paint_layers import _detect_node_pbr_channel
+            ch_id, ch_lbl, ch_icon = _detect_node_pbr_channel(tp_node)
+            row = layout.row(align=True)
+            disp_text = f"{ch_lbl}  ({item.name})" if (ch_id != 'CUSTOM' and ch_lbl.lower() not in item.name.lower()) else ch_lbl
+            row.label(text=disp_text, icon=ch_icon)
+            sub = row.row(align=True)
+            sub.alignment = 'RIGHT'
+            sub.ui_units_x = 2.6
+            sub.label(text=f"{len(tp_node.layers)}L", icon='RENDERLAYERS')
+        elif flat_node is not None:
+            from bl_ui.properties_tex_paint_layers import _detect_node_pbr_channel
+            ch_id, _ch_lbl, ch_icon = _detect_node_pbr_channel(flat_node)
+            row = layout.row(align=True)
+            row.label(text=item.name, icon=ch_icon if ch_id != 'CUSTOM' else 'IMAGE_DATA')
+            sub = row.row(align=True)
+            sub.alignment = 'RIGHT'
+            op_conv = sub.operator("node.tex_paint_convert_slot_to_layers", text="To Layers", icon='RENDERLAYERS')
+            op_conv.slot_index = int(_index)
+            op_conv.convert_all = False
+        else:
+            layout.label(text=item.name, icon_value=item.icon_value)
 
 
 class View3DPaintPanel(View3DPanel, UnifiedPaintPanel):
@@ -443,10 +478,10 @@ class SelectPaintSlotHelper:
                     row.template_list(
                         "TEXTURE_UL_texpaintslots", "",
                         mat, "texture_paint_slots",
-                        mat, "paint_active_slot", rows=2,
+                        mat, "paint_active_slot", rows=3,
                     )
 
-                    if mat.texture_paint_slots:
+                    if mat.texture_paint_slots and 0 <= mat.paint_active_slot < len(mat.texture_paint_slots):
                         slot = mat.texture_paint_slots[mat.paint_active_slot]
                     else:
                         slot = None
@@ -459,7 +494,41 @@ class SelectPaintSlotHelper:
                     box.label(text="No Textures")
 
                 sub = row.column(align=True)
-                sub.operator_menu_enum("paint.add_texture_paint_slot", "type", icon='ADD', text="")
+                sub.menu("TEXPAINT_MT_add_pbr_channel", icon='ADD', text="")
+
+                if mat and mat.node_tree and mat.texture_paint_images and 0 <= mat.paint_active_slot < len(mat.texture_paint_images):
+                    act_ima = mat.texture_paint_images[mat.paint_active_slot]
+                    act_tp = next((n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeTexPaint" and n.image == act_ima), None)
+                    flat_count = len([n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeTexImage" and n.image is not None])
+                    if act_tp is not None and act_tp.active_layer is not None:
+                        act_layer = act_tp.active_layer
+                        lyr_row = layout.row(align=True)
+                        lyr_row.use_property_split = False
+                        lyr_row.popover(
+                            panel="VIEW3D_PT_tex_paint_layers_popover",
+                            text=f"Active Layer: {act_layer.name} ({len(act_tp.layers)} Layers)",
+                            icon='RENDERLAYERS',
+                        )
+                        if act_layer.use_mask and act_layer.type == 'PAINT':
+                            lyr_row.context_pointer_set("node", act_tp)
+                            is_mask_tgt = (getattr(act_tp, "paint_target", 'COLOR') == 'MASK')
+                            op_tgt = lyr_row.operator(
+                                "node.tex_paint_layer_target_select",
+                                text="Mask" if is_mask_tgt else "Color",
+                                icon='MOD_MASK' if is_mask_tgt else 'BRUSH_DATA',
+                                depress=is_mask_tgt,
+                            )
+                            op_tgt.layer_index = act_tp.active_layer_index
+                            op_tgt.target = 'COLOR' if is_mask_tgt else 'MASK'
+                    if flat_count > 0:
+                        conv_row = layout.row(align=True)
+                        conv_row.use_property_split = False
+                        op_all = conv_row.operator(
+                            "node.tex_paint_convert_slot_to_layers",
+                            text=f"Convert {flat_count} Flat Slot(s) to Layered Canvas",
+                            icon='FILE_REFRESH',
+                        )
+                        op_all.convert_all = True
 
             case 'IMAGE':
                 mesh = ob.data
@@ -527,8 +596,18 @@ class VIEW3D_PT_slots_projectpaint(SelectPaintSlotHelper, View3DPanel, Panel):
         label = iface_("Texture Slots")
 
         if tool.mode == 'MATERIAL':
-            if mat and mat.texture_paint_images and mat.texture_paint_slots:
+            if mat and mat.texture_paint_images and mat.texture_paint_slots and 0 <= mat.paint_active_slot < len(mat.texture_paint_slots):
                 label = mat.texture_paint_slots[mat.paint_active_slot].name
+                if mat.node_tree and mat.paint_active_slot < len(mat.texture_paint_images):
+                    act_ima = mat.texture_paint_images[mat.paint_active_slot]
+                    if act_ima is not None:
+                        for n in mat.node_tree.nodes:
+                            if n.bl_idname == "ShaderNodeTexPaint" and n.image == act_ima:
+                                from bl_ui.properties_tex_paint_layers import _detect_node_pbr_channel
+                                _ch_id, ch_lbl, _ch_icon = _detect_node_pbr_channel(n)
+                                if _ch_id != 'CUSTOM':
+                                    label = ch_lbl
+                                break
         elif tool.canvas:
             label = tool.canvas.name
 

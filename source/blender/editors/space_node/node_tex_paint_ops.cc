@@ -156,10 +156,19 @@ static bNode *tex_paint_node_from_context(bContext *C, bNodeTree **r_ntree)
   if (ma == nullptr || ma->nodetree == nullptr) {
     return nullptr;
   }
-  bNode *node = bke::node_get_active_texture(*ma->nodetree);
-  if (!is_tex_paint_node(node) && ma->texpaintslot && ma->paint_active_slot < ma->tot_slots) {
-    node = BKE_tex_paint_node_find_by_image(*ma->nodetree,
-                                            ma->texpaintslot[ma->paint_active_slot].ima);
+  bNode *node = bke::node_get_active(*ma->nodetree);
+  if (!(is_tex_paint_node(node) && node->id == nullptr)) {
+    node = nullptr;
+    if (ma->texpaintslot && ma->paint_active_slot >= 0 && ma->paint_active_slot < ma->tot_slots) {
+      node = BKE_tex_paint_node_find_by_image(*ma->nodetree,
+                                              ma->texpaintslot[ma->paint_active_slot].ima);
+    }
+  }
+  if (!is_tex_paint_node(node)) {
+    node = bke::node_get_active_paint_canvas(*ma->nodetree);
+  }
+  if (!is_tex_paint_node(node)) {
+    node = bke::node_get_active_texture(*ma->nodetree);
   }
   if (!is_tex_paint_node(node)) {
     node = tex_paint_node_find_any(*ma->nodetree);
@@ -246,6 +255,14 @@ static wmOperatorStatus tex_paint_canvas_new_exec(bContext *C, wmOperator *op)
 
   char name[MAX_ID_NAME - 2];
   RNA_string_get(op->ptr, "name", name);
+  if (STREQ(name, "Painted Texture") && ob != nullptr) {
+    if (Material *ma = BKE_object_material_get(ob, ob->actcol)) {
+      SNPRINTF_UTF8(name, "%s_Base", ma->id.name + 2);
+      if (node->label[0] == '\0') {
+        STRNCPY_UTF8(node->label, "Base Color");
+      }
+    }
+  }
   const int width = RNA_int_get(op->ptr, "width");
   const int height = RNA_int_get(op->ptr, "height");
   const bool is_float = RNA_boolean_get(op->ptr, "float");
@@ -257,17 +274,22 @@ static wmOperatorStatus tex_paint_canvas_new_exec(bContext *C, wmOperator *op)
     return OPERATOR_CANCELLED;
   }
 
-  /* Auto-link Color -> Principled BSDF Base Color when Base Color is unconnected. */
-  ntree->ensure_topology_cache();
-  const Span<bNode *> bsdf_nodes = ntree->nodes_by_type("ShaderNodeBsdfPrincipled"_ustr);
-  if (!bsdf_nodes.is_empty()) {
-    bNode *bsdf = bsdf_nodes.first();
-    bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, "Color"_ustr);
-    bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, "Base Color"_ustr);
-    if (out_sock != nullptr && in_sock != nullptr && in_sock->link == nullptr) {
-      bke::node_add_link(*ntree, *node, *out_sock, *bsdf, *in_sock);
-      bke::node_position_relative(*node, *bsdf, out_sock, *in_sock);
-      bke::node_position_propagate(*node);
+  /* Auto-link Color -> Principled BSDF Base Color when Base Color is unconnected and this node is for Base Color. */
+  if (node->label[0] == '\0' || STREQ(node->label, "Base Color")) {
+    ntree->ensure_topology_cache();
+    const Span<bNode *> bsdf_nodes = ntree->nodes_by_type("ShaderNodeBsdfPrincipled"_ustr);
+    if (!bsdf_nodes.is_empty()) {
+      bNode *bsdf = bsdf_nodes.first();
+      bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, "Color"_ustr);
+      bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, "Base Color"_ustr);
+      if (out_sock != nullptr && in_sock != nullptr && in_sock->link == nullptr) {
+        if (node->label[0] == '\0') {
+          STRNCPY_UTF8(node->label, "Base Color");
+        }
+        bke::node_add_link(*ntree, *node, *out_sock, *bsdf, *in_sock);
+        bke::node_position_relative(*node, *bsdf, out_sock, *in_sock);
+        bke::node_position_propagate(*node);
+      }
     }
   }
 
