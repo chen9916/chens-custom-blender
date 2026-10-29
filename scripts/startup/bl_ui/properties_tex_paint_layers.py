@@ -908,19 +908,106 @@ def _absorb_pending_brush_strokes(node, layer=None):
     return True
 
 
-def _find_mesh_object_for_node(node, context=None):
+_OBJECT_DATA_PTR_OFFSET = None
+
+
+def _get_object_data_ptr_slot(ob):
+    """Return (ctypes.c_void_p slot, orig_value) for `Object::data` on `ob`."""
+    global _OBJECT_DATA_PTR_OFFSET
+    if ob is None or ob.data is None:
+        return None, None
+    ob_ptr = ob.as_pointer()
+    mesh_ptr = ob.data.as_pointer()
+    if _OBJECT_DATA_PTR_OFFSET is not None:
+        slot = ctypes.c_void_p.from_address(ob_ptr + _OBJECT_DATA_PTR_OFFSET)
+        if slot.value == mesh_ptr:
+            return slot, mesh_ptr
+    for off in range(0, 1024, 8):
+        slot = ctypes.c_void_p.from_address(ob_ptr + off)
+        if slot.value == mesh_ptr:
+            _OBJECT_DATA_PTR_OFFSET = off
+            return slot, mesh_ptr
+    return None, None
+
+
+def _find_all_mesh_objects_for_node(node, context=None):
+    """Return `(ordered_mesh_objects, first_c_ob)` for all mesh objects using `node`'s material.
+    `ordered_mesh_objects` places the active object LAST so its UV islands win when UVs overlap.
+    `first_c_ob` is the first mesh object in `bpy.data.objects` that C++ `find_mesh_for_ntree` resolves.
+    """
+    active_ob = None
     if context is not None:
-        ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
-        if ob is not None and ob.type == 'MESH' and ob.data is not None:
-            return ob
-    if bpy.context is not None:
-        ob = getattr(bpy.context, "active_object", None)
-        if ob is not None and ob.type == 'MESH' and ob.data is not None:
-            return ob
+        active_ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
+    if active_ob is None and bpy.context is not None:
+        active_ob = getattr(bpy.context, "active_object", None) or getattr(bpy.context, "image_paint_object", None)
+    if active_ob is not None and (active_ob.type != 'MESH' or active_ob.data is None):
+        active_ob = None
+
+    mat = _get_material_for_node(node) if node is not None else None
+    first_c_ob = None
+    fallback_c_ob = None
+    sharing_obs = []
+
     for ob in bpy.data.objects:
-        if ob.type == 'MESH' and ob.data is not None:
-            return ob
-    return None
+        if ob.type != 'MESH' or ob.data is None:
+            continue
+        if fallback_c_ob is None:
+            fallback_c_ob = ob
+        uses_mat = False
+        if mat is not None:
+            for slot in ob.material_slots:
+                if slot.material == mat:
+                    uses_mat = True
+                    break
+        if uses_mat:
+            if first_c_ob is None:
+                first_c_ob = ob
+            if len(ob.data.vertices) > 0 and len(ob.data.polygons) > 0:
+                sharing_obs.append(ob)
+
+    if first_c_ob is None:
+        first_c_ob = fallback_c_ob
+
+    if not sharing_obs:
+        if active_ob is not None and len(active_ob.data.vertices) > 0 and len(active_ob.data.polygons) > 0:
+            sharing_obs = [active_ob]
+        elif first_c_ob is not None and len(first_c_ob.data.vertices) > 0 and len(first_c_ob.data.polygons) > 0:
+            sharing_obs = [first_c_ob]
+
+    if active_ob is not None and active_ob in sharing_obs and len(sharing_obs) > 1:
+        sharing_obs = [o for o in sharing_obs if o != active_ob] + [active_ob]
+
+    return sharing_obs, first_c_ob
+
+
+def _find_mesh_object_for_node(node, context=None):
+    sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(node, context)
+    if sharing_obs:
+        return sharing_obs[-1]
+    return first_c_ob
+
+
+def _transform_widget_between_objects(loc_src, rot_src, scl_src, src_ob, dst_ob):
+    """Transform a 3D projection widget (loc, rot_euler, scale) from src_ob local space into dst_ob local space."""
+    if src_ob is None or dst_ob is None or src_ob == dst_ob:
+        return tuple(loc_src), tuple(rot_src), tuple(scl_src)
+    rel_mat = dst_ob.matrix_world.inverted_safe() @ src_ob.matrix_world
+    loc_v = rel_mat @ Vector(loc_src)
+    rot_m = Euler(rot_src, 'XYZ').to_matrix()
+    rel_3x3 = rel_mat.to_3x3()
+    dst_3x3 = rel_3x3 @ rot_m
+    sx_sign = -1.0 if scl_src[0] < 0.0 else 1.0
+    sy_sign = -1.0 if scl_src[1] < 0.0 else 1.0
+    sz_sign = -1.0 if scl_src[2] < 0.0 else 1.0
+    sx = max(abs(float(scl_src[0])) * max(dst_3x3.col[0].length, 1e-6), 1e-4) * sx_sign
+    sy = max(abs(float(scl_src[1])) * max(dst_3x3.col[1].length, 1e-6), 1e-4) * sy_sign
+    sz = max(abs(float(scl_src[2])) * max(dst_3x3.col[2].length, 1e-6), 1e-4) * sz_sign
+    rot_dst = dst_3x3.normalized().to_euler('XYZ')
+    return (
+        (float(loc_v.x), float(loc_v.y), float(loc_v.z)),
+        (float(rot_dst.x), float(rot_dst.y), float(rot_dst.z)),
+        (sx, sy, sz),
+    )
 
 
 def _resolve_grunge_image(eff, interactive=False):
@@ -958,8 +1045,23 @@ def _resolve_grunge_image(eff, interactive=False):
         return None
 
 
+def _read_mask_ibuf_r_u8(mask_ibuf_ptr, w, h):
+    import numpy as np
+    if not mask_ibuf_ptr:
+        return np.zeros(w * h, dtype=np.uint8)
+    c_imb = _C_ImBuf.from_address(mask_ibuf_ptr)
+    if c_imb.byte_data:
+        buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
+        return np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)[:, 0].copy()
+    if c_imb.float_data:
+        buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
+        arr_f = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)[:, 0]
+        return (np.clip(arr_f, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return np.zeros(w * h, dtype=np.uint8)
+
+
 def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
-    """Evaluate C++ BKE_tex_paint_layer_generate_mask in raw mode (balance=0.5, contrast=0.0) and cache uint8[w*h]."""
+    """Evaluate C++ BKE_tex_paint_layer_generate_mask in raw mode (balance=0.5, contrast=0.0) across all mesh objects sharing the material and cache uint8[w*h]."""
     global _INTERNAL_REPROJECTING
     import numpy as np
 
@@ -975,7 +1077,13 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
     noise = float(np.clip(eff.get("gen_noise", 0.0), 0.0, 1.0))
     noise_scale = max(float(eff.get("gen_noise_scale", 8.0)), 0.1)
 
-    sig = ("GEN", gen_type_int, round(radius, 4), round(noise, 4), round(noise_scale, 4), w, h)
+    sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(node)
+    obs_sig = tuple(
+        (o.name, o.data.as_pointer(), len(o.data.vertices), len(o.data.polygons))
+        for o in sharing_obs
+    )
+
+    sig = ("GEN", gen_type_int, round(radius, 4), round(noise, 4), round(noise_scale, 4), w, h, obs_sig)
     cached = _EFFECT_RAW_CACHE.get(rkey)
     if not force and cached is not None and cached.get("sig") == sig:
         return cached["raw_u8"]
@@ -994,19 +1102,47 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
     c_node_id = ctypes.c_void_p.from_address(node_ptr + 216)
     orig_node_id = c_node_id.value
 
+    c_data_slot, orig_mesh_ptr = _get_object_data_ptr_slot(first_c_ob) if first_c_ob is not None else (None, None)
+    eval_obs = sharing_obs if sharing_obs else ([first_c_ob] if first_c_ob is not None else [])
+    raw_u8 = np.zeros(w * h, dtype=np.uint8)
+
     _INTERNAL_REPROJECTING = True
     try:
         c_node_id.value = 0
-        c_layer.mask_gen_type = gen_type_int
         c_layer.mask_gen_blend = 0  # REPLACE
         c_layer.mask_gen_balance = 0.5
         c_layer.mask_gen_contrast = 0.0
         c_layer.mask_gen_radius = radius
         c_layer.mask_gen_noise = noise
         c_layer.mask_gen_invert = 0
-        # Trigger rna_TexPaintLayer_mask_gen_update -> BKE_tex_paint_layer_generate_mask
-        layer.mask_gen_noise_scale = noise_scale
+
+        if len(eval_obs) <= 1:
+            if eval_obs and c_data_slot is not None and eval_obs[0].data is not None:
+                c_data_slot.value = eval_obs[0].data.as_pointer()
+            c_layer.mask_gen_type = gen_type_int
+            layer.mask_gen_noise_scale = noise_scale
+            raw_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+        else:
+            for idx, ob_part in enumerate(eval_obs):
+                if ob_part.data is None:
+                    continue
+                if c_data_slot is not None:
+                    c_data_slot.value = ob_part.data.as_pointer()
+                c_layer.mask_gen_type = gen_type_int
+                layer.mask_gen_noise_scale = noise_scale
+                part_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+                if idx == 0:
+                    raw_u8 = part_u8
+                else:
+                    # Evaluate UV island coverage mask (gen_type=99 hits default: raw=1.0f using cached UV tiles)
+                    c_layer.mask_gen_type = 99
+                    layer.mask_gen_noise_scale = noise_scale
+                    cov_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+                    mask_sel = cov_u8 > 0
+                    raw_u8[mask_sel] = part_u8[mask_sel]
     finally:
+        if c_data_slot is not None and orig_mesh_ptr is not None:
+            c_data_slot.value = orig_mesh_ptr
         c_node_id.value = orig_node_id
         _INTERNAL_REPROJECTING = False
         c_layer.mask_gen_type = orig_gen_type
@@ -1017,17 +1153,6 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
         c_layer.mask_gen_noise = orig_gen_noise
         c_layer.mask_gen_noise_scale = orig_gen_noise_scale
         c_layer.mask_gen_invert = orig_gen_invert
-
-    c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
-    if c_imb.byte_data:
-        buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-        raw_u8 = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)[:, 0].copy()
-    elif c_imb.float_data:
-        buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-        arr_f = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)[:, 0]
-        raw_u8 = (np.clip(arr_f, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-    else:
-        raw_u8 = np.zeros(w * h, dtype=np.uint8)
 
     _EFFECT_RAW_CACHE[rkey] = {"sig": sig, "raw_u8": raw_u8}
     return raw_u8
@@ -1076,16 +1201,22 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
     box_blend = float(np.clip(eff.get("box_blend", 0.5), 0.0, 1.0))
     channel_mode = eff.get("channel", "AUTO")
 
-    ob = _find_mesh_object_for_node(node, context)
-    bbox_center = Vector((0.0, 0.0, 0.0))
-    max_extent = 2.0
-    if ob is not None and getattr(ob, "bound_box", None):
-        pts = [Vector(co) for co in ob.bound_box]
-        bmin = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
-        bmax = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
-        bbox_center = (bmin + bmax) * 0.5
-        bsize = bmax - bmin
-        max_extent = max(bsize.x, bsize.y, bsize.z, 1e-3)
+    sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(node, context)
+    ob = sharing_obs[-1] if sharing_obs else first_c_ob
+
+    def _compute_ob_bbox(target_ob):
+        bc = Vector((0.0, 0.0, 0.0))
+        me = 2.0
+        if target_ob is not None and getattr(target_ob, "bound_box", None):
+            pts = [Vector(co) for co in target_ob.bound_box]
+            bmin = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+            bmax = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+            bc = (bmin + bmax) * 0.5
+            bsize = bmax - bmin
+            me = max(bsize.x, bsize.y, bsize.z, 1e-3)
+        return bc, me
+
+    bbox_center, max_extent = _compute_ob_bbox(ob)
 
     if from_gizmo and getattr(layer, "show_projection_widget", False) and proj_mode_int >= 3:
         eff["gizmo_loc"] = [float(c_layer.proj_location[0]), float(c_layer.proj_location[1]), float(c_layer.proj_location[2])]
@@ -1106,46 +1237,48 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
         sx, sy = new_sx, new_sy
         off_x, off_y, rot_z = 0.0, 0.0, 0.0
 
-    if proj_mode_int in {1, 2}:
-        loc = (off_x, off_y, 0.0)
-        rot = (0.0, 0.0, rot_z)
-        if proj_mode_int == 2:
-            scl = (sx, sy, 1.0)
-        else:
-            scl = (1.0 / sx, 1.0 / sy, 1.0)
-    else:
+    def _compute_proj_xform(bc, me):
+        if proj_mode_int in {1, 2}:
+            l_out = (off_x, off_y, 0.0)
+            r_out = (0.0, 0.0, rot_z)
+            s_out = (sx, sy, 1.0) if proj_mode_int == 2 else (1.0 / sx, 1.0 / sy, 1.0)
+            return l_out, r_out, s_out
         if eff.get("gizmo_override") and eff.get("gizmo_loc") and eff.get("gizmo_rot"):
             base_loc = Vector(eff["gizmo_loc"])
             base_rot_mat = Euler(eff["gizmo_rot"], 'XYZ').to_matrix()
         elif proj_mode_str in {'DECAL', 'WARP'}:
-            base_loc = Vector((bbox_center.x, bbox_center.y + max_extent * 0.5, bbox_center.z))
+            base_loc = Vector((bc.x, bc.y + me * 0.5, bc.z))
             base_rot_mat = Euler((math.pi * 0.5, 0.0, 0.0), 'XYZ').to_matrix()
         else:
-            base_loc = bbox_center.copy()
+            base_loc = bc.copy()
             base_rot_mat = Matrix.Identity(3)
 
         ax_x = base_rot_mat.col[0].normalized()
         ax_y = base_rot_mat.col[1].normalized()
-        final_loc = base_loc + ax_x * (off_x * max_extent * 0.5) + ax_y * (off_y * max_extent * 0.5)
+        final_loc = base_loc + ax_x * (off_x * me * 0.5) + ax_y * (off_y * me * 0.5)
         final_rot_mat = base_rot_mat @ Matrix.Rotation(rot_z, 3, 'Z')
         final_rot = final_rot_mat.to_euler('XYZ')
 
-        half_x = max(max_extent * 0.5 / sx, 1e-3)
-        half_y = max(max_extent * 0.5 / sy, 1e-3)
+        half_x = max(me * 0.5 / sx, 1e-3)
+        half_y = max(me * 0.5 / sy, 1e-3)
         half_z = (
-            max(max_extent * 0.5 / ((sx + sy) * 0.5), 1e-3)
+            max(me * 0.5 / ((sx + sy) * 0.5), 1e-3)
             if proj_mode_str == 'TRIPLANAR'
-            else max(max_extent * 0.6, 1e-3)
+            else max(me * 0.6, 1e-3)
         )
-        # Sign of scl[2] communicates repeat_uv to C++ BKE_tex_paint_layer_reproject
-        if proj_mode_str == 'TRIPLANAR':
-            z_signed = half_z if is_repeat else -half_z
-        else:
-            z_signed = -half_z if is_repeat else half_z
+        z_signed = (half_z if is_repeat else -half_z) if proj_mode_str == 'TRIPLANAR' else (-half_z if is_repeat else half_z)
+        return (
+            (float(final_loc.x), float(final_loc.y), float(final_loc.z)),
+            (float(final_rot.x), float(final_rot.y), float(final_rot.z)),
+            (half_x, half_y, z_signed),
+        )
 
-        loc = (float(final_loc.x), float(final_loc.y), float(final_loc.z))
-        rot = (float(final_rot.x), float(final_rot.y), float(final_rot.z))
-        scl = (half_x, half_y, z_signed)
+    loc, rot, scl = _compute_proj_xform(bbox_center, max_extent)
+    obs_sig = (
+        tuple((o.name, o.data.as_pointer(), len(o.data.vertices), len(o.data.polygons)) for o in sharing_obs)
+        if proj_mode_int >= 3
+        else ()
+    )
 
     sig = (
         "GRUNGE",
@@ -1158,6 +1291,7 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
         round(box_blend, 4),
         w,
         h,
+        obs_sig,
     )
     cached = _EFFECT_RAW_CACHE.get(rkey)
     if not force and cached is not None and cached.get("sig") == sig:
@@ -1175,6 +1309,67 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
     c_node_id = ctypes.c_void_p.from_address(node_ptr + 216)
     orig_node_id = c_node_id.value
 
+    def _extract_projected_u8_and_cov():
+        c_imb = _C_ImBuf.from_address(orig_mask_ibuf)
+        if c_imb.byte_data:
+            buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
+            rgba = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
+            cov_m = rgba[:, 3] > 0
+            if (
+                channel_mode == 'AUTO' and
+                eff.get("category", "BITMAP_GRUNGES") != 'CUSTOM' and
+                proj_mode_int in {2, 3} and
+                is_repeat
+            ):
+                p_u8 = rgba[:, 0].copy()
+            elif channel_mode == 'ALPHA':
+                p_u8 = rgba[:, 3].copy()
+            elif channel_mode in {'RED', 'GREEN', 'BLUE'}:
+                ch_i = {'RED': 0, 'GREEN': 1, 'BLUE': 2}[channel_mode]
+                a_u16 = rgba[:, 3].astype(np.uint16)
+                p_u8 = ((rgba[:, ch_i].astype(np.uint16) * a_u16 + 127) >> 8).astype(np.uint8)
+            elif channel_mode == 'LUMINANCE':
+                lum_u16 = (
+                    rgba[:, 0].astype(np.uint16) * 77 +
+                    rgba[:, 1].astype(np.uint16) * 150 +
+                    rgba[:, 2].astype(np.uint16) * 29
+                ) >> 8
+                p_u8 = lum_u16.astype(np.uint8)
+            else:
+                a_u16 = rgba[:, 3].astype(np.uint16)
+                lum_u16 = (
+                    rgba[:, 0].astype(np.uint16) * 77 +
+                    rgba[:, 1].astype(np.uint16) * 150 +
+                    rgba[:, 2].astype(np.uint16) * 29
+                ) >> 8
+                if int(lum_u16.max()) == 0 and int(a_u16.max()) > 0:
+                    p_u8 = rgba[:, 3].copy()
+                else:
+                    p_u8 = ((lum_u16 * a_u16 + 127) >> 8).astype(np.uint8)
+            return p_u8, cov_m.copy()
+        if c_imb.float_data:
+            buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
+            arr = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)
+            cov = np.clip(arr[:, 3], 0.0, 1.0)
+            cov_m = cov > 1e-5
+            if channel_mode == 'ALPHA':
+                raw_f = cov
+            elif channel_mode in {'RED', 'GREEN', 'BLUE'}:
+                ch_i = {'RED': 0, 'GREEN': 1, 'BLUE': 2}[channel_mode]
+                raw_f = np.clip(arr[:, ch_i], 0.0, 1.0)
+            elif channel_mode == 'LUMINANCE':
+                lum = 0.299 * arr[:, 0] + 0.587 * arr[:, 1] + 0.114 * arr[:, 2]
+                raw_f = np.where(cov > 1e-5, np.clip(lum / np.maximum(cov, 1e-5), 0.0, 1.0), 0.0)
+            else:
+                lum = 0.299 * arr[:, 0] + 0.587 * arr[:, 1] + 0.114 * arr[:, 2]
+                raw_f = np.clip(lum, 0.0, 1.0)
+            return (raw_f * 255.0 + 0.5).astype(np.uint8), cov_m.copy()
+        return np.zeros(w * h, dtype=np.uint8), np.zeros(w * h, dtype=bool)
+
+    c_data_slot, orig_mesh_ptr = _get_object_data_ptr_slot(first_c_ob) if (proj_mode_int >= 3 and first_c_ob is not None) else (None, None)
+    eval_obs = sharing_obs if (proj_mode_int >= 3 and sharing_obs) else ([ob] if ob is not None else [])
+    raw_u8 = np.zeros(w * h, dtype=np.uint8)
+
     _INTERNAL_REPROJECTING = True
     try:
         c_node_id.value = 0
@@ -1182,12 +1377,55 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
         c_layer.ibuf = orig_mask_ibuf
         c_layer.proj_mode = proj_mode_int
         c_layer.proj_image_name = src_ima.name.encode('utf-8')[:63]
-        for i in range(3):
-            c_layer.proj_location[i] = loc[i]
-            c_layer.proj_rotation[i] = rot[i]
-            c_layer.proj_scale[i] = scl[i]
-        layer.proj_blend_falloff = box_blend
+
+        if proj_mode_int < 3 or len(eval_obs) <= 1:
+            if proj_mode_int >= 3 and eval_obs and c_data_slot is not None and eval_obs[0].data is not None:
+                c_data_slot.value = eval_obs[0].data.as_pointer()
+            loc_0, rot_0, scl_0 = (
+                _transform_widget_between_objects(loc, rot, scl, ob, eval_obs[0])
+                if (proj_mode_int >= 3 and eval_obs and eval_obs[0] != ob)
+                else (loc, rot, scl)
+            )
+            for i in range(3):
+                c_layer.proj_location[i] = loc_0[i]
+                c_layer.proj_rotation[i] = rot_0[i]
+                c_layer.proj_scale[i] = scl_0[i]
+            orig_uid = c_layer.uid
+            c_layer.uid = orig_uid + 10000
+            layer.proj_blend_falloff = box_blend
+            c_layer.uid = orig_uid
+            raw_u8, _ = _extract_projected_u8_and_cov()
+        else:
+            use_world_widget = bool(eff.get("gizmo_override") or proj_mode_str in {'DECAL', 'WARP'})
+            for idx, ob_part in enumerate(eval_obs):
+                if ob_part.data is None:
+                    continue
+                if c_data_slot is not None:
+                    c_data_slot.value = ob_part.data.as_pointer()
+                if use_world_widget:
+                    loc_p, rot_p, scl_p = _transform_widget_between_objects(loc, rot, scl, ob, ob_part)
+                else:
+                    bc_p, me_p = _compute_ob_bbox(ob_part)
+                    loc_p, rot_p, scl_p = _compute_proj_xform(bc_p, me_p)
+                for i in range(3):
+                    c_layer.proj_location[i] = loc_p[i]
+                    c_layer.proj_rotation[i] = rot_p[i]
+                    c_layer.proj_scale[i] = scl_p[i]
+                # Reset last_proj_layer_uid via temporary uid flip so C++ clears between objects
+                orig_uid = c_layer.uid
+                c_layer.uid = orig_uid + 10000 + idx
+                layer.proj_blend_falloff = box_blend
+                c_layer.uid = orig_uid
+                part_u8, cov_m = _extract_projected_u8_and_cov()
+                if idx == 0:
+                    raw_u8 = part_u8
+                elif not is_repeat:
+                    raw_u8[cov_m] = np.maximum(raw_u8[cov_m], part_u8[cov_m])
+                else:
+                    raw_u8[cov_m] = part_u8[cov_m]
     finally:
+        if c_data_slot is not None and orig_mesh_ptr is not None:
+            c_data_slot.value = orig_mesh_ptr
         c_node_id.value = orig_node_id
         _INTERNAL_REPROJECTING = False
         c_layer.type = orig_type
@@ -1201,61 +1439,6 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
             c_layer.proj_location[0], c_layer.proj_location[1], c_layer.proj_location[2] = loc[0], loc[1], loc[2]
             c_layer.proj_rotation[0], c_layer.proj_rotation[1], c_layer.proj_rotation[2] = rot[0], rot[1], rot[2]
             c_layer.proj_scale[0], c_layer.proj_scale[1], c_layer.proj_scale[2] = abs(scl[0]), abs(scl[1]), abs(scl[2])
-
-    c_imb = _C_ImBuf.from_address(orig_mask_ibuf)
-    if c_imb.byte_data:
-        buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-        rgba = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
-        if (
-            channel_mode == 'AUTO' and
-            eff.get("category", "BITMAP_GRUNGES") != 'CUSTOM' and
-            proj_mode_int in {2, 3} and
-            is_repeat
-        ):
-            raw_u8 = rgba[:, 0].copy()
-        elif channel_mode == 'ALPHA':
-            raw_u8 = rgba[:, 3].copy()
-        elif channel_mode in {'RED', 'GREEN', 'BLUE'}:
-            ch_i = {'RED': 0, 'GREEN': 1, 'BLUE': 2}[channel_mode]
-            a_u16 = rgba[:, 3].astype(np.uint16)
-            raw_u8 = ((rgba[:, ch_i].astype(np.uint16) * a_u16 + 127) >> 8).astype(np.uint8)
-        elif channel_mode == 'LUMINANCE':
-            lum_u16 = (
-                rgba[:, 0].astype(np.uint16) * 77 +
-                rgba[:, 1].astype(np.uint16) * 150 +
-                rgba[:, 2].astype(np.uint16) * 29
-            ) >> 8
-            raw_u8 = lum_u16.astype(np.uint8)
-        else:
-            # 'AUTO': Luminance * Alpha, with automatic detection for black-on-transparent PNG decals
-            a_u16 = rgba[:, 3].astype(np.uint16)
-            lum_u16 = (
-                rgba[:, 0].astype(np.uint16) * 77 +
-                rgba[:, 1].astype(np.uint16) * 150 +
-                rgba[:, 2].astype(np.uint16) * 29
-            ) >> 8
-            if int(lum_u16.max()) == 0 and int(a_u16.max()) > 0:
-                raw_u8 = rgba[:, 3].copy()
-            else:
-                raw_u8 = ((lum_u16 * a_u16 + 127) >> 8).astype(np.uint8)
-    elif c_imb.float_data:
-        buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-        arr = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)
-        cov = np.clip(arr[:, 3], 0.0, 1.0)
-        if channel_mode == 'ALPHA':
-            raw_f = cov
-        elif channel_mode in {'RED', 'GREEN', 'BLUE'}:
-            ch_i = {'RED': 0, 'GREEN': 1, 'BLUE': 2}[channel_mode]
-            raw_f = np.clip(arr[:, ch_i], 0.0, 1.0)
-        elif channel_mode == 'LUMINANCE':
-            lum = 0.299 * arr[:, 0] + 0.587 * arr[:, 1] + 0.114 * arr[:, 2]
-            raw_f = np.where(cov > 1e-5, np.clip(lum / np.maximum(cov, 1e-5), 0.0, 1.0), 0.0)
-        else:
-            lum = 0.299 * arr[:, 0] + 0.587 * arr[:, 1] + 0.114 * arr[:, 2]
-            raw_f = np.clip(lum, 0.0, 1.0)
-        raw_u8 = (raw_f * 255.0 + 0.5).astype(np.uint8)
-    else:
-        raw_u8 = np.zeros(w * h, dtype=np.uint8)
 
     _EFFECT_RAW_CACHE[rkey] = {"sig": sig, "raw_u8": raw_u8}
     return raw_u8
@@ -1993,9 +2176,127 @@ def _effective_proj_mode(node, layer):
     return 'NONE'
 
 
+_LAST_COLOR_PROJ_SIG = {}  # (node_ptr, layer_uid) -> tuple
+
+
+def _reproject_color_layer_multi_object(node, layer, context=None, force=True):
+    """Project a 3D Decal / Triplanar / Warp color/fill layer across ALL mesh objects sharing the material."""
+    global _INTERNAL_REPROJECTING
+    import numpy as np
+    if _INTERNAL_REPROJECTING or node is None or layer is None:
+        return False
+    if layer.type not in {'PAINT', 'FILL'}:
+        return False
+    pmode = getattr(layer, "proj_mode", 'NONE')
+    im_name = getattr(layer, "proj_image_name", "")
+    if pmode not in _3D_GIZMO_PROJ_MODES or not im_name:
+        return False
+
+    sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(node, context)
+    if not sharing_obs or first_c_ob is None:
+        return False
+    active_ob = sharing_obs[-1]
+
+    c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
+    orig_loc = (float(c_layer.proj_location[0]), float(c_layer.proj_location[1]), float(c_layer.proj_location[2]))
+    orig_rot = (float(c_layer.proj_rotation[0]), float(c_layer.proj_rotation[1]), float(c_layer.proj_rotation[2]))
+    orig_scl = (float(c_layer.proj_scale[0]), float(c_layer.proj_scale[1]), float(c_layer.proj_scale[2]))
+    falloff = float(layer.proj_blend_falloff)
+
+    key = (node.as_pointer(), _layer_uid(layer))
+    sig = (
+        pmode,
+        im_name,
+        tuple(round(v, 4) for v in orig_loc),
+        tuple(round(v, 4) for v in orig_rot),
+        tuple(round(v, 4) for v in orig_scl),
+        round(falloff, 4),
+        active_ob.name,
+        tuple((o.name, o.data.as_pointer(), len(o.data.vertices)) for o in sharing_obs),
+    )
+    if not force and _LAST_COLOR_PROJ_SIG.get(key) == sig:
+        return False
+
+    if len(sharing_obs) == 1 and sharing_obs[0] == first_c_ob:
+        _LAST_COLOR_PROJ_SIG[key] = sig
+        return False
+
+    c_data_slot, orig_mesh_ptr = _get_object_data_ptr_slot(first_c_ob)
+    if c_data_slot is None:
+        return False
+
+    w = max(int(node.canvas_width), 1)
+    h = max(int(node.canvas_height), 1)
+    c_node_id = ctypes.c_void_p.from_address(node.as_pointer() + 216)
+    orig_node_id = c_node_id.value
+    acc_u8 = None
+    acc_f32 = None
+
+    _INTERNAL_REPROJECTING = True
+    try:
+        c_node_id.value = 0
+        for idx, ob_part in enumerate(sharing_obs):
+            if ob_part.data is None:
+                continue
+            c_data_slot.value = ob_part.data.as_pointer()
+            loc_p, rot_p, scl_p = _transform_widget_between_objects(orig_loc, orig_rot, orig_scl, active_ob, ob_part)
+            for i in range(3):
+                c_layer.proj_location[i] = loc_p[i]
+                c_layer.proj_rotation[i] = rot_p[i]
+                c_layer.proj_scale[i] = scl_p[i]
+            orig_uid = c_layer.uid
+            c_layer.uid = orig_uid + 20000 + idx
+            layer.proj_blend_falloff = falloff
+            c_layer.uid = orig_uid
+
+            if c_layer.ibuf:
+                c_imb = _C_ImBuf.from_address(c_layer.ibuf)
+                if c_imb.byte_data:
+                    buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
+                    part_u8 = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
+                    if acc_u8 is None:
+                        acc_u8 = part_u8.copy()
+                    else:
+                        hit = (part_u8[:, 3] > 0) & (part_u8[:, 3] >= acc_u8[:, 3])
+                        acc_u8[hit] = part_u8[hit]
+                elif c_imb.float_data:
+                    buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
+                    part_f = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)
+                    if acc_f32 is None:
+                        acc_f32 = part_f.copy()
+                    else:
+                        hit = (part_f[:, 3] > 1e-5) & (part_f[:, 3] >= acc_f32[:, 3])
+                        acc_f32[hit] = part_f[hit]
+
+        if c_layer.ibuf:
+            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
+            if acc_u8 is not None and c_imb.byte_data:
+                buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
+                np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)[:] = acc_u8
+                c_layer.runtime_dirty = 1
+            elif acc_f32 is not None and c_imb.float_data:
+                buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
+                np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)[:] = acc_f32
+                c_layer.runtime_dirty = 1
+    finally:
+        c_data_slot.value = orig_mesh_ptr
+        for i in range(3):
+            c_layer.proj_location[i] = orig_loc[i]
+            c_layer.proj_rotation[i] = orig_rot[i]
+            c_layer.proj_scale[i] = orig_scl[i]
+        c_node_id.value = orig_node_id
+        _INTERNAL_REPROJECTING = False
+
+    _LAST_COLOR_PROJ_SIG[key] = sig
+    layer.opacity = layer.opacity
+    return True
+
+
 def _notify_gizmo_projection_changed(node, layer, context=None):
     if _is_layer_grunge_gizmo_eligible(node, layer):
         _evaluate_layer_grunge_mask(node, layer, context=context, force_reproject=True, from_gizmo=True, interactive=True)
+    elif layer is not None and layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
+        _reproject_color_layer_multi_object(node, layer, context=context, force=True)
 
 
 def _rotation_from_normal_and_up(normal_vec, up_hint):
@@ -2638,15 +2939,34 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
 
         coord = (event.mouse_region_x, event.mouse_region_y)
         ray_origin_world = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
-        ray_dir_world = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        ray_dir_world = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord).normalized()
+
+        sharing_obs, _first_c = _find_all_mesh_objects_for_node(node, context)
+        cand_obs = sharing_obs if sharing_obs else [ob]
+
+        best_dist_sq = 1e30
+        best_world_loc = None
+        best_world_no = None
+
+        for cand_ob in cand_obs:
+            c_inv = cand_ob.matrix_world.inverted_safe()
+            r_org = c_inv @ ray_origin_world
+            r_dir = (c_inv.to_3x3() @ ray_dir_world).normalized()
+            hit, h_loc, h_no, _f_idx = cand_ob.ray_cast(r_org, r_dir)
+            if hit:
+                w_loc = cand_ob.matrix_world @ h_loc
+                dist_sq = (w_loc - ray_origin_world).length_squared
+                if dist_sq < best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_world_loc = w_loc
+                    best_world_no = (c_inv.to_3x3().transposed() @ h_no).normalized()
+
+        if best_world_loc is None or best_world_no is None:
+            return False
 
         ob_inv = ob.matrix_world.inverted_safe()
-        ray_origin_obj = ob_inv @ ray_origin_world
-        ray_dir_obj = (ob_inv.to_3x3() @ ray_dir_world).normalized()
-
-        hit, hit_loc, hit_no, _face_idx = ob.ray_cast(ray_origin_obj, ray_dir_obj)
-        if not hit:
-            return False
+        hit_loc = ob_inv @ best_world_loc
+        hit_no = (ob_inv.to_3x3() @ best_world_no).normalized()
 
         view_inv = rv3d.view_matrix.inverted_safe()
         up_hint_obj = (ob_inv.to_3x3() @ Vector(view_inv.col[1][:3])).normalized()
@@ -3310,8 +3630,82 @@ def _compute_uv_gizmo_handles_px(region, center_u, center_v, half_u, half_v, rot
     }
 
 
+_2D_SELECTION_STATE = {}  # image_name -> {"mask": ndarray(H,W,float32), "contour_uv": ndarray(N,2,float32), "pct": float, "bbox": (u0,v0,u1,v1)}
+_2D_MODAL_DRAG_PREVIEW = {"active": False, "kind": "", "pts_uv": []}
+
+
+def _draw_2d_selection_and_tool_overlay(context, region):
+    """Draw the Krita-style 2D Selection Contour (marching-ants outline) and active modal tool drag wire in the Image Editor."""
+    space = getattr(context, "space_data", None)
+    ima = getattr(space, "image", None) if space else None
+    if ima is None:
+        return
+    sel_info = _2D_SELECTION_STATE.get(ima.name)
+    has_sel = sel_info is not None and sel_info.get("contour_uv") is not None and len(sel_info["contour_uv"]) > 0
+    has_drag = bool(_2D_MODAL_DRAG_PREVIEW.get("active") and _2D_MODAL_DRAG_PREVIEW.get("pts_uv"))
+    if not has_sel and not has_drag:
+        return
+
+    import gpu
+    import numpy as np
+    from gpu_extras.batch import batch_for_shader
+
+    v2d = region.view2d
+    x0, y0 = v2d.view_to_region(0.0, 0.0, clip=False)
+    x1, y1 = v2d.view_to_region(1.0, 1.0, clip=False)
+    sx_px = float(x1 - x0)
+    sy_px = float(y1 - y0)
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+
+    if has_sel:
+        c_uv = sel_info["contour_uv"]
+        px_pts = np.empty_like(c_uv)
+        px_pts[:, 0] = x0 + c_uv[:, 0] * sx_px
+        px_pts[:, 1] = y0 + c_uv[:, 1] * sy_px
+
+        # Dark backdrop pass + bright cyan/white Krita selection contour pass
+        gpu.state.line_width_set(3.0)
+        shader.bind()
+        shader.uniform_float("color", (0.04, 0.08, 0.14, 0.78))
+        batch_for_shader(shader, 'LINES', {"pos": px_pts}).draw(shader)
+
+        gpu.state.line_width_set(1.6)
+        shader.uniform_float("color", (0.22, 0.96, 1.0, 0.96))
+        batch_for_shader(shader, 'LINES', {"pos": px_pts}).draw(shader)
+
+        # Subtle selection bounding-box corner brackets
+        bbox = sel_info.get("bbox")
+        if bbox is not None:
+            bu0, bv0, bu1, bv1 = bbox
+            bx0, by0 = x0 + bu0 * sx_px, y0 + bv0 * sy_px
+            bx1, by1 = x0 + bu1 * sx_px, y0 + bv1 * sy_px
+            b_lines = [
+                (bx0, by0), (bx1, by0),
+                (bx1, by0), (bx1, by1),
+                (bx1, by1), (bx0, by1),
+                (bx0, by1), (bx0, by0),
+            ]
+            gpu.state.line_width_set(1.0)
+            shader.uniform_float("color", (1.0, 0.88, 0.25, 0.45))
+            batch_for_shader(shader, 'LINES', {"pos": b_lines}).draw(shader)
+
+    if has_drag:
+        pts_uv = _2D_MODAL_DRAG_PREVIEW["pts_uv"]
+        if len(pts_uv) >= 2:
+            d_pts = [(x0 + u * sx_px, y0 + v * sy_px) for (u, v) in pts_uv]
+            gpu.state.line_width_set(2.2)
+            shader.bind()
+            shader.uniform_float("color", (1.0, 0.85, 0.20, 0.95))
+            batch_for_shader(shader, 'LINES', {"pos": d_pts}).draw(shader)
+
+    gpu.state.line_width_set(1.0)
+    gpu.state.blend_set('NONE')
+
+
 def _draw_uv_projection_gizmo_2d():
-    """Draw the 3D Mesh UV layout overlay and interactive 2D UV Projection Gizmo in the Image Editor."""
+    """Draw the 3D Mesh UV layout overlay, Krita 2D Selection contour, and interactive 2D UV Projection Gizmo in the Image Editor."""
     if bpy.app.background:
         return
     context = bpy.context
@@ -3320,6 +3714,8 @@ def _draw_uv_projection_gizmo_2d():
     region = context.region
     if region is None or region.type != 'WINDOW':
         return
+
+    _draw_2d_selection_and_tool_overlay(context, region)
 
     ob, node, layer, target_kind, eff = _active_uv_projection_from_context(context)
     if node is None or layer is None or not getattr(layer, "show_projection_widget", False):
@@ -4755,6 +5151,7 @@ class NODE_OT_tex_paint_fill_layer_texture(Operator):
                 if is_2d:
                     layer.proj_scale = (2.0, 2.0, 1.0)
             layer.proj_image_name = ima.name
+            _reproject_color_layer_multi_object(node, layer, context=context, force=True)
 
         _tag_view3d_gizmo_refresh(context)
         return {'FINISHED'}
@@ -6433,6 +6830,100 @@ class NODE_OT_tex_paint_reconnect_live_layers(Operator):
         return {'FINISHED'}
 
 
+class NODE_OT_tex_paint_make_material_unique(Operator):
+    """Re-bake all shared modular models onto the shared material, or split the shared material into independent per-part materials"""
+    bl_idname = "node.tex_paint_make_material_unique"
+    bl_label = "Modular Shared Material Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Action",
+        items=(
+            ('REBAKE_ALL', "Re-Bake All Shared Models", "Re-evaluate all Mask Generators and 3D Projections across every mesh object sharing this material"),
+            ('ACTIVE_OBJECT', "Make Material Unique (Active Part)", "Duplicate this material and its canvas images for the active object so this part has its own independent material"),
+            ('ALL_SHARED_OBJECTS', "Split Material Across All Parts", "Give each modular mesh object sharing this material its own unique material & canvas copy and re-bake each part"),
+        ),
+        default='REBAKE_ALL',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return tex_paint_node_from_context(context) is not None
+
+    @staticmethod
+    def _rebake_node_layers(node, context):
+        if node is None:
+            return
+        for l_item in node.layers:
+            if getattr(l_item, "use_mask", False):
+                st = _get_layer_grunge_state(node, l_item)
+                if st.get("effects"):
+                    _evaluate_layer_grunge_mask(node, l_item, context=context, force_reproject=True, skip_absorb=True)
+            if l_item.type in {'PAINT', 'FILL'} and getattr(l_item, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
+                _reproject_color_layer_multi_object(node, l_item, context=context, force=True)
+
+    @staticmethod
+    def _clone_material_for_object(src_mat, target_ob, context):
+        new_mat = src_mat.copy()
+        new_mat.name = f"{src_mat.name}_{target_ob.name}"
+        if new_mat.node_tree is not None:
+            for n in new_mat.node_tree.nodes:
+                if n.bl_idname == "ShaderNodeTexPaint" and n.image is not None:
+                    new_ima = n.image.copy()
+                    new_ima.name = f"{new_mat.name}_BaseColor"
+                    new_ima.use_fake_user = True
+                    n_ptr = n.as_pointer()
+                    # Assign bNode::id (offset 216) to the new per-part master image
+                    ctypes.c_void_p.from_address(n_ptr + 216).value = new_ima.as_pointer()
+                    # Clear aux image pointers in NodeTexPaint (offsets 1072, 1080) so C++ allocates fresh per-part PBR/Emission images
+                    c_storage_ptr = ctypes.c_void_p.from_address(n_ptr + 224).value
+                    if c_storage_ptr:
+                        ctypes.c_void_p.from_address(c_storage_ptr + 1072).value = 0
+                        ctypes.c_void_p.from_address(c_storage_ptr + 1080).value = 0
+                    if len(n.layers) > 0:
+                        n.layers[0].opacity = n.layers[0].opacity
+        for slot in target_ob.material_slots:
+            if slot.material == src_mat:
+                slot.material = new_mat
+        if new_mat.node_tree is not None:
+            for n in new_mat.node_tree.nodes:
+                if n.bl_idname == "ShaderNodeTexPaint":
+                    NODE_OT_tex_paint_make_material_unique._rebake_node_layers(n, context)
+        return new_mat
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        if node is None:
+            return {'CANCELLED'}
+        mat = _get_material_for_node(node, context)
+        sharing_obs, _first_c = _find_all_mesh_objects_for_node(node, context)
+
+        if self.mode == 'REBAKE_ALL' or mat is None or len(sharing_obs) <= 1:
+            self._rebake_node_layers(node, context)
+            _tag_view3d_gizmo_refresh(context)
+            self.report({'INFO'}, f"Re-baked Generators & 3D Projections across {max(len(sharing_obs), 1)} model(s)")
+            return {'FINISHED'}
+
+        active_ob = getattr(context, "active_object", None) or sharing_obs[-1]
+        if self.mode == 'ACTIVE_OBJECT' and active_ob in sharing_obs:
+            new_mat = self._clone_material_for_object(mat, active_ob, context)
+            self._rebake_node_layers(node, context)
+            _tag_view3d_gizmo_refresh(context)
+            self.report({'INFO'}, f"Created unique material '{new_mat.name}' for '{active_ob.name}'")
+            return {'FINISHED'}
+
+        if self.mode == 'ALL_SHARED_OBJECTS':
+            # Keep the original material on the first object, and clone unique materials for all other objects
+            for ob_part in sharing_obs[1:]:
+                self._clone_material_for_object(mat, ob_part, context)
+            self._rebake_node_layers(node, context)
+            _tag_view3d_gizmo_refresh(context)
+            self.report({'INFO'}, f"Split shared material across {len(sharing_obs)} modular objects")
+            return {'FINISHED'}
+
+        return {'CANCELLED'}
+
+
 class TEXPAINT_MT_layer_specials(Menu):
     """Special layer operations (Fill, Clear, Invert, Flip, Rasterize, Copy Mask, Merge Visible, Flatten, Export Texture Set)"""
     bl_idname = "TEXPAINT_MT_layer_specials"
@@ -6441,6 +6932,10 @@ class TEXPAINT_MT_layer_specials(Menu):
     def draw(self, _context):
         layout = self.layout
         layout.operator("node.tex_paint_export_texture_set", text="Export / Bake PBR Texture Set...", icon='EXPORT')
+        layout.separator()
+        layout.operator("node.tex_paint_make_material_unique", text="Re-Bake All Shared Models", icon='FILE_REFRESH').mode = 'REBAKE_ALL'
+        layout.operator("node.tex_paint_make_material_unique", text="Make Material Unique (Active Part)", icon='DUPLICATE').mode = 'ACTIVE_OBJECT'
+        layout.operator("node.tex_paint_make_material_unique", text="Split Shared Material Across All Parts", icon='MOD_EXPLODE').mode = 'ALL_SHARED_OBJECTS'
         layout.separator()
         layout.operator("node.tex_paint_layer_pixel_action", text="Fill Layer with Brush Color", icon='COLOR').action = 'FILL_BRUSH'
         layout.operator("node.tex_paint_layer_pixel_action", text="Clear Layer to Transparent", icon='TRASH').action = 'CLEAR'
@@ -7290,6 +7785,15 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
         col.operator("node.tex_paint_canvas_new", text="New Multilayer Texture Canvas", icon='ADD')
         return
 
+    if not is_2d_only and not compact:
+        sharing_obs, _first_c = _find_all_mesh_objects_for_node(node, context)
+        if len(sharing_obs) > 1:
+            sh_row = layout.row(align=True)
+            sh_row.label(text=f"Shared ({len(sharing_obs)} Parts):", icon='LINKED')
+            sh_row.operator("node.tex_paint_make_material_unique", text="Re-Bake All", icon='FILE_REFRESH').mode = 'REBAKE_ALL'
+            sh_row.operator("node.tex_paint_make_material_unique", text="Unique Part", icon='DUPLICATE').mode = 'ACTIVE_OBJECT'
+            sh_row.operator("node.tex_paint_make_material_unique", text="Split All", icon='MOD_EXPLODE').mode = 'ALL_SHARED_OBJECTS'
+
     # 1. Layer Stack List + Right-Side Column (Up ▲, Add + Dropdown in the middle, Down ▼, Remove -, Specials ▾)
     row = layout.row()
     row.template_list(
@@ -7712,7 +8216,8 @@ def _sync_2d_image_to_3d_projections(context, ima):
             for l_3d in node_3d.layers:
                 if l_3d.type == 'PAINT' and getattr(l_3d, "proj_mode", 'NONE') != 'NONE':
                     if getattr(l_3d, "proj_image_name", "") == ima_name:
-                        l_3d.proj_blend_falloff = l_3d.proj_blend_falloff
+                        if not _reproject_color_layer_multi_object(node_3d, l_3d, context=context, force=True):
+                            l_3d.proj_blend_falloff = l_3d.proj_blend_falloff
                 if getattr(l_3d, "use_mask", False):
                     st = _get_layer_grunge_state(node_3d, l_3d)
                     for eff in st.get("effects", []):
@@ -7781,6 +8286,259 @@ def _write_active_2d_rgba_f32(context, ima, node, layer, rgba_f32):
     ima.pixels.foreach_set(rgba_f32.ravel())
     ima.update()
     _sync_2d_image_to_3d_projections(context, ima)
+
+
+# ---------------------------------------------------------------------------
+# Krita-Style 2D Selection Engine (Magic Wand, Marquee, Lasso & Contour Cache)
+# ---------------------------------------------------------------------------
+
+def _get_2d_selection_mask(ima, w=0, h=0):
+    """Return the active float32[H, W] selection mask in [0..1] for `ima`, or None if no selection is active."""
+    if ima is None:
+        return None
+    info = _2D_SELECTION_STATE.get(ima.name)
+    if info is None:
+        return None
+    m = info.get("mask")
+    if m is None:
+        return None
+    if w > 0 and h > 0 and m.shape != (h, w):
+        return None
+    return m
+
+
+def _compute_selection_contour_uv(mask_f32):
+    """Extract vectorized pixel-boundary line segments in [0, 1] UV space where mask crosses 0.5."""
+    import numpy as np
+    h, w = mask_f32.shape
+    b = mask_f32 >= 0.5
+    if not np.any(b):
+        return None, 0.0, None
+
+    ys_all, xs_all = np.nonzero(b)
+    pct = float(len(ys_all)) * 100.0 / float(max(w * h, 1))
+    bbox = (
+        float(xs_all.min()) / float(w),
+        float(ys_all.min()) / float(h),
+        float(xs_all.max() + 1) / float(w),
+        float(ys_all.max() + 1) / float(h),
+    )
+
+    segs_u0 = []
+    segs_v0 = []
+    segs_u1 = []
+    segs_v1 = []
+
+    # Vertical edges between col x and col x+1
+    vy, vx = np.nonzero(b[:, :-1] != b[:, 1:])
+    if len(vx) > 0:
+        u = (vx.astype(np.float32) + 1.0) / float(w)
+        segs_u0.append(u)
+        segs_u1.append(u)
+        segs_v0.append(vy.astype(np.float32) / float(h))
+        segs_v1.append((vy.astype(np.float32) + 1.0) / float(h))
+
+    # Horizontal edges between row y and row y+1
+    hy, hx = np.nonzero(b[:-1, :] != b[1:, :])
+    if len(hy) > 0:
+        v = (hy.astype(np.float32) + 1.0) / float(h)
+        segs_u0.append(hx.astype(np.float32) / float(w))
+        segs_u1.append((hx.astype(np.float32) + 1.0) / float(w))
+        segs_v0.append(v)
+        segs_v1.append(v)
+
+    # Border edges where selection touches canvas edge
+    bx0 = np.nonzero(b[:, 0])[0]
+    if len(bx0) > 0:
+        z = np.zeros(len(bx0), dtype=np.float32)
+        segs_u0.append(z)
+        segs_u1.append(z)
+        segs_v0.append(bx0.astype(np.float32) / float(h))
+        segs_v1.append((bx0.astype(np.float32) + 1.0) / float(h))
+
+    bx1 = np.nonzero(b[:, -1])[0]
+    if len(bx1) > 0:
+        o = np.ones(len(bx1), dtype=np.float32)
+        segs_u0.append(o)
+        segs_u1.append(o)
+        segs_v0.append(bx1.astype(np.float32) / float(h))
+        segs_v1.append((bx1.astype(np.float32) + 1.0) / float(h))
+
+    by0 = np.nonzero(b[0, :])[0]
+    if len(by0) > 0:
+        z = np.zeros(len(by0), dtype=np.float32)
+        segs_u0.append(by0.astype(np.float32) / float(w))
+        segs_u1.append((by0.astype(np.float32) + 1.0) / float(w))
+        segs_v0.append(z)
+        segs_v1.append(z)
+
+    by1 = np.nonzero(b[-1, :])[0]
+    if len(by1) > 0:
+        o = np.ones(len(by1), dtype=np.float32)
+        segs_u0.append(by1.astype(np.float32) / float(w))
+        segs_u1.append((by1.astype(np.float32) + 1.0) / float(w))
+        segs_v0.append(o)
+        segs_v1.append(o)
+
+    if not segs_u0:
+        return None, pct, bbox
+
+    u0_cat = np.concatenate(segs_u0)
+    v0_cat = np.concatenate(segs_v0)
+    u1_cat = np.concatenate(segs_u1)
+    v1_cat = np.concatenate(segs_v1)
+
+    n_segs = len(u0_cat)
+    if n_segs > 12000:
+        step = max(1, n_segs // 12000)
+        u0_cat = u0_cat[::step]
+        v0_cat = v0_cat[::step]
+        u1_cat = u1_cat[::step]
+        v1_cat = v1_cat[::step]
+        n_segs = len(u0_cat)
+
+    pts = np.empty((n_segs * 2, 2), dtype=np.float32)
+    pts[0::2, 0] = u0_cat
+    pts[0::2, 1] = v0_cat
+    pts[1::2, 0] = u1_cat
+    pts[1::2, 1] = v1_cat
+    return pts, pct, bbox
+
+
+def _set_2d_selection_mask(ima, mask_f32, context=None):
+    """Store `mask_f32` (float32[H, W] in [0..1]) as the active 2D selection for `ima` and refresh the Image Editor."""
+    import numpy as np
+    if ima is None:
+        return
+    if mask_f32 is None:
+        _2D_SELECTION_STATE.pop(ima.name, None)
+        _tag_view3d_gizmo_refresh(context)
+        return
+
+    m = np.clip(mask_f32, 0.0, 1.0).astype(np.float32, copy=False)
+    if float(m.max()) < 0.01:
+        _2D_SELECTION_STATE.pop(ima.name, None)
+        _tag_view3d_gizmo_refresh(context)
+        return
+
+    contour_uv, pct, bbox = _compute_selection_contour_uv(m)
+    if contour_uv is None:
+        _2D_SELECTION_STATE.pop(ima.name, None)
+    else:
+        _2D_SELECTION_STATE[ima.name] = {
+            "active": True,
+            "mask": m,
+            "contour_uv": contour_uv,
+            "pct": pct,
+            "bbox": bbox,
+        }
+    _tag_view3d_gizmo_refresh(context)
+
+
+def _combine_2d_selection(old_mask, new_mask, combine_mode):
+    import numpy as np
+    if old_mask is None or old_mask.shape != new_mask.shape or combine_mode == 'REPLACE':
+        return new_mask
+    if combine_mode == 'ADD':
+        return np.maximum(old_mask, new_mask)
+    if combine_mode == 'SUBTRACT':
+        return np.clip(old_mask - new_mask, 0.0, 1.0)
+    if combine_mode == 'INTERSECT':
+        return np.minimum(old_mask, new_mask)
+    return new_mask
+
+
+def _apply_2d_edit_with_selection(orig_rgba, new_rgba, ima):
+    """If `ima` has an active 2D selection mask, blend `new_rgba` only inside the selection mask."""
+    h, w, _ = orig_rgba.shape
+    sel_m = _get_2d_selection_mask(ima, w, h)
+    if sel_m is None:
+        return new_rgba
+    w_m = sel_m[:, :, None]
+    return orig_rgba * (1.0 - w_m) + new_rgba * w_m
+
+
+def _flood_fill_connected_2d(within_bool, seed_y, seed_x):
+    """Fast pure-NumPy 4-connected flood-fill component containing `(seed_y, seed_x)` (< 2ms at 1K-4K)."""
+    import numpy as np
+    h, w = within_bool.shape
+    sy = max(0, min(int(seed_y), h - 1))
+    sx = max(0, min(int(seed_x), w - 1))
+    if not within_bool[sy, sx]:
+        within_bool = within_bool.copy()
+        within_bool[sy, sx] = True
+
+    def _dilate_flood(grid_bool, start_y, start_x, max_iters=512):
+        gh, gw = grid_bool.shape
+        vis = np.zeros((gh, gw), dtype=bool)
+        vis[start_y, start_x] = True
+        for _ in range(max_iters):
+            nxt = vis.copy()
+            nxt[1:, :] |= vis[:-1, :]
+            nxt[:-1, :] |= vis[1:, :]
+            nxt[:, 1:] |= vis[:, :-1]
+            nxt[:, :-1] |= vis[:, 1:]
+            nxt &= grid_bool
+            if np.array_equal(nxt, vis):
+                break
+            vis = nxt
+        return vis
+
+    # Multi-grid acceleration for large canvases (> 256px) so interactive dragging stays > 60 FPS
+    stride = max(1, max(h, w) // 192)
+    if stride <= 1:
+        return _dilate_flood(within_bool, sy, sx, max_iters=max(h, w) * 2)
+
+    coarse = within_bool[::stride, ::stride].copy()
+    cy = min(sy // stride, coarse.shape[0] - 1)
+    cx = min(sx // stride, coarse.shape[1] - 1)
+    coarse[cy, cx] = True
+    c_vis = _dilate_flood(coarse, cy, cx, max_iters=coarse.shape[0] + coarse.shape[1] + 64)
+
+    # Dilate coarse mask by 1 coarse cell to cover boundary transitions cleanly, then upsample & refine
+    c_pad = c_vis.copy()
+    c_pad[1:, :] |= c_vis[:-1, :]
+    c_pad[:-1, :] |= c_vis[1:, :]
+    c_pad[:, 1:] |= c_vis[:, :-1]
+    c_pad[:, :-1] |= c_vis[:, 1:]
+
+    up = np.repeat(np.repeat(c_pad, stride, axis=0), stride, axis=1)[:h, :w]
+    fine = up & within_bool
+    fine[sy, sx] = True
+    return _dilate_flood(c_vis if stride == 1 else fine, sy, sx, max_iters=stride * 2 + 4) if stride <= 2 else fine
+
+
+def _compute_magic_wand_mask(rgba_f32, seed_x, seed_y, tolerance, contiguous=True, feather_px=0):
+    """Compute a [0..1] float32 Magic Wand selection mask from `rgba_f32` around `(seed_x, seed_y)`."""
+    import numpy as np
+    h, w, _ = rgba_f32.shape
+    sx = max(0, min(int(seed_x), w - 1))
+    sy = max(0, min(int(seed_y), h - 1))
+    seed_col = rgba_f32[sy, sx]
+    tol = max(float(tolerance), 0.002)
+
+    # Perceptual weighted max + Euclidean RGB/Alpha distance
+    diff = np.abs(rgba_f32 - seed_col[None, None, :])
+    # Weight RGB by alpha if both seed and pixel are transparent, otherwise include alpha difference
+    if float(seed_col[3]) < 0.02:
+        dist = diff[:, :, 3]
+    else:
+        rgb_dist = np.sqrt((diff[:, :, 0] ** 2 + diff[:, :, 1] ** 2 + diff[:, :, 2] ** 2) * (1.0 / 3.0))
+        dist = np.maximum(rgb_dist, diff[:, :, 3] * 0.85)
+
+    within = dist <= tol
+    within[sy, sx] = True
+
+    if contiguous:
+        conn = _flood_fill_connected_2d(within, sy, sx)
+        mask_f = conn.astype(np.float32)
+    else:
+        soft = max(tol * 0.15, 0.005)
+        mask_f = np.clip((tol + soft - dist) / soft, 0.0, 1.0).astype(np.float32)
+
+    if int(feather_px) > 0:
+        mask_f = IMAGE_OT_tex_paint_2d_fx._box_blur_2d(mask_f, int(feather_px))
+    return mask_f
 
 
 class IMAGE_OT_tex_paint_new_2d_canvas(Operator):
@@ -8057,6 +8815,7 @@ class IMAGE_OT_tex_paint_2d_shape(Operator):
         ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
         if rgba is None:
             return {'CANCELLED'}
+        orig_rgba = rgba.copy()
 
         # Read active brush color
         col_rgb, _ = _get_current_brush_colors(context)
@@ -8122,6 +8881,7 @@ class IMAGE_OT_tex_paint_2d_shape(Operator):
             rgba[:, :, :3] = (src_rgb * mask + rgba[:, :, :3] * rgba[:, :, 3:4] * (1.0 - mask)) / safe_a
             rgba[:, :, 3:4] = out_a
 
+        rgba = _apply_2d_edit_with_selection(orig_rgba, rgba, ima)
         _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
         return {'FINISHED'}
 
@@ -8137,13 +8897,17 @@ class IMAGE_OT_tex_paint_2d_fx(Operator):
         items=(
             ('OUTLINE', "Outline Alpha (Stroke)", "Draw a colored stroke outline around painted opaque shapes"),
             ('SHADOW', "Drop Shadow / Glow", "Add a soft outer shadow or glow behind transparent logo shapes"),
-            ('BLUR', "Gaussian Blur", "Smoothly blur the 2D image or active layer"),
+            ('BLUR', "Gaussian Blur", "Smoothly blur the 2D image or active layer (or active selection)"),
             ('SHARPEN', "Sharpen (Unsharp Mask)", "Enhance crispness and edge contrast"),
             ('COLOR_TO_ALPHA_WHITE', "White BG -> Transparent", "Convert white background into clean alpha transparency (Krita Color-to-Alpha)"),
             ('COLOR_TO_ALPHA_BLACK', "Black BG -> Transparent", "Convert black background into clean alpha transparency"),
             ('INVERT_RGB', "Invert Colors", "Invert RGB channels"),
-            ('CLEAR_TRANSPARENT', "Clear to Transparent", "Clear the active 2D layer or image to 100% transparent"),
-            ('FILL_BRUSH', "Fill with Brush Color", "Fill the active 2D layer or image with the current brush color"),
+            ('AUTO_CONTRAST', "Auto Levels / Contrast", "Stretch RGB luminance histogram across [0..1]"),
+            ('THRESHOLD', "Threshold (High-Contrast B&W)", "Convert image to crisp black-and-white stencil around midpoint"),
+            ('POSTERIZE', "Posterize (Quantize Colors)", "Quantize tonal steps for stylized / cel-shaded decals"),
+            ('PIXELATE', "Pixelate / Mosaic", "Pixelate the image or selection into crisp blocks"),
+            ('CLEAR_TRANSPARENT', "Clear to Transparent", "Clear the active 2D layer (or active selection) to 100% transparent"),
+            ('FILL_BRUSH', "Fill with Brush Color", "Fill the active 2D layer (or active selection) with the current brush color"),
         ),
         default='OUTLINE',
     )
@@ -8173,6 +8937,7 @@ class IMAGE_OT_tex_paint_2d_fx(Operator):
         ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
         if rgba is None:
             return {'CANCELLED'}
+        orig_rgba = rgba.copy()
 
         col_rgb, _ = _get_current_brush_colors(context)
         if col_rgb is None:
@@ -8187,6 +8952,27 @@ class IMAGE_OT_tex_paint_2d_fx(Operator):
             rgba[:, :, 3] = 1.0
         elif self.effect == 'INVERT_RGB':
             rgba[:, :, :3] = 1.0 - rgba[:, :, :3]
+        elif self.effect == 'AUTO_CONTRAST':
+            op_mask = rgba[:, :, 3] > 0.01
+            if np.any(op_mask):
+                lo = float(np.percentile(rgba[:, :, :3][op_mask], 1.0))
+                hi = float(np.percentile(rgba[:, :, :3][op_mask], 99.0))
+                if hi - lo > 1e-4:
+                    rgba[:, :, :3] = np.clip((rgba[:, :, :3] - lo) / (hi - lo), 0.0, 1.0)
+        elif self.effect == 'THRESHOLD':
+            lum = 0.2126 * rgba[:, :, 0] + 0.7152 * rgba[:, :, 1] + 0.0722 * rgba[:, :, 2]
+            thr = max(0.05, min(0.95, 1.0 - self.strength * 0.5))
+            bw = (lum >= thr).astype(np.float32)
+            rgba[:, :, 0] = bw
+            rgba[:, :, 1] = bw
+            rgba[:, :, 2] = bw
+        elif self.effect == 'POSTERIZE':
+            steps = float(max(2, min(16, int(self.radius_px))))
+            rgba[:, :, :3] = np.round(rgba[:, :, :3] * steps) / steps
+        elif self.effect == 'PIXELATE':
+            blk = max(2, min(64, int(self.radius_px)))
+            small = rgba[::blk, ::blk, :]
+            rgba = np.repeat(np.repeat(small, blk, axis=0), blk, axis=1)[:h, :w, :].copy()
         elif self.effect == 'COLOR_TO_ALPHA_WHITE':
             lum = np.max(rgba[:, :, :3], axis=2)
             new_a = np.clip((1.0 - lum) * self.strength, 0.0, 1.0)
@@ -8226,8 +9012,1086 @@ class IMAGE_OT_tex_paint_2d_fx(Operator):
             rgba[:, :, :3] = (rgba[:, :, :3] * rgba[:, :, 3:4]) / safe_a
             rgba[:, :, 3:4] = out_a
 
+        rgba = _apply_2d_edit_with_selection(orig_rgba, rgba, ima)
         _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
         return {'FINISHED'}
+
+
+class IMAGE_OT_tex_paint_2d_magic_wand(Operator):
+    """Krita Magic Wand / Contiguous Color Selection Tool (Click pixel in 2D Image Editor, drag left/right to adjust tolerance live; Shift=Add, Alt=Subtract)"""
+    bl_idname = "image.tex_paint_2d_magic_wand"
+    bl_label = "Magic Wand Select (2D)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    tolerance: FloatProperty(name="Tolerance", min=0.002, max=1.0, default=0.14, subtype='FACTOR')
+    contiguous: BoolProperty(name="Contiguous (Flood Fill)", default=True)
+    sample_merged: BoolProperty(name="Sample Merged Canvas", default=True)
+    feather_px: IntProperty(name="Feather (px)", min=0, max=32, default=0)
+    combine_mode: EnumProperty(
+        name="Mode",
+        items=(
+            ('REPLACE', "Replace Selection", "Replace active selection"),
+            ('ADD', "Add (Shift)", "Add to active selection"),
+            ('SUBTRACT', "Subtract (Alt)", "Subtract from active selection"),
+            ('INTERSECT', "Intersect", "Intersect with active selection"),
+        ),
+        default='REPLACE',
+    )
+    seed_u: FloatProperty(name="Seed U", min=0.0, max=1.0, default=0.5)
+    seed_v: FloatProperty(name="Seed V", min=0.0, max=1.0, default=0.5)
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    def _compute_and_apply(self, context):
+        sx = int(round(self.seed_u * (self._w - 1)))
+        sy = int(round(self.seed_v * (self._h - 1)))
+        new_mask = _compute_magic_wand_mask(
+            self._sample_rgba, sx, sy, self.tolerance, contiguous=self.contiguous, feather_px=self.feather_px
+        )
+        combined = _combine_2d_selection(self._prev_sel, new_mask, self.combine_mode)
+        _set_2d_selection_mask(self._ima, combined, context)
+
+    def execute(self, context):
+        import numpy as np
+        ima, _node, _layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        self._ima, self._w, self._h = ima, w, h
+        if self.sample_merged and int(ima.size[0]) == w and int(ima.size[1]) == h:
+            buf = np.empty(w * h * 4, dtype=np.float32)
+            ima.pixels.foreach_get(buf)
+            self._sample_rgba = buf.reshape(h, w, 4)
+        else:
+            self._sample_rgba = rgba
+        self._prev_sel = _get_2d_selection_mask(ima, w, h)
+        self._compute_and_apply(context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        import numpy as np
+        wm = getattr(context, "window_manager", None)
+        if wm is not None:
+            self.tolerance = float(getattr(wm, "tex_paint_2d_wand_tolerance", self.tolerance))
+            self.contiguous = bool(getattr(wm, "tex_paint_2d_wand_contiguous", self.contiguous))
+            self.sample_merged = bool(getattr(wm, "tex_paint_2d_wand_merged", self.sample_merged))
+            self.feather_px = int(getattr(wm, "tex_paint_2d_sel_feather", self.feather_px))
+
+        if event.shift and event.alt:
+            self.combine_mode = 'INTERSECT'
+        elif event.shift:
+            self.combine_mode = 'ADD'
+        elif event.alt:
+            self.combine_mode = 'SUBTRACT'
+
+        ima, _node, _layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        self._ima, self._w, self._h = ima, w, h
+        if self.sample_merged and int(ima.size[0]) == w and int(ima.size[1]) == h:
+            buf = np.empty(w * h * 4, dtype=np.float32)
+            ima.pixels.foreach_get(buf)
+            self._sample_rgba = buf.reshape(h, w, 4)
+        else:
+            self._sample_rgba = rgba
+        self._prev_sel = _get_2d_selection_mask(ima, w, h)
+        if self._prev_sel is not None:
+            self._prev_sel = self._prev_sel.copy()
+
+        self._waiting_for_click = True
+        if context.region and context.region.type == 'WINDOW':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                self.seed_u = float(u)
+                self.seed_v = float(v)
+                self._start_x = event.mouse_region_x
+                self._start_tol = self.tolerance
+                self._waiting_for_click = False
+                self._compute_and_apply(context)
+
+        context.window.cursor_modal_set('EYEDROPPER')
+        context.area.header_text_set(
+            "Magic Wand (2D): Click image to select color region | Drag Left/Right = Adjust Tolerance | Shift=Add, Alt=Subtract | Esc=Cancel"
+        )
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            _set_2d_selection_mask(self._ima, self._prev_sel, context)
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'CANCELLED'}
+
+        if self._waiting_for_click:
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                self.seed_u = min(max(float(u), 0.0), 1.0)
+                self.seed_v = min(max(float(v), 0.0), 1.0)
+                if event.shift and event.alt:
+                    self.combine_mode = 'INTERSECT'
+                elif event.shift:
+                    self.combine_mode = 'ADD'
+                elif event.alt:
+                    self.combine_mode = 'SUBTRACT'
+                self._start_x = event.mouse_region_x
+                self._start_tol = self.tolerance
+                self._waiting_for_click = False
+                self._compute_and_apply(context)
+                return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            dx = (event.mouse_region_x - self._start_x) / 280.0
+            if abs(dx) > 0.008:
+                self.tolerance = min(max(self._start_tol + dx, 0.005), 0.98)
+                wm = getattr(context, "window_manager", None)
+                if wm is not None and hasattr(wm, "tex_paint_2d_wand_tolerance"):
+                    wm.tex_paint_2d_wand_tolerance = self.tolerance
+                self._compute_and_apply(context)
+                context.area.header_text_set(
+                    f"Magic Wand Tolerance: {self.tolerance * 100.0:.1f}% ({'Contiguous' if self.contiguous else 'Global Color'}) — Release LMB to confirm"
+                )
+            return {'RUNNING_MODAL'}
+
+        if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value == 'RELEASE':
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_tex_paint_2d_marquee_select(Operator):
+    """Krita Rectangular, Elliptical & Freehand Lasso Selection Tool in the 2D Image Editor (Shift=Add, Alt=Subtract)"""
+    bl_idname = "image.tex_paint_2d_marquee_select"
+    bl_label = "Marquee / Lasso Select (2D)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    shape: EnumProperty(
+        name="Shape",
+        items=(
+            ('BOX', "Rectangle Select", "Drag a rectangular marquee selection"),
+            ('ELLIPSE', "Ellipse / Circle Select", "Drag an elliptical or circular marquee selection"),
+            ('LASSO', "Freehand Lasso Select", "Draw a freehand lasso polygon selection"),
+        ),
+        default='BOX',
+    )
+    combine_mode: EnumProperty(
+        name="Mode",
+        items=(
+            ('REPLACE', "Replace Selection", "Replace active selection"),
+            ('ADD', "Add (Shift)", "Add to active selection"),
+            ('SUBTRACT', "Subtract (Alt)", "Subtract from active selection"),
+            ('INTERSECT', "Intersect", "Intersect with active selection"),
+        ),
+        default='REPLACE',
+    )
+    feather_px: IntProperty(name="Feather (px)", min=0, max=32, default=0)
+    u0: FloatProperty(default=0.2)
+    v0: FloatProperty(default=0.2)
+    u1: FloatProperty(default=0.8)
+    v1: FloatProperty(default=0.8)
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    def _rasterize_and_commit(self, context, pts_uv=None):
+        import numpy as np
+        ima = context.space_data.image
+        w, h = int(ima.size[0]), int(ima.size[1])
+        if w <= 0 or h <= 0:
+            return
+        prev_sel = getattr(self, "_prev_sel", _get_2d_selection_mask(ima, w, h))
+
+        ys = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
+        xs = (np.arange(w, dtype=np.float32) + 0.5) / float(w)
+
+        if self.shape == 'BOX':
+            u_min, u_max = min(self.u0, self.u1), max(self.u0, self.u1)
+            v_min, v_max = min(self.v0, self.v1), max(self.v0, self.v1)
+            mask = ((xs[None, :] >= u_min) & (xs[None, :] <= u_max) & (ys[:, None] >= v_min) & (ys[:, None] <= v_max)).astype(np.float32)
+        elif self.shape == 'ELLIPSE':
+            cu = 0.5 * (self.u0 + self.u1)
+            cv = 0.5 * (self.v0 + self.v1)
+            ru = max(0.5 * abs(self.u1 - self.u0), 1.0 / w)
+            rv = max(0.5 * abs(self.v1 - self.v0), 1.0 / h)
+            d = ((xs[None, :] - cu) / ru) ** 2 + ((ys[:, None] - cv) / rv) ** 2
+            mask = (d <= 1.0).astype(np.float32)
+        else:  # LASSO polygon rasterization via vectorized ray-crossing
+            poly = pts_uv if pts_uv and len(pts_uv) >= 3 else [(self.u0, self.v0), (self.u1, self.v0), (self.u1, self.v1), (self.u0, self.v1)]
+            inside = np.zeros((h, w), dtype=bool)
+            gx = xs[None, :]
+            gy = ys[:, None]
+            n = len(poly)
+            for i in range(n):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % n]
+                cond = (y1 > gy) != (y2 > gy)
+                dy = y2 - y1
+                if abs(dy) > 1e-7:
+                    x_int = (x2 - x1) * (gy - y1) / dy + x1
+                    inside ^= cond & (gx < x_int)
+            mask = inside.astype(np.float32)
+
+        if int(self.feather_px) > 0:
+            mask = IMAGE_OT_tex_paint_2d_fx._box_blur_2d(mask, int(self.feather_px))
+        combined = _combine_2d_selection(prev_sel, mask, self.combine_mode)
+        _set_2d_selection_mask(ima, combined, context)
+
+    def execute(self, context):
+        self._rasterize_and_commit(context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        wm = getattr(context, "window_manager", None)
+        if wm is not None:
+            self.feather_px = int(getattr(wm, "tex_paint_2d_sel_feather", self.feather_px))
+        if event.shift and event.alt:
+            self.combine_mode = 'INTERSECT'
+        elif event.shift:
+            self.combine_mode = 'ADD'
+        elif event.alt:
+            self.combine_mode = 'SUBTRACT'
+
+        ima = context.space_data.image
+        w, h = int(ima.size[0]), int(ima.size[1])
+        self._prev_sel = _get_2d_selection_mask(ima, w, h)
+        if self._prev_sel is not None:
+            self._prev_sel = self._prev_sel.copy()
+
+        self._dragging = False
+        self._lasso_pts = []
+        if context.region and context.region.type == 'WINDOW' and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+                self.u0 = self.u1 = float(u)
+                self.v0 = self.v1 = float(v)
+                self._lasso_pts = [(float(u), float(v))]
+                self._dragging = True
+
+        context.window.cursor_modal_set('CROSSHAIR')
+        context.area.header_text_set(
+            f"2D {self.shape.title()} Select: Click & drag on image | Shift=Add, Alt=Subtract | Esc=Cancel"
+        )
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            _2D_MODAL_DRAG_PREVIEW["active"] = False
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            _tag_view3d_gizmo_refresh(context)
+            return {'CANCELLED'}
+
+        if not self._dragging:
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                if event.shift and event.alt:
+                    self.combine_mode = 'INTERSECT'
+                elif event.shift:
+                    self.combine_mode = 'ADD'
+                elif event.alt:
+                    self.combine_mode = 'SUBTRACT'
+                self.u0 = self.u1 = float(u)
+                self.v0 = self.v1 = float(v)
+                self._lasso_pts = [(float(u), float(v))]
+                self._dragging = True
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            self.u1 = float(u)
+            self.v1 = float(v)
+            if self.shape == 'LASSO':
+                if not self._lasso_pts or math.hypot(u - self._lasso_pts[-1][0], v - self._lasso_pts[-1][1]) > 0.004:
+                    self._lasso_pts.append((float(u), float(v)))
+                pts = self._lasso_pts + [self._lasso_pts[0]]
+            elif self.shape == 'ELLIPSE':
+                cu, cv = 0.5 * (self.u0 + self.u1), 0.5 * (self.v0 + self.v1)
+                ru, rv = 0.5 * (self.u1 - self.u0), 0.5 * (self.v1 - self.v0)
+                pts = [(cu + ru * math.cos(a), cv + rv * math.sin(a)) for a in [i * 2.0 * math.pi / 40.0 for i in range(41)]]
+            else:
+                pts = [(self.u0, self.v0), (self.u1, self.v0), (self.u1, self.v1), (self.u0, self.v1), (self.u0, self.v0)]
+            _2D_MODAL_DRAG_PREVIEW["active"] = True
+            _2D_MODAL_DRAG_PREVIEW["mode"] = self.shape
+            _2D_MODAL_DRAG_PREVIEW["points_uv"] = pts
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            _2D_MODAL_DRAG_PREVIEW["active"] = False
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            self._rasterize_and_commit(context, self._lasso_pts)
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_tex_paint_2d_select_action(Operator):
+    """Krita 2D Selection Modifiers & Pixel Actions (Invert, Grow, Shrink, Feather, Delete Pixels, Fill, Stroke, Extract to Layer, Convert to Mask)"""
+    bl_idname = "image.tex_paint_2d_select_action"
+    bl_label = "2D Selection Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: EnumProperty(
+        name="Action",
+        items=(
+            ('SELECT_ALL', "Select All", "Select the entire 2D canvas"),
+            ('DESELECT', "Deselect (Clear Selection)", "Clear the active 2D selection"),
+            ('INVERT_SEL', "Invert Selection", "Invert the active 2D selection"),
+            ('SELECT_OPAQUE', "Select Opaque Pixels (Alpha > 0)", "Select all non-transparent pixels on the active layer or image"),
+            ('GROW', "Grow / Expand Selection", "Expand the active selection outward by Radius px"),
+            ('SHRINK', "Shrink / Contract Selection", "Contract the active selection inward by Radius px"),
+            ('FEATHER', "Feather / Smooth Selection", "Soften the edges of the active selection by Radius px"),
+            ('BORDER', "Border Selection (Ring)", "Convert the active selection into a border ring of width Radius px"),
+            ('DELETE_PIXELS', "Delete / Erase Selected Pixels", "Erase pixels inside the active selection to transparent"),
+            ('CROP_TO_SEL', "Keep Only Selection (Erase Outside)", "Erase all pixels outside the active selection (Cutout / Crop)"),
+            ('FILL_SEL', "Fill Selection with Brush Color", "Fill the active selection with the current brush color"),
+            ('STROKE_SEL', "Stroke Selection Outline", "Draw a colored stroke outline along the active selection border"),
+            ('EXTRACT_LAYER', "Duplicate Selection to New 2D Layer", "Copy the selected pixels onto a new 2D layer above"),
+            ('CUT_TO_LAYER', "Cut Selection to New 2D Layer", "Move (cut) the selected pixels onto a new 2D layer above"),
+            ('SEL_TO_MASK', "Convert Selection to Layer Mask", "Apply the active 2D selection as the layer mask on the active layer"),
+        ),
+        default='INVERT_SEL',
+    )
+    radius_px: IntProperty(name="Radius / Width (px)", min=1, max=64, default=4)
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    @staticmethod
+    def _dilate_2d(mask, r):
+        import numpy as np
+        out = mask.copy()
+        for shift in range(1, max(int(r), 1) + 1):
+            out = np.maximum(out, np.roll(mask, shift, axis=0))
+            out = np.maximum(out, np.roll(mask, -shift, axis=0))
+            out = np.maximum(out, np.roll(out, shift, axis=1))
+            out = np.maximum(out, np.roll(out, -shift, axis=1))
+        return out
+
+    @staticmethod
+    def _erode_2d(mask, r):
+        import numpy as np
+        out = mask.copy()
+        for shift in range(1, max(int(r), 1) + 1):
+            out = np.minimum(out, np.roll(mask, shift, axis=0))
+            out = np.minimum(out, np.roll(mask, -shift, axis=0))
+            out = np.minimum(out, np.roll(out, shift, axis=1))
+            out = np.minimum(out, np.roll(out, -shift, axis=1))
+        return out
+
+    def execute(self, context):
+        import numpy as np
+        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        sel = _get_2d_selection_mask(ima, w, h)
+
+        if self.action == 'SELECT_ALL':
+            _set_2d_selection_mask(ima, np.ones((h, w), dtype=np.float32), context)
+            return {'FINISHED'}
+        if self.action == 'DESELECT':
+            _set_2d_selection_mask(ima, None, context)
+            return {'FINISHED'}
+        if self.action == 'SELECT_OPAQUE':
+            _set_2d_selection_mask(ima, np.clip(rgba[:, :, 3], 0.0, 1.0).copy(), context)
+            return {'FINISHED'}
+
+        if sel is None:
+            if self.action == 'INVERT_SEL':
+                _set_2d_selection_mask(ima, np.ones((h, w), dtype=np.float32), context)
+                return {'FINISHED'}
+            # Default to opaque pixels if user clicks a selection modifier without an active selection
+            sel = (rgba[:, :, 3] > 0.02).astype(np.float32)
+            if not np.any(sel > 0.01):
+                sel = np.ones((h, w), dtype=np.float32)
+
+        if self.action == 'INVERT_SEL':
+            _set_2d_selection_mask(ima, 1.0 - sel, context)
+            return {'FINISHED'}
+        if self.action == 'GROW':
+            _set_2d_selection_mask(ima, self._dilate_2d(sel, self.radius_px), context)
+            return {'FINISHED'}
+        if self.action == 'SHRINK':
+            _set_2d_selection_mask(ima, self._erode_2d(sel, self.radius_px), context)
+            return {'FINISHED'}
+        if self.action == 'FEATHER':
+            _set_2d_selection_mask(ima, IMAGE_OT_tex_paint_2d_fx._box_blur_2d(sel, self.radius_px), context)
+            return {'FINISHED'}
+        if self.action == 'BORDER':
+            dil = self._dilate_2d(sel, max(self.radius_px // 2, 1))
+            ero = self._erode_2d(sel, max(self.radius_px - self.radius_px // 2, 1))
+            _set_2d_selection_mask(ima, np.clip(dil - ero, 0.0, 1.0), context)
+            return {'FINISHED'}
+
+        col_rgb, _ = _get_current_brush_colors(context)
+        if col_rgb is None:
+            col_rgb = (1.0, 1.0, 1.0)
+        m3 = np.clip(sel, 0.0, 1.0)[:, :, None]
+
+        if self.action == 'DELETE_PIXELS':
+            rgba[:, :, 3:4] *= (1.0 - m3)
+            _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
+        elif self.action == 'CROP_TO_SEL':
+            rgba[:, :, 3:4] *= m3
+            _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
+        elif self.action == 'FILL_SEL':
+            src_rgb = np.array(col_rgb, dtype=np.float32).reshape(1, 1, 3)
+            out_a = m3 + rgba[:, :, 3:4] * (1.0 - m3)
+            safe_a = np.maximum(out_a, 1e-6)
+            rgba[:, :, :3] = (src_rgb * m3 + rgba[:, :, :3] * rgba[:, :, 3:4] * (1.0 - m3)) / safe_a
+            rgba[:, :, 3:4] = out_a
+            _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
+        elif self.action == 'STROKE_SEL':
+            dil = self._dilate_2d(sel, max(self.radius_px, 1))
+            ero = self._erode_2d(sel, 1)
+            ring = np.clip(dil - ero, 0.0, 1.0)[:, :, None]
+            src_rgb = np.array(col_rgb, dtype=np.float32).reshape(1, 1, 3)
+            out_a = ring + rgba[:, :, 3:4] * (1.0 - ring)
+            safe_a = np.maximum(out_a, 1e-6)
+            rgba[:, :, :3] = (src_rgb * ring + rgba[:, :, :3] * rgba[:, :, 3:4] * (1.0 - ring)) / safe_a
+            rgba[:, :, 3:4] = out_a
+            _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
+        elif self.action in {'EXTRACT_LAYER', 'CUT_TO_LAYER'}:
+            extracted = rgba.copy()
+            extracted[:, :, 3:4] *= m3
+            if self.action == 'CUT_TO_LAYER':
+                rgba[:, :, 3:4] *= (1.0 - m3)
+                _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
+            if node is None:
+                bpy.ops.image.tex_paint_2d_layer_mode(action='ENABLE_LAYERS')
+                ima, node, layer, w, h, _ = _read_active_2d_rgba_f32(context)
+            if node is not None:
+                with context.temp_override(node=node):
+                    bpy.ops.node.tex_paint_layer_add(type='PAINT')
+                new_layer = node.active_layer
+                if new_layer is not None:
+                    new_layer.name = "Extracted Selection"
+                    _write_active_2d_rgba_f32(context, node.image, node, new_layer, extracted)
+        elif self.action == 'SEL_TO_MASK':
+            if node is None:
+                bpy.ops.image.tex_paint_2d_layer_mode(action='ENABLE_LAYERS')
+                ima, node, layer, w, h, _ = _read_active_2d_rgba_f32(context)
+            if node is not None and layer is not None:
+                if not getattr(layer, "use_mask", False):
+                    with context.temp_override(node=node):
+                        bpy.ops.node.tex_paint_layer_mask_init(mode='BLACK')
+                c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
+                if c_layer.mask_ibuf:
+                    c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
+                    mw, mh = int(c_imb.x), int(c_imb.y)
+                    if mw == w and mh == h and c_imb.byte_data:
+                        u8 = (np.clip(sel, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).ravel()
+                        rgba_m = np.empty((w * h, 4), dtype=np.uint8)
+                        rgba_m[:, 0] = u8
+                        rgba_m[:, 1] = u8
+                        rgba_m[:, 2] = u8
+                        rgba_m[:, 3] = 255
+                        ctypes.memmove(c_imb.byte_data, rgba_m.ctypes.data, w * h * 4)
+                        c_layer.runtime_dirty = 1
+                        layer.opacity = layer.opacity
+
+        return {'FINISHED'}
+
+
+class IMAGE_OT_tex_paint_2d_bucket_fill(Operator):
+    """Krita Contiguous Paint Bucket / Flood Fill Tool in the 2D Image Editor (Click to flood-fill region with Brush Color; drag to adjust tolerance)"""
+    bl_idname = "image.tex_paint_2d_bucket_fill"
+    bl_label = "Paint Bucket Flood Fill (2D)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    tolerance: FloatProperty(name="Tolerance", min=0.002, max=1.0, default=0.15, subtype='FACTOR')
+    contiguous: BoolProperty(name="Contiguous", default=True)
+    grow_px: IntProperty(name="Grow / Anti-Gap (px)", min=0, max=8, default=1)
+    feather_px: IntProperty(name="Feather (px)", min=0, max=16, default=1)
+    erase: BoolProperty(name="Erase to Transparent", default=False)
+    seed_u: FloatProperty(default=0.5)
+    seed_v: FloatProperty(default=0.5)
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    def _apply_bucket(self, context):
+        import numpy as np
+        sx = int(round(self.seed_u * (self._w - 1)))
+        sy = int(round(self.seed_v * (self._h - 1)))
+        fill_mask = _compute_magic_wand_mask(
+            self._orig_rgba, sx, sy, self.tolerance, contiguous=self.contiguous, feather_px=0
+        )
+        if self.grow_px > 0:
+            fill_mask = IMAGE_OT_tex_paint_2d_select_action._dilate_2d(fill_mask, self.grow_px)
+        if self.feather_px > 0:
+            fill_mask = IMAGE_OT_tex_paint_2d_fx._box_blur_2d(fill_mask, self.feather_px)
+
+        sel = _get_2d_selection_mask(self._ima, self._w, self._h)
+        if sel is not None:
+            fill_mask = fill_mask * np.clip(sel, 0.0, 1.0)
+
+        m3 = fill_mask[:, :, None]
+        rgba = self._orig_rgba.copy()
+        if self.erase:
+            rgba[:, :, 3:4] *= (1.0 - m3)
+        else:
+            col_rgb, _ = _get_current_brush_colors(context)
+            if col_rgb is None:
+                col_rgb = (1.0, 1.0, 1.0)
+            src_rgb = np.array(col_rgb, dtype=np.float32).reshape(1, 1, 3)
+            out_a = m3 + rgba[:, :, 3:4] * (1.0 - m3)
+            safe_a = np.maximum(out_a, 1e-6)
+            rgba[:, :, :3] = (src_rgb * m3 + rgba[:, :, :3] * rgba[:, :, 3:4] * (1.0 - m3)) / safe_a
+            rgba[:, :, 3:4] = out_a
+
+        _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, rgba)
+
+    def execute(self, context):
+        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        self._ima, self._node, self._layer, self._w, self._h = ima, node, layer, w, h
+        self._orig_rgba = rgba.copy()
+        self._apply_bucket(context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        wm = getattr(context, "window_manager", None)
+        if wm is not None:
+            self.tolerance = float(getattr(wm, "tex_paint_2d_wand_tolerance", self.tolerance))
+            self.contiguous = bool(getattr(wm, "tex_paint_2d_wand_contiguous", self.contiguous))
+
+        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        self._ima, self._node, self._layer, self._w, self._h = ima, node, layer, w, h
+        self._orig_rgba = rgba.copy()
+        self._waiting_for_click = True
+
+        if context.region and context.region.type == 'WINDOW' and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+                self.seed_u, self.seed_v = float(u), float(v)
+                self._start_x = event.mouse_region_x
+                self._start_tol = self.tolerance
+                self._waiting_for_click = False
+                self._apply_bucket(context)
+
+        context.window.cursor_modal_set('PAINT_CROSS')
+        context.area.header_text_set(
+            "Paint Bucket Fill (2D): Click region to flood-fill with Brush Color | Drag Left/Right = Adjust Tolerance | Esc=Cancel"
+        )
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, self._orig_rgba)
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'CANCELLED'}
+
+        if self._waiting_for_click:
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                self.seed_u = min(max(float(u), 0.0), 1.0)
+                self.seed_v = min(max(float(v), 0.0), 1.0)
+                self._start_x = event.mouse_region_x
+                self._start_tol = self.tolerance
+                self._waiting_for_click = False
+                self._apply_bucket(context)
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            dx = (event.mouse_region_x - self._start_x) / 280.0
+            if abs(dx) > 0.008:
+                self.tolerance = min(max(self._start_tol + dx, 0.005), 0.98)
+                self._apply_bucket(context)
+                context.area.header_text_set(f"Paint Bucket Fill Tolerance: {self.tolerance * 100.0:.1f}% — Release LMB to confirm")
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_tex_paint_2d_gradient(Operator):
+    """Krita Interactive 2D Gradient Tool (Click & drag start->end line in the Image Editor; respects active 2D selection)"""
+    bl_idname = "image.tex_paint_2d_gradient"
+    bl_label = "Gradient Fill Tool (2D)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    gradient_type: EnumProperty(
+        name="Gradient Type",
+        items=(
+            ('LINEAR', "Linear Gradient", "Linear ramp from start point to end point"),
+            ('RADIAL', "Radial Gradient", "Circular ramp from center point to outer radius"),
+            ('REFLECTED', "Reflected (Mirrored)", "Symmetric linear gradient mirrored across the start line"),
+            ('ANGLE', "Conical / Angle", "Angular sweep around the start point"),
+        ),
+        default='LINEAR',
+    )
+    blend_target: EnumProperty(
+        name="Colors",
+        items=(
+            ('FG_TO_TRANSPARENT', "Brush Color -> Transparent", "Fade from Primary Brush Color to Transparent"),
+            ('FG_TO_BG', "Primary -> Secondary Brush Color", "Blend from Primary Brush Color to Secondary Brush Color"),
+        ),
+        default='FG_TO_TRANSPARENT',
+    )
+    opacity: FloatProperty(name="Opacity", min=0.0, max=1.0, default=1.0, subtype='FACTOR')
+    reverse: BoolProperty(name="Reverse Gradient", default=False)
+    u0: FloatProperty(default=0.2)
+    v0: FloatProperty(default=0.5)
+    u1: FloatProperty(default=0.8)
+    v1: FloatProperty(default=0.5)
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    def _render_gradient(self, context):
+        import numpy as np
+        w, h = self._w, self._h
+        ys = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
+        xs = (np.arange(w, dtype=np.float32) + 0.5) / float(w)
+        du = self.u1 - self.u0
+        dv = self.v1 - self.v0
+        dist_sq = max(du * du + dv * dv, 1e-6)
+        dist = math.sqrt(dist_sq)
+
+        px = xs[None, :] - self.u0
+        py = ys[:, None] - self.v0
+
+        if self.gradient_type == 'LINEAR':
+            t = np.clip((px * du + py * dv) / dist_sq, 0.0, 1.0)
+        elif self.gradient_type == 'REFLECTED':
+            t = np.clip(np.abs((px * du + py * dv) / dist_sq), 0.0, 1.0)
+        elif self.gradient_type == 'RADIAL':
+            t = np.clip(np.hypot(px, py) / dist, 0.0, 1.0)
+        else:  # ANGLE
+            ang0 = math.atan2(dv, du)
+            ang = np.arctan2(py, px) - ang0
+            t = np.mod(ang / (2.0 * math.pi), 1.0)
+
+        if self.reverse:
+            t = 1.0 - t
+
+        col1, col2 = _get_current_brush_colors(context)
+        if col1 is None:
+            col1 = (1.0, 1.0, 1.0)
+        if col2 is None:
+            col2 = (0.0, 0.0, 0.0)
+
+        c1 = np.array(col1, dtype=np.float32).reshape(1, 1, 3)
+        t3 = t[:, :, None]
+        if self.blend_target == 'FG_TO_TRANSPARENT':
+            grad_rgb = np.broadcast_to(c1, (h, w, 3)).copy()
+            grad_a = (1.0 - t3) * self.opacity
+        else:
+            c2 = np.array(col2, dtype=np.float32).reshape(1, 1, 3)
+            grad_rgb = c1 * (1.0 - t3) + c2 * t3
+            grad_a = np.full((h, w, 1), self.opacity, dtype=np.float32)
+
+        sel = _get_2d_selection_mask(self._ima, w, h)
+        if sel is not None:
+            grad_a = grad_a * np.clip(sel, 0.0, 1.0)[:, :, None]
+
+        rgba = self._orig_rgba.copy()
+        out_a = grad_a + rgba[:, :, 3:4] * (1.0 - grad_a)
+        safe_a = np.maximum(out_a, 1e-6)
+        rgba[:, :, :3] = (grad_rgb * grad_a + rgba[:, :, :3] * rgba[:, :, 3:4] * (1.0 - grad_a)) / safe_a
+        rgba[:, :, 3:4] = out_a
+        _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, rgba)
+
+    def execute(self, context):
+        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        self._ima, self._node, self._layer, self._w, self._h = ima, node, layer, w, h
+        self._orig_rgba = rgba.copy()
+        self._render_gradient(context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        self._ima, self._node, self._layer, self._w, self._h = ima, node, layer, w, h
+        self._orig_rgba = rgba.copy()
+        self._dragging = False
+        if context.region and context.region.type == 'WINDOW' and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+                self.u0 = self.u1 = float(u)
+                self.v0 = self.v1 = float(v)
+                self._dragging = True
+
+        context.window.cursor_modal_set('CROSSHAIR')
+        context.area.header_text_set("Gradient Tool (2D): Click & drag start -> end point on image | Esc=Cancel")
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            _2D_MODAL_DRAG_PREVIEW["active"] = False
+            _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, self._orig_rgba)
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'CANCELLED'}
+
+        if not self._dragging:
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                self.u0 = self.u1 = float(u)
+                self.v0 = self.v1 = float(v)
+                self._dragging = True
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            self.u1, self.v1 = float(u), float(v)
+            _2D_MODAL_DRAG_PREVIEW["active"] = True
+            _2D_MODAL_DRAG_PREVIEW["mode"] = 'GRADIENT'
+            _2D_MODAL_DRAG_PREVIEW["points_uv"] = [(self.u0, self.v0), (self.u1, self.v1)]
+            self._render_gradient(context)
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            _2D_MODAL_DRAG_PREVIEW["active"] = False
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            self._render_gradient(context)
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_tex_paint_2d_free_transform(Operator):
+    """Krita Free Transform Tool (Interactive Move, Rotate, and Scale of selected 2D pixels or active 2D layer)"""
+    bl_idname = "image.tex_paint_2d_free_transform"
+    bl_label = "Free Transform Selection / Layer (2D)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Transform Mode",
+        items=(
+            ('TRANSLATE', "Move / Translate", "Drag to move selected pixels or layer"),
+            ('ROTATE', "Rotate", "Drag to rotate selected pixels or layer around pivot"),
+            ('SCALE', "Scale", "Drag to scale selected pixels or layer around pivot"),
+        ),
+        default='TRANSLATE',
+    )
+    offset_u: FloatProperty(name="Offset X", min=-1.0, max=1.0, default=0.0)
+    offset_v: FloatProperty(name="Offset Y", min=-1.0, max=1.0, default=0.0)
+    angle: FloatProperty(name="Rotation", min=-math.pi * 2.0, max=math.pi * 2.0, default=0.0, subtype='ANGLE')
+    scale_x: FloatProperty(name="Scale X", min=0.05, max=8.0, default=1.0)
+    scale_y: FloatProperty(name="Scale Y", min=0.05, max=8.0, default=1.0)
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    def _apply_transform(self, context):
+        import numpy as np
+        w, h = self._w, self._h
+        ys = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
+        xs = (np.arange(w, dtype=np.float32) + 0.5) / float(w)
+
+        du = xs[None, :] - self._piv_u - self.offset_u
+        dv = ys[:, None] - self._piv_v - self.offset_v
+        ca, sa = math.cos(self.angle), math.sin(self.angle)
+        sx = max(self.scale_x, 0.02)
+        sy = max(self.scale_y, 0.02)
+
+        src_u = (du * ca + dv * sa) / sx + self._piv_u
+        src_v = (-du * sa + dv * ca) / sy + self._piv_v
+
+        valid = (src_u >= 0.0) & (src_u <= 1.0) & (src_v >= 0.0) & (src_v <= 1.0)
+        ix = np.clip((src_u * w).astype(np.int32), 0, w - 1)
+        iy = np.clip((src_v * h).astype(np.int32), 0, h - 1)
+
+        warped = self._floating_rgba[iy, ix].copy()
+        warped[~valid] = 0.0
+
+        out = self._bg_rgba.copy()
+        wa = warped[:, :, 3:4]
+        out_a = wa + out[:, :, 3:4] * (1.0 - wa)
+        safe_a = np.maximum(out_a, 1e-6)
+        out[:, :, :3] = (warped[:, :, :3] * wa + out[:, :, :3] * out[:, :, 3:4] * (1.0 - wa)) / safe_a
+        out[:, :, 3:4] = out_a
+
+        _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, out)
+        if self._has_sel and self._orig_sel is not None:
+            warped_sel = self._orig_sel[iy, ix].copy()
+            warped_sel[~valid] = 0.0
+            _set_2d_selection_mask(self._ima, warped_sel, context)
+
+    def _init_buffers(self, context):
+        import numpy as np
+        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return False
+        self._ima, self._node, self._layer, self._w, self._h = ima, node, layer, w, h
+        self._orig_rgba = rgba.copy()
+        sel = _get_2d_selection_mask(ima, w, h)
+        self._orig_sel = sel.copy() if sel is not None else None
+        self._has_sel = sel is not None and bool(np.any(sel > 0.01))
+
+        if self._has_sel:
+            m3 = np.clip(sel, 0.0, 1.0)[:, :, None]
+            self._floating_rgba = rgba.copy()
+            self._floating_rgba[:, :, 3:4] *= m3
+            self._bg_rgba = rgba.copy()
+            self._bg_rgba[:, :, 3:4] *= (1.0 - m3)
+            ys, xs = np.nonzero(sel > 0.05)
+            self._piv_u = float(xs.mean() / w) if len(xs) else 0.5
+            self._piv_v = float(ys.mean() / h) if len(ys) else 0.5
+        else:
+            self._floating_rgba = rgba.copy()
+            self._bg_rgba = np.zeros_like(rgba)
+            op = rgba[:, :, 3] > 0.02
+            if np.any(op):
+                ys, xs = np.nonzero(op)
+                self._piv_u = float(xs.mean() / w)
+                self._piv_v = float(ys.mean() / h)
+            else:
+                self._piv_u, self._piv_v = 0.5, 0.5
+        return True
+
+    def execute(self, context):
+        if not self._init_buffers(context):
+            return {'CANCELLED'}
+        self._apply_transform(context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        if not self._init_buffers(context):
+            return {'CANCELLED'}
+        self.offset_u = 0.0
+        self.offset_v = 0.0
+        self.angle = 0.0
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+
+        context.window.cursor_modal_set('SCROLL_XY')
+        context.area.header_text_set(
+            f"2D Free Transform ({self.mode.title()}): Drag mouse | Press G=Move, R=Rotate, S=Scale | LMB/Enter=Confirm | Esc=Cancel"
+        )
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, self._orig_rgba)
+            if self._orig_sel is not None:
+                _set_2d_selection_mask(self._ima, self._orig_sel, context)
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'CANCELLED'}
+
+        if event.value == 'PRESS':
+            if event.type == 'G':
+                self.mode = 'TRANSLATE'
+                self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                return {'RUNNING_MODAL'}
+            if event.type == 'R':
+                self.mode = 'ROTATE'
+                self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                return {'RUNNING_MODAL'}
+            if event.type == 'S':
+                self.mode = 'SCALE'
+                self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+                return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+            if self.mode == 'TRANSLATE':
+                self.offset_u = float(u - self._start_u)
+                self.offset_v = float(v - self._start_v)
+            elif self.mode == 'ROTATE':
+                a0 = math.atan2(self._start_v - self._piv_v, self._start_u - self._piv_u)
+                a1 = math.atan2(v - self._piv_v, u - self._piv_u)
+                self.angle = float(a1 - a0)
+            elif self.mode == 'SCALE':
+                d0 = max(math.hypot(self._start_u - self._piv_u, self._start_v - self._piv_v), 0.02)
+                d1 = max(math.hypot(u - self._piv_u, v - self._piv_v), 0.01)
+                s = min(max(d1 / d0, 0.05), 6.0)
+                self.scale_x = s
+                self.scale_y = s
+            self._apply_transform(context)
+            return {'RUNNING_MODAL'}
+
+        if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value in {'PRESS', 'RELEASE'}:
+            context.window.cursor_modal_restore()
+            context.area.header_text_set(None)
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_tex_paint_2d_color_adjust(Operator):
+    """Krita Color Adjustment Dialog (Hue / Saturation / Value, Brightness / Contrast, Gamma & RGB Balance; respects active 2D selection)"""
+    bl_idname = "image.tex_paint_2d_color_adjust"
+    bl_label = "Krita 2D Color Adjustments (HSV / Levels / Balance)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    hue_shift: FloatProperty(name="Hue Shift", min=-0.5, max=0.5, default=0.0, subtype='FACTOR')
+    saturation: FloatProperty(name="Saturation", min=0.0, max=2.5, default=1.0, subtype='FACTOR')
+    value_mult: FloatProperty(name="Value / Exposure", min=0.0, max=2.5, default=1.0, subtype='FACTOR')
+    brightness: FloatProperty(name="Brightness", min=-1.0, max=1.0, default=0.0, subtype='FACTOR')
+    contrast: FloatProperty(name="Contrast", min=-0.95, max=2.0, default=0.0, subtype='FACTOR')
+    gamma: FloatProperty(name="Gamma", min=0.2, max=3.0, default=1.0)
+    red_gain: FloatProperty(name="Red Balance", min=0.0, max=2.0, default=1.0, subtype='FACTOR')
+    green_gain: FloatProperty(name="Green Balance", min=0.0, max=2.0, default=1.0, subtype='FACTOR')
+    blue_gain: FloatProperty(name="Blue Balance", min=0.0, max=2.0, default=1.0, subtype='FACTOR')
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, _context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.label(text="HSV Adjustment:", icon='COLOR')
+        col.prop(self, "hue_shift", slider=True)
+        col.prop(self, "saturation", slider=True)
+        col.prop(self, "value_mult", slider=True)
+        col.separator()
+        col.label(text="Levels / Tone:", icon='SEQ_LUMA_WAVEFORM')
+        col.prop(self, "brightness", slider=True)
+        col.prop(self, "contrast", slider=True)
+        col.prop(self, "gamma", slider=True)
+        col.separator()
+        col.label(text="RGB Color Balance:", icon='IMAGE_RGB')
+        row = col.row(align=True)
+        row.prop(self, "red_gain", text="R", slider=True)
+        row.prop(self, "green_gain", text="G", slider=True)
+        row.prop(self, "blue_gain", text="B", slider=True)
+
+    def execute(self, context):
+        import numpy as np
+        ima, node, layer, _w, _h, rgba = _read_active_2d_rgba_f32(context)
+        if rgba is None:
+            return {'CANCELLED'}
+        orig_rgba = rgba.copy()
+        rgb = rgba[:, :, :3].copy()
+
+        # 1. Hue / Saturation / Value (Vectorized RGB <-> HSV)
+        if abs(self.hue_shift) > 1e-4 or abs(self.saturation - 1.0) > 1e-4 or abs(self.value_mult - 1.0) > 1e-4:
+            r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+            cmax = np.maximum(np.maximum(r, g), b)
+            cmin = np.minimum(np.minimum(r, g), b)
+            delta = cmax - cmin
+
+            h_map = np.zeros_like(cmax)
+            nz = delta > 1e-6
+            mr = nz & (cmax == r)
+            mg = nz & (cmax == g) & ~mr
+            mb = nz & ~mr & ~mg
+            h_map[mr] = np.mod((g[mr] - b[mr]) / delta[mr], 6.0) / 6.0
+            h_map[mg] = ((b[mg] - r[mg]) / delta[mg] + 2.0) / 6.0
+            h_map[mb] = ((r[mb] - g[mb]) / delta[mb] + 4.0) / 6.0
+
+            s_map = np.where(cmax > 1e-6, delta / np.maximum(cmax, 1e-6), 0.0)
+            h_map = np.mod(h_map + self.hue_shift, 1.0)
+            s_map = np.clip(s_map * self.saturation, 0.0, 1.0)
+            v_map = np.clip(cmax * self.value_mult, 0.0, 1.0)
+
+            h6 = h_map * 6.0
+            i_sec = np.floor(h6).astype(np.int32) % 6
+            f_sec = h6 - np.floor(h6)
+            p = v_map * (1.0 - s_map)
+            q = v_map * (1.0 - f_sec * s_map)
+            t = v_map * (1.0 - (1.0 - f_sec) * s_map)
+
+            rgb[:, :, 0] = np.select([i_sec == 0, i_sec == 1, i_sec == 2, i_sec == 3, i_sec == 4], [v_map, q, p, p, t], default=v_map)
+            rgb[:, :, 1] = np.select([i_sec == 0, i_sec == 1, i_sec == 2, i_sec == 3, i_sec == 4], [t, v_map, v_map, q, p], default=p)
+            rgb[:, :, 2] = np.select([i_sec == 0, i_sec == 1, i_sec == 2, i_sec == 3, i_sec == 4], [p, p, t, v_map, v_map], default=q)
+
+        # 2. RGB Balance
+        rgb[:, :, 0] *= self.red_gain
+        rgb[:, :, 1] *= self.green_gain
+        rgb[:, :, 2] *= self.blue_gain
+
+        # 3. Brightness / Contrast / Gamma
+        if abs(self.brightness) > 1e-4 or abs(self.contrast) > 1e-4:
+            c_fac = 1.0 + self.contrast if self.contrast >= 0.0 else 1.0 / (1.0 - self.contrast)
+            rgb = (rgb - 0.5) * c_fac + 0.5 + self.brightness
+        if abs(self.gamma - 1.0) > 1e-4:
+            rgb = np.power(np.clip(rgb, 0.0, 1.0), 1.0 / max(self.gamma, 0.05))
+
+        rgba[:, :, :3] = np.clip(rgb, 0.0, 1.0)
+        rgba = _apply_2d_edit_with_selection(orig_rgba, rgba, ima)
+        _write_active_2d_rgba_f32(context, ima, node, layer, rgba)
+        return {'FINISHED'}
+
+
+class TEXPAINT_MT_2d_select_menu(Menu):
+    """Krita 2D Selection & Pixel Actions Menu in the Image Editor."""
+    bl_label = "Krita 2D Selection & Pixel Actions"
+
+    def draw(self, context):
+        layout = self.layout
+        wm = getattr(context, "window_manager", None)
+        fx_rad = getattr(wm, "tex_paint_2d_fx_radius", 6) if wm else 6
+
+        layout.operator("image.tex_paint_2d_magic_wand", text="Magic Wand (Contiguous Color)", icon='EYEDROPPER')
+        layout.operator("image.tex_paint_2d_marquee_select", text="Rectangle Marquee Select", icon='SELECT_SET').shape = 'BOX'
+        layout.operator("image.tex_paint_2d_marquee_select", text="Ellipse / Circle Select", icon='MESH_CIRCLE').shape = 'ELLIPSE'
+        layout.operator("image.tex_paint_2d_marquee_select", text="Freehand Lasso Select", icon='GP_SELECT_POINTS').shape = 'LASSO'
+        layout.separator()
+        layout.operator("image.tex_paint_2d_select_action", text="Select Opaque Pixels (Alpha > 0)", icon='IMAGE_ALPHA').action = 'SELECT_OPAQUE'
+        layout.operator("image.tex_paint_2d_select_action", text="Select All", icon='SELECT_EXTEND').action = 'SELECT_ALL'
+        layout.operator("image.tex_paint_2d_select_action", text="Invert Selection", icon='ARROW_LEFTRIGHT').action = 'INVERT_SEL'
+        layout.operator("image.tex_paint_2d_select_action", text="Deselect (Clear)", icon='X').action = 'DESELECT'
+        layout.separator()
+        op_gr = layout.operator("image.tex_paint_2d_select_action", text=f"Grow Selection (+{fx_rad} px)", icon='FULLSCREEN_ENTER')
+        op_gr.action = 'GROW'
+        op_gr.radius_px = fx_rad
+        op_sh = layout.operator("image.tex_paint_2d_select_action", text=f"Shrink Selection (-{fx_rad} px)", icon='FULLSCREEN_EXIT')
+        op_sh.action = 'SHRINK'
+        op_sh.radius_px = fx_rad
+        op_fe = layout.operator("image.tex_paint_2d_select_action", text=f"Feather Selection ({fx_rad} px)", icon='SMOOTHCURVE')
+        op_fe.action = 'FEATHER'
+        op_fe.radius_px = fx_rad
+        op_bd = layout.operator("image.tex_paint_2d_select_action", text=f"Border Ring ({fx_rad} px)", icon='MOD_SKIN')
+        op_bd.action = 'BORDER'
+        op_bd.radius_px = fx_rad
+        layout.separator()
+        layout.operator("image.tex_paint_2d_select_action", text="Delete / Erase Selected Pixels", icon='TRASH').action = 'DELETE_PIXELS'
+        layout.operator("image.tex_paint_2d_select_action", text="Keep Only Selection (Crop Outside)", icon='PIVOT_BOUNDBOX').action = 'CROP_TO_SEL'
+        layout.operator("image.tex_paint_2d_select_action", text="Fill Selection with Brush Color", icon='COLOR').action = 'FILL_SEL'
+        op_st = layout.operator("image.tex_paint_2d_select_action", text="Stroke Selection Outline", icon='MOD_SKIN')
+        op_st.action = 'STROKE_SEL'
+        op_st.radius_px = fx_rad
+        layout.separator()
+        layout.operator("image.tex_paint_2d_select_action", text="Duplicate Selection to New 2D Layer", icon='DUPLICATE').action = 'EXTRACT_LAYER'
+        layout.operator("image.tex_paint_2d_select_action", text="Cut Selection to New 2D Layer", icon='COPYDOWN').action = 'CUT_TO_LAYER'
+        layout.operator("image.tex_paint_2d_select_action", text="Convert Selection to Layer Mask", icon='MOD_MASK').action = 'SEL_TO_MASK'
+
+
+
 
 
 class IMAGE_OT_tex_paint_send_to_3d(Operator):
@@ -8298,6 +10162,7 @@ class IMAGE_OT_tex_paint_send_to_3d(Operator):
                     layer_3d.proj_mode = 'TRIPLANAR'
                 layer_3d.show_projection_widget = True
                 layer_3d.proj_blend_falloff = 0.5
+                _reproject_color_layer_multi_object(node_3d, layer_3d, context=context, force=True)
 
         elif self.target_mode == 'MASK_GRUNGE':
             layer_3d = node_3d.active_layer
@@ -8450,6 +10315,18 @@ class TEXPAINT_MT_2d_fx(Menu):
         op_b2a.strength = fx_str
 
         layout.operator("image.tex_paint_2d_fx", text="Invert RGB Colors", icon='ARROW_LEFTRIGHT').effect = 'INVERT_RGB'
+        layout.operator("image.tex_paint_2d_fx", text="Auto Levels / Contrast", icon='SEQ_LUMA_WAVEFORM').effect = 'AUTO_CONTRAST'
+        op_thr = layout.operator("image.tex_paint_2d_fx", text="Threshold (B&W Stencil)", icon='MOD_MASK')
+        op_thr.effect = 'THRESHOLD'
+        op_thr.strength = fx_str
+        op_pst = layout.operator("image.tex_paint_2d_fx", text="Posterize (Quantize)", icon='IPO_CONSTANT')
+        op_pst.effect = 'POSTERIZE'
+        op_pst.radius_px = fx_rad
+        op_pix = layout.operator("image.tex_paint_2d_fx", text="Pixelate / Mosaic", icon='MESH_GRID')
+        op_pix.effect = 'PIXELATE'
+        op_pix.radius_px = fx_rad
+        layout.separator()
+        layout.operator("image.tex_paint_2d_color_adjust", text="HSV / Levels / Color Balance...", icon='COLOR')
         layout.separator()
         layout.operator("image.tex_paint_2d_fx", text="Fill with Brush Color", icon='COLOR').effect = 'FILL_BRUSH'
         layout.operator("image.tex_paint_2d_fx", text="Clear to Transparent", icon='TRASH').effect = 'CLEAR_TRANSPARENT'
@@ -8500,7 +10377,49 @@ class IMAGE_PT_2d_canvas_studio(Panel):
         if ob is not None and ob.type == 'MESH' and not is_3d_master:
             top_row.menu("TEXPAINT_MT_2d_send_to_3d", text="Send to 3D", icon='EXPORT')
 
-        # Row 2: Seamless Wrap Toggles + Transform Dropdown Menu on one row
+        layout.separator(factor=0.25)
+
+        # Row 2: Krita Selection & Magic Wand Toolbar
+        sel_box = layout.box()
+        sel_col = sel_box.column(align=True)
+        sel_row = sel_col.row(align=True)
+        sel_row.operator("image.tex_paint_2d_magic_wand", text="Magic Wand", icon='EYEDROPPER')
+        sel_row.operator("image.tex_paint_2d_marquee_select", text="Box", icon='SELECT_SET').shape = 'BOX'
+        sel_row.operator("image.tex_paint_2d_marquee_select", text="Ellipse", icon='MESH_CIRCLE').shape = 'ELLIPSE'
+        sel_row.operator("image.tex_paint_2d_marquee_select", text="Lasso", icon='GP_SELECT_POINTS').shape = 'LASSO'
+        sel_row.menu("TEXPAINT_MT_2d_select_menu", text="", icon='DOWNARROW_HLT')
+
+        if wm and hasattr(wm, "tex_paint_2d_wand_tolerance"):
+            wand_row = sel_col.row(align=True)
+            wand_row.prop(wm, "tex_paint_2d_wand_tolerance", text="Wand Tol", slider=True)
+            wand_row.prop(wm, "tex_paint_2d_wand_contiguous", text="Contig", toggle=True)
+            wand_row.prop(wm, "tex_paint_2d_wand_merged", text="Merged", toggle=True)
+            wand_row.prop(wm, "tex_paint_2d_sel_feather", text="Feather")
+
+        # Active Selection Quick-Action Bar (appears automatically when a 2D selection is active!)
+        sel_st = _2D_SELECTION_STATE.get(ima.name)
+        if sel_st and sel_st.get("active") and sel_st.get("mask") is not None:
+            act_row = sel_col.row(align=True)
+            act_row.alert = False
+            act_row.operator("image.tex_paint_2d_select_action", text="Fill", icon='COLOR').action = 'FILL_SEL'
+            act_row.operator("image.tex_paint_2d_select_action", text="Erase", icon='TRASH').action = 'DELETE_PIXELS'
+            act_row.operator("image.tex_paint_2d_select_action", text="Crop", icon='PIVOT_BOUNDBOX').action = 'CROP_TO_SEL'
+            act_row.operator("image.tex_paint_2d_select_action", text="To Layer", icon='DUPLICATE').action = 'EXTRACT_LAYER'
+            act_row.operator("image.tex_paint_2d_select_action", text="To Mask", icon='MOD_MASK').action = 'SEL_TO_MASK'
+            act_row.operator("image.tex_paint_2d_select_action", text="Invert", icon='ARROW_LEFTRIGHT').action = 'INVERT_SEL'
+            act_row.operator("image.tex_paint_2d_select_action", text="", icon='X').action = 'DESELECT'
+
+        # Row 3: Krita Image Editing Tools (Paint Bucket, Gradient, Free Transform, Color Adjust)
+        edit_row = layout.row(align=True)
+        op_bkt = edit_row.operator("image.tex_paint_2d_bucket_fill", text="Bucket Fill", icon='SNAP_FACE')
+        op_bkt.erase = False
+        op_era = edit_row.operator("image.tex_paint_2d_bucket_fill", text="Magic Erase", icon='IMAGE_ALPHA')
+        op_era.erase = True
+        edit_row.operator("image.tex_paint_2d_gradient", text="Gradient", icon='IPO_LINEAR')
+        edit_row.operator("image.tex_paint_2d_free_transform", text="Transform", icon='OBJECT_ORIGIN').mode = 'TRANSLATE'
+        edit_row.operator("image.tex_paint_2d_color_adjust", text="HSV/Levels", icon='COLOR')
+
+        # Row 4: Seamless Wrap Toggles + Flip/Rotate Menu on one row
         wrap_row = layout.row(align=True)
         ip = getattr(context.tool_settings, "image_paint", None) if context.tool_settings else None
         if ip is not None:
@@ -8508,12 +10427,12 @@ class IMAGE_PT_2d_canvas_studio(Panel):
             wrap_row.prop(ip, "tile_y", text="Wrap Y", toggle=True, icon='MOD_MIRROR')
         if hasattr(space, "show_repeat"):
             wrap_row.prop(space, "show_repeat", text="Repeat", toggle=True, icon='MESH_GRID')
-        wrap_row.menu("TEXPAINT_MT_2d_transform", text="Transform", icon='ORIENTATION_VIEW')
+        wrap_row.menu("TEXPAINT_MT_2d_transform", text="Flip/Rot", icon='ORIENTATION_VIEW')
         wrap_row.operator("image.tex_paint_2d_edit", text="", icon='FULLSCREEN_ENTER').action = 'WRAP_50'
 
-        layout.separator(factor=0.3)
+        layout.separator(factor=0.25)
 
-        # Row 3: 2D Shape & Logo Stamp Dropdown + Inline Parametric Controls
+        # Row 5: 2D Shape & Logo Stamp Dropdown + Inline Parametric Controls
         sh_col = layout.column(align=True)
         sh_row = sh_col.row(align=True)
         sh_row.menu("TEXPAINT_MT_2d_shapes", text="Stamp Shape", icon='MESH_CIRCLE')
@@ -8523,9 +10442,9 @@ class IMAGE_PT_2d_canvas_studio(Panel):
             sh_row.prop(wm, "tex_paint_2d_shape_sides", text="Sides")
             sh_row.prop(wm, "tex_paint_2d_shape_erase", text="", toggle=True, icon='IMAGE_ALPHA')
 
-        layout.separator(factor=0.25)
+        layout.separator(factor=0.2)
 
-        # Row 4: 2D Filters, Outline & Alpha FX Dropdown + Inline Radius/Strength Sliders
+        # Row 6: 2D Filters, Outline & Alpha FX Dropdown + Inline Radius/Strength Sliders
         fx_col = layout.column(align=True)
         fx_row = fx_col.row(align=True)
         fx_row.menu("TEXPAINT_MT_2d_fx", text="2D Filters & FX", icon='SHADERFX')
@@ -8774,6 +10693,7 @@ def _register_node_grunge_props():
         else:
             layer.proj_mode = mode_str
         layer.show_projection_widget = True
+        _reproject_color_layer_multi_object(self, layer, context=bpy.context, force=True)
 
     Node.tex_paint_color_proj_mode = EnumProperty(
         name="Projection",
@@ -8812,6 +10732,7 @@ def _register_node_grunge_props():
                 layer.proj_mode = 'UV_REPEAT'
             else:
                 layer.proj_blend_falloff = layer.proj_blend_falloff
+        _reproject_color_layer_multi_object(self, layer, context=bpy.context, force=True)
 
     Node.tex_paint_color_wrap_mode = EnumProperty(
         name="UV Wrap / Tiling Mode",
@@ -9337,6 +11258,8 @@ def _mask_paint_sync_timer():
 
         node = tex_paint_node_from_context(context)
         layer = node.active_layer if node else None
+        if node is not None and layer is not None:
+            _reproject_color_layer_multi_object(node, layer, context=context, force=False)
         if node is not None:
             n_ptr = node.as_pointer()
             cur_target = getattr(node, "paint_target", 'COLOR')
@@ -9412,6 +11335,7 @@ classes = (
     NODE_OT_tex_paint_layer_pixel_action,
     NODE_OT_tex_paint_export_texture_set,
     NODE_OT_tex_paint_reconnect_live_layers,
+    NODE_OT_tex_paint_make_material_unique,
     TEXPAINT_MT_layer_specials,
     NODE_OT_tex_paint_smart_mask_recipe,
     TEXPAINT_MT_smart_mask_recipes,
@@ -9423,12 +11347,20 @@ classes = (
     IMAGE_OT_tex_paint_2d_edit,
     IMAGE_OT_tex_paint_2d_shape,
     IMAGE_OT_tex_paint_2d_fx,
+    IMAGE_OT_tex_paint_2d_magic_wand,
+    IMAGE_OT_tex_paint_2d_marquee_select,
+    IMAGE_OT_tex_paint_2d_select_action,
+    IMAGE_OT_tex_paint_2d_bucket_fill,
+    IMAGE_OT_tex_paint_2d_gradient,
+    IMAGE_OT_tex_paint_2d_free_transform,
+    IMAGE_OT_tex_paint_2d_color_adjust,
     IMAGE_OT_tex_paint_send_to_3d,
     TEXPAINT_MT_2d_canvas_new,
     TEXPAINT_MT_2d_send_to_3d,
     TEXPAINT_MT_2d_transform,
     TEXPAINT_MT_2d_shapes,
     TEXPAINT_MT_2d_fx,
+    TEXPAINT_MT_2d_select_menu,
     TEXPAINT_UL_layers,
     VIEW3D_PT_tex_paint_layers,
     VIEW3D_PT_tex_paint_layers_popover,
@@ -9677,6 +11609,31 @@ def register():
         max=2.0,
         default=1.0,
     )
+    WindowManager.tex_paint_2d_wand_tolerance = FloatProperty(
+        name="Magic Wand Tolerance",
+        description="Color similarity tolerance for the Krita 2D Magic Wand & Paint Bucket tools (drag left/right in viewport to adjust live)",
+        min=0.005,
+        max=0.98,
+        default=0.14,
+        subtype='FACTOR',
+    )
+    WindowManager.tex_paint_2d_wand_contiguous = BoolProperty(
+        name="Contiguous Region Only",
+        description="Flood-fill only connected pixels around the clicked point (turn off to select all matching colors across the canvas)",
+        default=True,
+    )
+    WindowManager.tex_paint_2d_wand_merged = BoolProperty(
+        name="Sample Merged Canvas",
+        description="Sample composite colors across all visible 2D layers instead of only the active layer",
+        default=True,
+    )
+    WindowManager.tex_paint_2d_sel_feather = IntProperty(
+        name="Selection Feather (px)",
+        description="Soft edge feathering radius in pixels for 2D Magic Wand and Marquee selections",
+        min=0,
+        max=32,
+        default=0,
+    )
 
     if _draw_handler_handle is None:
         _draw_handler_handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -9751,6 +11708,10 @@ def unregister():
         "tex_paint_2d_shape_erase",
         "tex_paint_2d_fx_radius",
         "tex_paint_2d_fx_strength",
+        "tex_paint_2d_wand_tolerance",
+        "tex_paint_2d_wand_contiguous",
+        "tex_paint_2d_wand_merged",
+        "tex_paint_2d_sel_feather",
     ):
         if hasattr(WindowManager, wm_prop):
             delattr(WindowManager, wm_prop)
