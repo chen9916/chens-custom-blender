@@ -7,12 +7,18 @@ See 'release/text/readme.html' for the end user read-me.
 Chen's Custom Blender
 =====================
 
-A personal Blender 5.3 development fork with native mesh onion skins and animation
-editing improvements. Custom development lives on the `mesh-onion-live` branch.
+A personal Blender 5.3 development fork combining native Substance-style **Multi-Layer Texture Painting & Mask Studio** and **Native 3D Mesh Onion Skins** on `main`.
 
 Custom Features
 ---------------
 
+### 1. Multi-Layer Texture Painting & Substance Mask Studio (`ShaderNodeTexPaint`)
+- Native C++ multi-layer canvas node (`ShaderNodeTexPaint`) with Paint, Fill, and Adjustment layers, 16 blend modes, Clipping Masks, Alpha Lock, Layer Solo, and grayscale Mask Preview (`Alt`-click style).
+- **Substance-Style Mask Stack**: Non-destructive stack of **Mask Fill (Custom Image / Grunge)**, **Smart 3D Mask Generators** (*Edge Wear*, *Cavity & Dirt*, *Curvature*, *Ambient Occlusion*, *Top-Down Dust*, *Vertical Height*), **Hand-Painted Mask**, and **Levels** sub-layers.
+- **6 Projection Methods**: *UV Projection*, *Triplanar*, *Planar / Decal*, *Warp (Surface-Hugging)*, *Spherical*, and *Cylindrical* with *Repeat (Tile)* and *Clamp (Stamp)* wrap modes.
+- **Interactive 3D & 2D UV Projection Gizmos**: Manipulate projections in the 3D Viewport or directly over UV islands in the 2D Image Editor (`G` / `R` / `S` shortcuts and interactive handles).
+
+### 2. Native 3D Mesh Onion Skins
 - Native mesh onion skins for a posed armature and its directly skinned meshes.
 - Live pose previews following Blender's native Auto Key policy.
 - Keyed-frame sampling, frame-range looping, and smoothly scrolling ghost poses.
