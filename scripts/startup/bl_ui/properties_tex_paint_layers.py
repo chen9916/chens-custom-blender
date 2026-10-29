@@ -5570,6 +5570,8 @@ def _ensure_single_node_pbr_links(mat, node):
     """Ensure the single multi-channel `ShaderNodeTexPaint` node has all PBR outputs wired to Principled BSDF."""
     if mat is None or mat.node_tree is None or node is None or node.bl_idname != "ShaderNodeTexPaint":
         return
+    if bool(node.get("_tex_paint_baked_set_active", False)):
+        return
     ntree = mat.node_tree
     bsdf = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
     if bsdf is None:
@@ -6107,13 +6109,339 @@ class NODE_OT_tex_paint_layer_pixel_action(Operator):
         return {'CANCELLED'}
 
 
+class NODE_OT_tex_paint_export_texture_set(Operator):
+    """Bake & export the Multilayer Texture node into standard PBR texture maps (BaseColor, Roughness, Metallic, Normal, Height, ORM, Emission) on disk and/or wire standard Image Texture nodes into the material"""
+    bl_idname = "node.tex_paint_export_texture_set"
+    bl_label = "Export / Bake PBR Texture Set"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Output Mode",
+        items=(
+            (
+                'BOTH',
+                "Save Files + Create Material Nodes",
+                "Export PNG textures to disk AND wire standard Image Texture nodes into Principled BSDF (ready for FBX / glTF export)",
+            ),
+            (
+                'NODES_ONLY',
+                "Create Blender Texture Set Nodes Only",
+                "Unpack into regular Blender Image datablocks and connect standard Image Texture nodes to Principled BSDF",
+            ),
+            (
+                'FILES_ONLY',
+                "Export Texture Files to Folder Only",
+                "Save PBR texture maps to disk while keeping the live Multilayer Texture node connected",
+            ),
+        ),
+        default='BOTH',
+    )
+    export_dir: StringProperty(
+        name="Export Folder",
+        description="Folder where exported PNG texture maps are written",
+        default="//textures/",
+        subtype='DIR_PATH',
+    )
+    prefix: StringProperty(
+        name="Texture Prefix",
+        description="Filename and datablock prefix for the exported PBR texture set",
+        default="",
+    )
+    normal_convention: EnumProperty(
+        name="Normal Format",
+        items=(
+            ('OPENGL', "OpenGL (+Y) — Blender / glTF / Unity", "Standard right-handed tangent-space normal map (+Y green channel)"),
+            ('DIRECTX', "DirectX (-Y) — Unreal Engine", "Inverted green channel (-Y) tangent-space normal map"),
+        ),
+        default='OPENGL',
+    )
+    export_base_color: BoolProperty(name="Base Color", default=True)
+    export_roughness: BoolProperty(name="Roughness", default=True)
+    export_metallic: BoolProperty(name="Metallic", default=True)
+    export_normal: BoolProperty(name="Normal Map (from Height)", default=True)
+    export_height: BoolProperty(name="Height (Displacement)", default=False)
+    export_orm: BoolProperty(
+        name="Packed ORM (R=AO, G=Rough, B=Metal)",
+        description="Pack Ambient Occlusion (1.0), Roughness, and Metallic into a single RGB map for Unreal / glTF",
+        default=False,
+    )
+    export_emission: BoolProperty(name="Emission", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        node = tex_paint_node_from_context(context)
+        return node is not None and getattr(node, "image", None) is not None
+
+    def invoke(self, context, _event):
+        node = tex_paint_node_from_context(context)
+        ob = getattr(context, "active_object", None)
+        mat = ob.active_material if ob else None
+        if not self.prefix:
+            raw_name = mat.name if mat else (node.image.name if node and node.image else "Material")
+            self.prefix = "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw_name).strip("_") or "Material"
+        if not bpy.data.is_saved and self.export_dir.startswith("//"):
+            import tempfile
+            self.export_dir = os.path.join(tempfile.gettempdir(), f"{self.prefix}_textures")
+        wm = getattr(context, "window_manager", None)
+        if wm:
+            return wm.invoke_props_dialog(self, width=380)
+        return self.execute(context)
+
+    def draw(self, _context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.prop(self, "mode", text="Target")
+        col.prop(self, "prefix", text="Set Name")
+        if self.mode in {'BOTH', 'FILES_ONLY'}:
+            col.prop(self, "export_dir", text="Folder")
+        col.prop(self, "normal_convention", text="Normals")
+
+        layout.separator(factor=0.4)
+        box = layout.box()
+        bcol = box.column(align=True)
+        bcol.label(text="Channels to Generate:", icon='TEXTURE')
+        r1 = bcol.row(align=True)
+        r1.prop(self, "export_base_color", toggle=True)
+        r1.prop(self, "export_roughness", toggle=True)
+        r1.prop(self, "export_metallic", toggle=True)
+        r2 = bcol.row(align=True)
+        r2.prop(self, "export_normal", toggle=True)
+        r2.prop(self, "export_height", toggle=True)
+        r2.prop(self, "export_emission", toggle=True)
+        bcol.prop(self, "export_orm", toggle=True, icon=' NODE_COMPOSITING' if False else 'RENDERLAYERS')
+
+    def execute(self, context):
+        import numpy as np
+
+        node = tex_paint_node_from_context(context)
+        if node is None or node.image is None:
+            self.report({'WARNING'}, "No active Multilayer Texture Canvas found")
+            return {'CANCELLED'}
+
+        ob = getattr(context, "active_object", None)
+        mat = (ob.active_material if ob else None) or _get_material_for_node(node)
+
+        # Force a fresh composite by touching active layer opacity
+        if node.active_layer is not None:
+            node.active_layer.opacity = node.active_layer.opacity
+
+        w = int(node.canvas_width or node.image.size[0] or 1024)
+        h = int(node.canvas_height or node.image.size[1] or 1024)
+        prefix = (self.prefix or (mat.name if mat else node.image.name)).strip() or "Material"
+
+        # Read composited Base Color (RGBA)
+        color_arr = np.zeros((h, w, 4), dtype=np.float32)
+        if node.image and len(node.image.pixels) == w * h * 4:
+            node.image.pixels.foreach_get(color_arr.ravel())
+
+        # Read composited Packed PBR (R=Roughness, G=Metallic, B=Height, A=Specular)
+        pbr_ima = getattr(node, "pbr_image", None)
+        pbr_arr = np.zeros((h, w, 4), dtype=np.float32)
+        pbr_arr[:, :, 0] = 0.5
+        pbr_arr[:, :, 2] = 0.5
+        pbr_arr[:, :, 3] = 0.5
+        if pbr_ima and len(pbr_ima.pixels) == w * h * 4:
+            pbr_ima.pixels.foreach_get(pbr_arr.ravel())
+
+        # Read composited Emission (RGBA)
+        em_ima = getattr(node, "emission_image", None)
+        em_arr = np.zeros((h, w, 4), dtype=np.float32)
+        has_any_emission = any(getattr(l, "use_channel_emission", False) for l in node.layers)
+        if em_ima and len(em_ima.pixels) == w * h * 4:
+            em_ima.pixels.foreach_get(em_arr.ravel())
+
+        def _make_or_update_image(img_name, rgba_float, is_data=False):
+            ima = bpy.data.images.get(img_name)
+            if ima is not None and (ima.size[0] != w or ima.size[1] != h):
+                bpy.data.images.remove(ima)
+                ima = None
+            if ima is None:
+                ima = bpy.data.images.new(name=img_name, width=w, height=h, alpha=True, float_buffer=False)
+            try:
+                ima.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
+            except Exception:
+                pass
+            ima.pixels.foreach_set(np.clip(rgba_float, 0.0, 1.0).astype(np.float32).ravel())
+            ima.update()
+            return ima
+
+        generated_images = {}
+
+        if self.export_base_color:
+            generated_images["BaseColor"] = _make_or_update_image(f"{prefix}_BaseColor", color_arr, is_data=False)
+
+        if self.export_roughness:
+            r_rgba = np.ones((h, w, 4), dtype=np.float32)
+            r_rgba[:, :, 0] = pbr_arr[:, :, 0]
+            r_rgba[:, :, 1] = pbr_arr[:, :, 0]
+            r_rgba[:, :, 2] = pbr_arr[:, :, 0]
+            generated_images["Roughness"] = _make_or_update_image(f"{prefix}_Roughness", r_rgba, is_data=True)
+
+        if self.export_metallic:
+            m_rgba = np.ones((h, w, 4), dtype=np.float32)
+            m_rgba[:, :, 0] = pbr_arr[:, :, 1]
+            m_rgba[:, :, 1] = pbr_arr[:, :, 1]
+            m_rgba[:, :, 2] = pbr_arr[:, :, 1]
+            generated_images["Metallic"] = _make_or_update_image(f"{prefix}_Metallic", m_rgba, is_data=True)
+
+        if self.export_height:
+            h_rgba = np.ones((h, w, 4), dtype=np.float32)
+            h_rgba[:, :, 0] = pbr_arr[:, :, 2]
+            h_rgba[:, :, 1] = pbr_arr[:, :, 2]
+            h_rgba[:, :, 2] = pbr_arr[:, :, 2]
+            generated_images["Height"] = _make_or_update_image(f"{prefix}_Height", h_rgba, is_data=True)
+
+        if self.export_normal:
+            h_field = pbr_arr[:, :, 2]
+            bump_str = float(getattr(node, "bump_strength", 1.0)) * 8.0
+            dh_dx = (np.roll(h_field, -1, axis=1) - np.roll(h_field, 1, axis=1)) * 0.5 * bump_str
+            dh_dy = (np.roll(h_field, -1, axis=0) - np.roll(h_field, 1, axis=0)) * 0.5 * bump_str
+            nx = -dh_dx
+            ny = -dh_dy if self.normal_convention == 'OPENGL' else dh_dy
+            nz = np.ones_like(h_field)
+            inv_len = 1.0 / np.maximum(np.sqrt(nx * nx + ny * ny + nz * nz), 1e-6)
+            n_rgba = np.ones((h, w, 4), dtype=np.float32)
+            n_rgba[:, :, 0] = (nx * inv_len) * 0.5 + 0.5
+            n_rgba[:, :, 1] = (ny * inv_len) * 0.5 + 0.5
+            n_rgba[:, :, 2] = (nz * inv_len) * 0.5 + 0.5
+            generated_images["Normal"] = _make_or_update_image(f"{prefix}_Normal", n_rgba, is_data=True)
+
+        if self.export_orm:
+            orm_rgba = np.ones((h, w, 4), dtype=np.float32)
+            orm_rgba[:, :, 0] = 1.0
+            orm_rgba[:, :, 1] = pbr_arr[:, :, 0]
+            orm_rgba[:, :, 2] = pbr_arr[:, :, 1]
+            generated_images["ORM"] = _make_or_update_image(f"{prefix}_ORM", orm_rgba, is_data=True)
+
+        if self.export_emission and has_any_emission:
+            em_out = em_arr.copy()
+            em_out[:, :, 3] = 1.0
+            generated_images["Emission"] = _make_or_update_image(f"{prefix}_Emission", em_out, is_data=False)
+
+        saved_paths = []
+        if self.mode in {'BOTH', 'FILES_ONLY'}:
+            out_dir = bpy.path.abspath(self.export_dir)
+            if not out_dir or out_dir.startswith("//"):
+                import tempfile
+                out_dir = os.path.join(tempfile.gettempdir(), f"{prefix}_textures")
+            os.makedirs(out_dir, exist_ok=True)
+            for ch_key, ima in generated_images.items():
+                fpath = os.path.join(out_dir, f"{prefix}_{ch_key}.png")
+                ima.filepath_raw = fpath
+                ima.file_format = 'PNG'
+                ima.save()
+                saved_paths.append(fpath)
+
+        if self.mode in {'BOTH', 'NODES_ONLY'} and mat is not None and mat.use_nodes and mat.node_tree is not None:
+            ntree = mat.node_tree
+            bsdf = next((n for n in ntree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+            if bsdf is not None:
+                node["_tex_paint_baked_set_active"] = True
+                # Remove existing generated texture set nodes from previous bakes
+                for old_n in [n for n in ntree.nodes if n.get("_tex_paint_exported_set_node")]:
+                    ntree.nodes.remove(old_n)
+
+                base_x = node.location.x
+                base_y = node.location.y - 340.0
+                row_idx = 0
+
+                def _spawn_tex_node(label, ima):
+                    nonlocal row_idx
+                    tn = ntree.nodes.new("ShaderNodeTexImage")
+                    tn.name = f"TexSet_{label}"
+                    tn.label = f"{prefix} {label}"
+                    tn.image = ima
+                    tn["_tex_paint_exported_set_node"] = True
+                    tn.location = (base_x, base_y - row_idx * 260.0)
+                    row_idx += 1
+                    return tn
+
+                if "BaseColor" in generated_images:
+                    tn_c = _spawn_tex_node("Base Color", generated_images["BaseColor"])
+                    sock_bc = bsdf.inputs.get("Base Color")
+                    if sock_bc:
+                        ntree.links.new(tn_c.outputs["Color"], sock_bc)
+
+                if "Roughness" in generated_images:
+                    tn_r = _spawn_tex_node("Roughness", generated_images["Roughness"])
+                    sock_r = bsdf.inputs.get("Roughness")
+                    if sock_r:
+                        ntree.links.new(tn_r.outputs["Color"], sock_r)
+
+                if "Metallic" in generated_images:
+                    tn_m = _spawn_tex_node("Metallic", generated_images["Metallic"])
+                    sock_m = bsdf.inputs.get("Metallic")
+                    if sock_m:
+                        ntree.links.new(tn_m.outputs["Color"], sock_m)
+
+                if "Normal" in generated_images:
+                    tn_n = _spawn_tex_node("Normal", generated_images["Normal"])
+                    nmap = ntree.nodes.new("ShaderNodeNormalMap")
+                    nmap.label = f"{prefix} Normal Map"
+                    nmap["_tex_paint_exported_set_node"] = True
+                    nmap.location = (base_x + 260.0, tn_n.location.y)
+                    ntree.links.new(tn_n.outputs["Color"], nmap.inputs["Color"])
+                    sock_n = bsdf.inputs.get("Normal")
+                    if sock_n:
+                        ntree.links.new(nmap.outputs["Normal"], sock_n)
+
+                if "Emission" in generated_images:
+                    tn_e = _spawn_tex_node("Emission", generated_images["Emission"])
+                    sock_e = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+                    if sock_e:
+                        ntree.links.new(tn_e.outputs["Color"], sock_e)
+                    sock_es = bsdf.inputs.get("Emission Strength")
+                    if sock_es and not sock_es.is_linked and sock_es.default_value == 0.0:
+                        sock_es.default_value = 1.0
+
+        ch_names = ", ".join(generated_images.keys())
+        if saved_paths:
+            self.report({'INFO'}, f"Exported {len(saved_paths)} PBR maps ({ch_names}) to {os.path.dirname(saved_paths[0])}")
+        else:
+            self.report({'INFO'}, f"Created standard PBR Texture Set nodes ({ch_names}) in '{mat.name if mat else prefix}'")
+        return {'FINISHED'}
+
+
+class NODE_OT_tex_paint_reconnect_live_layers(Operator):
+    """Switch the material back from baked Image Texture nodes to the live Multilayer Texture node"""
+    bl_idname = "node.tex_paint_reconnect_live_layers"
+    bl_label = "Reconnect Live Paint Layers"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    remove_baked_nodes: BoolProperty(
+        name="Remove Baked Image Nodes",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return tex_paint_node_from_context(context) is not None
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        ob = getattr(context, "active_object", None)
+        mat = (ob.active_material if ob else None) or _get_material_for_node(node)
+        if node is None or mat is None or not mat.use_nodes or mat.node_tree is None:
+            return {'CANCELLED'}
+        if "_tex_paint_baked_set_active" in node:
+            del node["_tex_paint_baked_set_active"]
+        if self.remove_baked_nodes:
+            for old_n in [n for n in mat.node_tree.nodes if n.get("_tex_paint_exported_set_node")]:
+                mat.node_tree.nodes.remove(old_n)
+        _ensure_single_node_pbr_links(mat, node)
+        self.report({'INFO'}, "Reconnected live Multilayer Texture node to Principled BSDF")
+        return {'FINISHED'}
+
+
 class TEXPAINT_MT_layer_specials(Menu):
-    """Special layer operations (Fill, Clear, Invert, Flip, Rasterize, Copy Mask, Merge Visible, Flatten)"""
+    """Special layer operations (Fill, Clear, Invert, Flip, Rasterize, Copy Mask, Merge Visible, Flatten, Export Texture Set)"""
     bl_idname = "TEXPAINT_MT_layer_specials"
     bl_label = "Layer Specials"
 
     def draw(self, _context):
         layout = self.layout
+        layout.operator("node.tex_paint_export_texture_set", text="Export / Bake PBR Texture Set...", icon='EXPORT')
+        layout.separator()
         layout.operator("node.tex_paint_layer_pixel_action", text="Fill Layer with Brush Color", icon='COLOR').action = 'FILL_BRUSH'
         layout.operator("node.tex_paint_layer_pixel_action", text="Clear Layer to Transparent", icon='TRASH').action = 'CLEAR'
         layout.operator("node.tex_paint_layer_pixel_action", text="Invert Layer RGB", icon='ARROW_LEFTRIGHT').action = 'INVERT_RGB'
@@ -7276,14 +7604,23 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             _draw_mask_effect_stack(insp_col, context, node, layer, is_2d_only=is_2d_only)
 
     if not compact:
+        if bool(node.get("_tex_paint_baked_set_active", False)):
+            baked_row = layout.row(align=True)
+            baked_row.alert = True
+            baked_row.operator(
+                "node.tex_paint_reconnect_live_layers",
+                text="Baked Texture Set Active — Switch Back to Live Layers",
+                icon='FILE_REFRESH',
+            )
         foot_row = layout.row(align=True)
         foot_row.label(
-            text=iface_("Canvas: {:d} x {:d} {:s}").format(
+            text=iface_("{:d}x{:d} {:s}").format(
                 node.canvas_width, node.canvas_height, iface_("Float") if node.use_float else iface_("Byte"),
             ),
             icon='IMAGE_RGB_ALPHA',
         )
         foot_row.operator("node.tex_paint_canvas_resize", text="Resize", icon='FULLSCREEN_ENTER')
+        foot_row.operator("node.tex_paint_export_texture_set", text="Export Set", icon='EXPORT')
 
 
 class VIEW3D_PT_tex_paint_layers(Panel):
@@ -9073,6 +9410,8 @@ classes = (
     NODE_OT_tex_paint_fill_channel_toggle,
     TEXPAINT_MT_fill_channels_and_presets,
     NODE_OT_tex_paint_layer_pixel_action,
+    NODE_OT_tex_paint_export_texture_set,
+    NODE_OT_tex_paint_reconnect_live_layers,
     TEXPAINT_MT_layer_specials,
     NODE_OT_tex_paint_smart_mask_recipe,
     TEXPAINT_MT_smart_mask_recipes,
