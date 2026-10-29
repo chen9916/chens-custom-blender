@@ -234,6 +234,17 @@ _MASK_GEN_LABELS = {
     'POSITION_Z': "Height Gradient",
 }
 
+_MASK_FILTER_LABELS = {
+    'BLUR': "Filter: Blur",
+    'BLUR_SLOPE': "Filter: Blur Slope",
+    'SHARPEN': "Filter: Sharpen",
+    'DILATE_ERODE': "Filter: Grow / Shrink",
+    'BEVEL': "Filter: Bevel",
+    'THRESHOLD': "Filter: Threshold",
+    'POSTERIZE': "Filter: Posterize",
+    'HIGHPASS': "Filter: Highpass",
+}
+
 _BLEND_SHORT_LABELS = {
     'REPLACE': "Norm",
     'MULTIPLY': "Mul",
@@ -263,19 +274,29 @@ _LAYER_BLEND_SHORT_LABELS = {
 }
 
 
-def _make_default_mask_effect(effect_type='GRUNGE', uid=1, is_first=True, gen_type='EDGE_WEAR', fill_source='GRUNGE'):
+def _make_default_mask_effect(
+    effect_type='GRUNGE',
+    uid=1,
+    is_first=True,
+    gen_type='EDGE_WEAR',
+    fill_source='GRUNGE',
+    filter_type='BLUR',
+):
     if effect_type == 'GENERATOR':
         default_blend = 'REPLACE' if is_first else 'ADD'
-        name = _MASK_GEN_LABELS.get(gen_type, "Smart Mask")
+        name = _MASK_GEN_LABELS.get(gen_type, "Generator")
     elif effect_type == 'PAINT':
         default_blend = 'REPLACE'  # Normal (Paint White = Reveal, Paint Black = Hide)
         name = "Paint Mask"
     elif effect_type == 'LEVELS':
         default_blend = 'REPLACE'
-        name = "Levels & Contrast"
+        name = "Levels"
+    elif effect_type == 'FILTER':
+        default_blend = 'REPLACE'
+        name = _MASK_FILTER_LABELS.get(filter_type, "Filter: Blur")
     elif fill_source == 'CUSTOM_IMAGE':
         default_blend = 'REPLACE' if is_first else 'ADD'
-        name = "Image Fill"
+        name = "Bitmap Fill"
     else:
         default_blend = 'REPLACE' if is_first else 'MULTIPLY'
         name = "Grunge Fill"
@@ -287,19 +308,20 @@ def _make_default_mask_effect(effect_type='GRUNGE', uid=1, is_first=True, gen_ty
     return {
         "uid": int(uid),
         "name": name,
-        "type": effect_type,         # 'GENERATOR' | 'PAINT' | 'GRUNGE' | 'LEVELS'
+        "type": effect_type,         # 'GENERATOR' | 'PAINT' | 'GRUNGE' | 'LEVELS' | 'FILTER'
         "enabled": True,
         "blend_mode": default_blend, # 'REPLACE' | 'MULTIPLY' | 'SUBTRACT' | 'ADD' | 'SCREEN' | 'OVERLAY' | 'MAX' | 'MIN'
         "opacity": 1.0,
         "invert": False,
 
-        # GENERATOR (Smart Mask) settings
+        # GENERATOR settings
         "gen_type": gen_type,
         "gen_balance": 0.50,
         "gen_contrast": 0.45,
         "gen_radius": 0.35,
         "gen_noise": 0.0,
         "gen_noise_scale": 8.0,
+        "gen_global_ao": True,
 
         # GRUNGE / IMAGE FILL (Substance Mask Fill) settings
         "category": "CUSTOM" if is_custom_img else "BITMAP_GRUNGES",
@@ -322,6 +344,12 @@ def _make_default_mask_effect(effect_type='GRUNGE', uid=1, is_first=True, gen_ty
         # LEVELS settings
         "lvl_balance": 0.50,
         "lvl_contrast": 0.0,
+
+        # FILTER (Substance Mask Filter: Blur, Blur Slope, Sharpen, Grow/Shrink, Bevel, Threshold, Posterize, Highpass)
+        "filter_type": filter_type,
+        "flt_radius": 6.0,
+        "flt_strength": 1.0,
+        "flt_scale": 8.0,
     }
 
 
@@ -348,6 +376,8 @@ _LAST_COMPOSITED_MASK = {}       # (node_ptr, layer_uid) -> ndarray (uint8[w*h])
 _LAST_MASK_SAMPLE = {}           # (node_ptr, layer_uid) -> ndarray (256-byte strided sample for 5us stroke detection)
 _PENDING_STROKE_SNAPSHOT = {}    # (node_ptr, layer_uid) -> int hash (detects when brush stroke finishes)
 _PENDING_HIRES_REFINE = {}       # (node_ptr, layer_uid) -> (node, layer, float_timestamp)
+_GLOBAL_AO_CACHE = {}            # (ob_ptr, w, h, radius_q, scene_sig) -> ndarray uint8[w*h]
+_UV_TEXEL_GRID_CACHE = {}        # (mesh_ptr, n_v, n_p, w, h) -> dict
 _LUT_THREAD_POOL = None
 _INTERNAL_REPROJECTING = False
 
@@ -719,7 +749,9 @@ def _update_active_mask_effect(node, layer, updates, ensure_type=None, flush_jso
         if im_name:
             eff["name"] = os.path.splitext(im_name)[0][:28]
     elif eff["type"] == 'GENERATOR' and "gen_type" in updates:
-        eff["name"] = _MASK_GEN_LABELS.get(eff["gen_type"], "Smart Mask")
+        eff["name"] = _MASK_GEN_LABELS.get(eff["gen_type"], "Generator")
+    elif eff["type"] == 'FILTER' and "filter_type" in updates:
+        eff["name"] = _MASK_FILTER_LABELS.get(eff["filter_type"], "Filter: Blur")
 
     st["active"] = True
     _save_layer_grunge_state(node, layer, st, flush_json=flush_json)
@@ -1060,11 +1092,459 @@ def _read_mask_ibuf_r_u8(mask_ibuf_ptr, w, h):
     return np.zeros(w * h, dtype=np.uint8)
 
 
+_MESH_MAP_SLOTS = (
+    ("normal", "Normal (Tangent)", "NORMALS_FACE"),
+    ("normal_ws", "World Space Normal", "ORIENTATION_GLOBAL"),
+    ("id_map", "ID (Color / Part)", "COLOR"),
+    ("ao", "Ambient Occlusion", "SHADING_RENDERED"),
+    ("curvature", "Curvature", "SMOOTHCURVE"),
+    ("position", "Position", "EMPTY_AXIS"),
+    ("thickness", "Thickness", "MOD_SOLIDIFY"),
+)
+
+_DEFAULT_MESH_MAPS_STATE = {
+    "use_baked_maps": True,
+    "source_mode": "LOW_POLY",      # 'LOW_POLY' | 'HIGH_POLY_OB' | 'HIGH_POLY_COL'
+    "high_poly_ob": "",
+    "high_poly_col": "",
+    "ao_scope": "GLOBAL",           # 'GLOBAL' (Surrounding Scene Objects) | 'MATERIAL' (Shared Parts) | 'SELF' (Isolated)
+    "cage_dist": 0.08,
+    "ao_dist": 0.65,
+    "bake_res": "MATCH",            # 'MATCH' | '512' | '1024' | '2048' | '4096'
+    "apply_normal_to_shader": True,
+    "maps": {
+        "normal": "",
+        "normal_ws": "",
+        "id_map": "",
+        "ao": "",
+        "curvature": "",
+        "position": "",
+        "thickness": "",
+    },
+}
+
+
+def _get_mesh_maps_state(node):
+    """Return the Substance-Painter-style Mesh Maps & High-Poly Baker state dict for `node`'s material."""
+    st = dict(_DEFAULT_MESH_MAPS_STATE)
+    st["maps"] = dict(_DEFAULT_MESH_MAPS_STATE["maps"])
+    if node is None:
+        return st
+    owner = _canonical_mask_owner_node(node)
+    raw = owner.get("_mesh_maps_json", "")
+    if raw:
+        try:
+            saved = json.loads(raw)
+            if isinstance(saved, dict):
+                saved_maps = saved.get("maps")
+                for k, v in saved.items():
+                    if k != "maps":
+                        st[k] = v
+                if isinstance(saved_maps, dict):
+                    for mk in st["maps"]:
+                        if mk in saved_maps:
+                            st["maps"][mk] = str(saved_maps[mk] or "")
+        except Exception:
+            pass
+    return st
+
+
+def _save_mesh_maps_state(node, updates=None, map_updates=None):
+    """Persist Mesh Maps & High-Poly Baker state onto the canonical base-color `ShaderNodeTexPaint`."""
+    if node is None:
+        return None
+    owner = _canonical_mask_owner_node(node)
+    st = _get_mesh_maps_state(owner)
+    if updates:
+        for k, v in updates.items():
+            if k != "maps":
+                st[k] = v
+    if map_updates:
+        for mk, mv in map_updates.items():
+            st["maps"][mk] = str(mv or "")
+    try:
+        owner["_mesh_maps_json"] = json.dumps(st)
+    except Exception:
+        pass
+    return None
+
+
+def _read_baked_image_channel_f32(ima, w, h, channel=0):
+    """Read a channel (or grayscale) from `bpy.data.images` `ima` resized to `(h, w)` float32[0..1]."""
+    import numpy as np
+    if ima is None:
+        return None
+    iw, ih = int(ima.size[0]), int(ima.size[1])
+    if iw <= 0 or ih <= 0:
+        return None
+    arr = np.empty(iw * ih * 4, dtype=np.float32)
+    try:
+        ima.pixels.foreach_get(arr)
+    except Exception:
+        return None
+    ch_2d = arr.reshape(ih, iw, 4)[:, :, channel]
+    if iw == w and ih == h:
+        return np.clip(ch_2d, 0.0, 1.0)
+    ys = np.clip((np.linspace(0.0, ih - 1.0, h)).astype(np.int32), 0, ih - 1)
+    xs = np.clip((np.linspace(0.0, iw - 1.0, w)).astype(np.int32), 0, iw - 1)
+    return np.clip(ch_2d[ys[:, None], xs[None, :]], 0.0, 1.0)
+
+
+def _build_uv_texel_map(ob, grid_w, grid_h):
+    """Vectorized UV triangle rasterizer returning covered texels `(pix_idx, tri_idx, w0, w1, w2, tri_verts, tri_loops)` at `(grid_w, grid_h)`.
+    Cached by mesh pointer & topology so subsequent evaluations take 0.0ms.
+    """
+    import numpy as np
+    if ob is None or ob.type != 'MESH' or ob.data is None:
+        return None
+    mesh = ob.data
+    if not mesh.uv_layers or len(mesh.vertices) == 0 or len(mesh.polygons) == 0:
+        return None
+
+    ckey = (mesh.as_pointer(), len(mesh.vertices), len(mesh.polygons), int(grid_w), int(grid_h))
+    cached = _UV_TEXEL_GRID_CACHE.get(ckey)
+    if cached is not None:
+        return cached
+
+    mesh.calc_loop_triangles()
+    n_tris = len(mesh.loop_triangles)
+    n_loops = len(mesh.loops)
+    if n_tris == 0 or n_loops == 0:
+        return None
+
+    tri_loops = np.empty(n_tris * 3, dtype=np.int32)
+    tri_verts = np.empty(n_tris * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("loops", tri_loops)
+    mesh.loop_triangles.foreach_get("vertices", tri_verts)
+    tri_loops = tri_loops.reshape(n_tris, 3)
+    tri_verts = tri_verts.reshape(n_tris, 3)
+
+    uv_layer = mesh.uv_layers.active or mesh.uv_layers[0]
+    uvs = np.empty(n_loops * 2, dtype=np.float32)
+    uv_layer.data.foreach_get("uv", uvs)
+    uvs = uvs.reshape(n_loops, 2)
+
+    uv0 = uvs[tri_loops[:, 0]] * np.array([grid_w, grid_h], dtype=np.float32)
+    uv1 = uvs[tri_loops[:, 1]] * np.array([grid_w, grid_h], dtype=np.float32)
+    uv2 = uvs[tri_loops[:, 2]] * np.array([grid_w, grid_h], dtype=np.float32)
+
+    e0 = uv1 - uv0
+    e1 = uv2 - uv0
+    denom = e0[:, 0] * e1[:, 1] - e0[:, 1] * e1[:, 0]
+    valid_tri = np.abs(denom) > 1e-6
+    inv_denom = np.where(valid_tri, 1.0 / np.where(valid_tri, denom, 1.0), 0.0)
+
+    xmin = np.clip(np.floor(np.minimum(uv0[:, 0], np.minimum(uv1[:, 0], uv2[:, 0])) - 0.5).astype(np.int32), 0, grid_w - 1)
+    xmax = np.clip(np.ceil(np.maximum(uv0[:, 0], np.maximum(uv1[:, 0], uv2[:, 0])) + 0.5).astype(np.int32), 0, grid_w - 1)
+    ymin = np.clip(np.floor(np.minimum(uv0[:, 1], np.minimum(uv1[:, 1], uv2[:, 1])) - 0.5).astype(np.int32), 0, grid_h - 1)
+    ymax = np.clip(np.ceil(np.maximum(uv0[:, 1], np.maximum(uv1[:, 1], uv2[:, 1])) + 0.5).astype(np.int32), 0, grid_h - 1)
+
+    span_x = xmax - xmin + 1
+    span_y = ymax - ymin + 1
+    valid_tri &= (span_x > 0) & (span_y > 0)
+
+    buf_tri = np.full(grid_h * grid_w, -1, dtype=np.int32)
+    buf_w1 = np.zeros(grid_h * grid_w, dtype=np.float32)
+    buf_w2 = np.zeros(grid_h * grid_w, dtype=np.float32)
+
+    # 1. Batch-vectorized rasterization for all small triangles (span <= 14x14)
+    MAX_S = 14
+    small_mask = valid_tri & (span_x <= MAX_S) & (span_y <= MAX_S)
+    small_ids = np.flatnonzero(small_mask)
+    if len(small_ids) > 0:
+        # Process in chunks of 4096 triangles to stay in L2 cache
+        oy = np.arange(MAX_S, dtype=np.int32)[None, :, None]
+        ox = np.arange(MAX_S, dtype=np.int32)[None, None, :]
+        for c_start in range(0, len(small_ids), 4096):
+            s_idx = small_ids[c_start:c_start + 4096]
+            px = xmin[s_idx, None, None] + ox
+            py = ymin[s_idx, None, None] + oy
+            in_box = (px <= xmax[s_idx, None, None]) & (py <= ymax[s_idx, None, None])
+            dx = (px.astype(np.float32) + 0.5) - uv0[s_idx, 0, None, None]
+            dy = (py.astype(np.float32) + 0.5) - uv0[s_idx, 1, None, None]
+            inv_d = inv_denom[s_idx, None, None]
+            w1 = (dx * e1[s_idx, 1, None, None] - dy * e1[s_idx, 0, None, None]) * inv_d
+            w2 = (e0[s_idx, 0, None, None] * dy - e0[s_idx, 1, None, None] * dx) * inv_d
+            w0 = 1.0 - w1 - w2
+            hit = in_box & (w0 >= -0.02) & (w1 >= -0.02) & (w2 >= -0.02)
+            t_loc, y_loc, x_loc = np.nonzero(hit)
+            if len(t_loc) > 0:
+                p_flat = py[t_loc, y_loc, x_loc] * grid_w + px[t_loc, y_loc, x_loc]
+                buf_tri[p_flat] = s_idx[t_loc]
+                buf_w1[p_flat] = np.clip(w1[t_loc, y_loc, x_loc], 0.0, 1.0)
+                buf_w2[p_flat] = np.clip(w2[t_loc, y_loc, x_loc], 0.0, 1.0)
+
+    # 2. Vectorized 2D meshgrid slice for any larger triangles (span > 14)
+    large_ids = np.flatnonzero(valid_tri & (~small_mask))
+    for ti in large_ids:
+        x0, x1 = int(xmin[ti]), int(xmax[ti])
+        y0, y1 = int(ymin[ti]), int(ymax[ti])
+        ys, xs = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+        dx = (xs.astype(np.float32) + 0.5) - uv0[ti, 0]
+        dy = (ys.astype(np.float32) + 0.5) - uv0[ti, 1]
+        inv_d = float(inv_denom[ti])
+        w1 = (dx * float(e1[ti, 1]) - dy * float(e1[ti, 0])) * inv_d
+        w2 = (float(e0[ti, 0]) * dy - float(e0[ti, 1]) * dx) * inv_d
+        w0 = 1.0 - w1 - w2
+        hit = (w0 >= -0.015) & (w1 >= -0.015) & (w2 >= -0.015)
+        if np.any(hit):
+            p_flat = (ys[hit] * grid_w + xs[hit]).ravel()
+            buf_tri[p_flat] = int(ti)
+            buf_w1[p_flat] = np.clip(w1[hit].ravel(), 0.0, 1.0)
+            buf_w2[p_flat] = np.clip(w2[hit].ravel(), 0.0, 1.0)
+
+    cov_idx = np.flatnonzero(buf_tri >= 0)
+    t_idx = buf_tri[cov_idx]
+    w1_c = buf_w1[cov_idx]
+    w2_c = buf_w2[cov_idx]
+    w0_c = np.maximum(0.0, 1.0 - w1_c - w2_c)
+    w_sum = np.maximum(w0_c + w1_c + w2_c, 1e-6)
+    w0_c /= w_sum
+    w1_c /= w_sum
+    w2_c /= w_sum
+
+    res = {
+        "grid_w": int(grid_w),
+        "grid_h": int(grid_h),
+        "pix_idx": cov_idx,
+        "tri_idx": t_idx,
+        "w0": w0_c,
+        "w1": w1_c,
+        "w2": w2_c,
+        "tri_verts": tri_verts,
+        "tri_loops": tri_loops,
+        "uvs": uvs,
+    }
+    _UV_TEXEL_GRID_CACHE[ckey] = res
+    return res
+
+
+def _dilate_2d_buffer_into_gutter(img_2d, cov_mask_2d, iterations=3):
+    """Dilate covered UV island values by `iterations` pixels into the UV gutter to eliminate seam bleeding."""
+    import numpy as np
+    out = img_2d.copy()
+    mask = cov_mask_2d.copy()
+    for _ in range(iterations):
+        unfilled = ~mask
+        if not np.any(unfilled):
+            break
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nbr_m = np.roll(np.roll(mask, dy, axis=0), dx, axis=1)
+            fill_here = unfilled & nbr_m
+            if np.any(fill_here):
+                nbr_v = np.roll(np.roll(out, dy, axis=0), dx, axis=1)
+                out[fill_here] = nbr_v[fill_here]
+                mask[fill_here] = True
+                unfilled = ~mask
+    return out
+
+
+_HEMI_DIRS_10 = (
+    (0.0, 0.0, 1.0),
+    (0.5877, 0.0, 0.8090),
+    (-0.5877, 0.0, 0.8090),
+    (0.0, 0.5877, 0.8090),
+    (0.0, -0.5877, 0.8090),
+    (0.6881, 0.5000, 0.5257),
+    (-0.6881, 0.5000, 0.5257),
+    (0.6881, -0.5000, 0.5257),
+    (-0.6881, -0.5000, 0.5257),
+    (0.0, 0.8506, 0.5257),
+)
+
+
+def _build_world_bvh_for_objects(obs):
+    """Build a single combined World-Space C++ `BVHTree` from a list of mesh objects `obs`."""
+    import numpy as np
+    from mathutils.bvhtree import BVHTree
+
+    all_verts = []
+    all_tris = []
+    v_offset = 0
+    for ob in obs:
+        if ob is None or ob.type != 'MESH' or ob.data is None:
+            continue
+        mesh = ob.data
+        nv = len(mesh.vertices)
+        if nv == 0 or len(mesh.polygons) == 0:
+            continue
+        mesh.calc_loop_triangles()
+        nt = len(mesh.loop_triangles)
+        if nt == 0:
+            continue
+        v_co = np.empty(nv * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", v_co)
+        v_co = v_co.reshape(nv, 3)
+        mw = np.array(ob.matrix_world, dtype=np.float32)
+        v_w = v_co @ mw[:3, :3].T + mw[:3, 3]
+        t_v = np.empty(nt * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", t_v)
+        t_v = t_v.reshape(nt, 3) + v_offset
+        all_verts.append(v_w)
+        all_tris.append(t_v)
+        v_offset += nv
+
+    if not all_verts:
+        return None
+    V = np.vstack(all_verts).tolist()
+    T = np.vstack(all_tris).tolist()
+    return BVHTree.FromPolygons(V, T)
+
+
+def _compute_part_external_scene_occlusion(ob_part, other_obs, w, h, radius):
+    """Compute World-Space inter-object Ambient Occlusion (0..255 occlusion amount) cast by `other_obs` onto `ob_part`."""
+    import numpy as np
+    if ob_part is None or ob_part.data is None or not other_obs:
+        return None
+
+    # Filter other_obs to those whose world bounding box is within ao_dist of ob_part
+    mw = ob_part.matrix_world
+    pts = [mw @ Vector(co) for co in ob_part.bound_box]
+    bmin = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    bmax = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    bsize = bmax - bmin
+    max_ext = max(float(bsize.x), float(bsize.y), float(bsize.z), 1e-3)
+    ao_dist = max((0.20 + 0.55 * float(radius)) * max_ext, 0.02)
+    contact_dist = max(0.22 * max_ext, 0.01)
+
+    nearby_obs = []
+    for o in other_obs:
+        if o == ob_part or o.type != 'MESH' or o.data is None or len(o.data.vertices) == 0:
+            continue
+        omw = o.matrix_world
+        opts = [omw @ Vector(co) for co in o.bound_box]
+        obmin = Vector((min(p.x for p in opts), min(p.y for p in opts), min(p.z for p in opts)))
+        obmax = Vector((max(p.x for p in opts), max(p.y for p in opts), max(p.z for p in opts)))
+        if (
+            obmax.x >= bmin.x - ao_dist and obmin.x <= bmax.x + ao_dist and
+            obmax.y >= bmin.y - ao_dist and obmin.y <= bmax.y + ao_dist and
+            obmax.z >= bmin.z - ao_dist and obmin.z <= bmax.z + ao_dist
+        ):
+            nearby_obs.append(o)
+
+    if not nearby_obs:
+        return None
+
+    scene_sig = tuple(
+        (o.name, o.data.as_pointer(), len(o.data.vertices), tuple(round(v, 3) for row in o.matrix_world for v in row))
+        for o in [ob_part] + nearby_obs
+    )
+    ckey = (ob_part.as_pointer(), int(w), int(h), round(float(radius), 2), scene_sig)
+    cached = _GLOBAL_AO_CACHE.get(ckey)
+    if cached is not None:
+        return cached
+
+    bvh = _build_world_bvh_for_objects(nearby_obs)
+    if bvh is None:
+        return None
+
+    mesh = ob_part.data
+    nv = len(mesh.vertices)
+    v_co = np.empty(nv * 3, dtype=np.float32)
+    v_no = np.empty(nv * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", v_co)
+    mesh.vertices.foreach_get("normal", v_no)
+    v_co = v_co.reshape(nv, 3)
+    v_no = v_no.reshape(nv, 3)
+
+    mw_np = np.array(mw, dtype=np.float32)
+    rot_3x3 = mw_np[:3, :3]
+    inv_t = np.linalg.inv(rot_3x3).T
+    V_w = v_co @ rot_3x3.T + mw_np[:3, 3]
+    N_w = v_no @ inv_t.T
+    n_len = np.maximum(np.linalg.norm(N_w, axis=1, keepdims=True), 1e-6)
+    N_w /= n_len
+
+    v_occ = np.zeros(nv, dtype=np.float32)
+    eps = 0.0025 * max_ext
+    inv_ao_dist = 1.0 / ao_dist
+    inv_contact = 1.0 / contact_dist
+
+    # Evaluate hemisphere raycast + contact proximity per vertex against surrounding objects' BVH
+    ray_cast = bvh.ray_cast
+    find_nearest = bvh.find_nearest
+    for vi in range(nv):
+        px, py, pz = float(V_w[vi, 0]), float(V_w[vi, 1]), float(V_w[vi, 2])
+        nx, ny, nz = float(N_w[vi, 0]), float(N_w[vi, 1]), float(N_w[vi, 2])
+        orig = Vector((px + nx * eps, py + ny * eps, pz + nz * eps))
+
+        # Orthonormal basis around vertex normal N
+        if abs(nz) < 0.9:
+            tx, ty, tz = -ny, nx, 0.0
+        else:
+            tx, ty, tz = 0.0, -nz, ny
+        t_inv = 1.0 / max(math.hypot(tx, ty, tz), 1e-6)
+        tx, ty, tz = tx * t_inv, ty * t_inv, tz * t_inv
+        bx = ny * tz - nz * ty
+        by = nz * tx - nx * tz
+        bz = nx * ty - ny * tx
+
+        occ_sum = 0.0
+        for hx, hy, hz in _HEMI_DIRS_10:
+            dx = tx * hx + bx * hy + nx * hz
+            dy = ty * hx + by * hy + ny * hz
+            dz = tz * hx + bz * hy + nz * hz
+            hit_loc, _hit_no, _hit_idx, hit_d = ray_cast(orig, Vector((dx, dy, dz)), ao_dist)
+            if hit_loc is not None and hit_d is not None:
+                occ_sum += (1.0 - float(hit_d) * inv_ao_dist)
+
+        occ_val = (occ_sum / float(len(_HEMI_DIRS_10))) * 1.35
+
+        # Contact / Proximity occlusion for 90-degree seams & touching modular parts
+        near_loc, _near_no, _near_idx, near_d = find_nearest(Vector((px, py, pz)), contact_dist)
+        if near_loc is not None and near_d is not None:
+            to_near = near_loc - Vector((px, py, pz))
+            # Only occlude if the nearby surface is not strictly behind the back-face
+            if near_d <= contact_dist * 0.25 or (to_near.x * nx + to_near.y * ny + to_near.z * nz) >= -0.25 * near_d:
+                c_fall = max(0.0, 1.0 - float(near_d) * inv_contact)
+                occ_val = max(occ_val, c_fall * c_fall * 0.88)
+
+        v_occ[vi] = min(occ_val, 1.0)
+
+    if float(np.max(v_occ)) <= 1e-3:
+        _GLOBAL_AO_CACHE[ckey] = None
+        return None
+
+    # Smooth vertex occlusion 1 pass across mesh edges for soft gradients
+    grid_w = min(int(w), 512)
+    grid_h = min(int(h), 512)
+    tmap = _build_uv_texel_map(ob_part, grid_w, grid_h)
+    if tmap is None:
+        return None
+
+    tv = tmap["tri_verts"][tmap["tri_idx"]]
+    pix_occ = (
+        v_occ[tv[:, 0]] * tmap["w0"]
+        + v_occ[tv[:, 1]] * tmap["w1"]
+        + v_occ[tv[:, 2]] * tmap["w2"]
+    )
+    occ_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
+    cov_grid = np.zeros((grid_h, grid_w), dtype=bool)
+    occ_grid.ravel()[tmap["pix_idx"]] = pix_occ
+    cov_grid.ravel()[tmap["pix_idx"]] = True
+    occ_grid = _dilate_2d_buffer_into_gutter(occ_grid, cov_grid, iterations=2)
+    occ_grid = _fast_mask_box_blur_2d_f32(occ_grid, 1)
+
+    if grid_w != w or grid_h != h:
+        ys = np.clip((np.linspace(0.0, grid_h - 1.0, h)).astype(np.int32), 0, grid_h - 1)
+        xs = np.clip((np.linspace(0.0, grid_w - 1.0, w)).astype(np.int32), 0, grid_w - 1)
+        occ_full = occ_grid[ys[:, None], xs[None, :]].ravel()
+    else:
+        occ_full = occ_grid.ravel()
+
+    occ_u8 = (np.clip(occ_full, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    _GLOBAL_AO_CACHE[ckey] = occ_u8
+    return occ_u8
+
+
 def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
-    """Evaluate C++ BKE_tex_paint_layer_generate_mask in raw mode (balance=0.5, contrast=0.0) across all mesh objects sharing the material and cache uint8[w*h]."""
+    """Evaluate C++ BKE_tex_paint_layer_generate_mask in raw mode (balance=0.5, contrast=0.0) across all mesh objects sharing the material,
+    incorporating Baked Mesh Maps (Normal, AO, Curvature, World Normal, Position) and Global Scene AO across surrounding objects.
+    """
     global _INTERNAL_REPROJECTING
     import numpy as np
 
+    owner_node = _canonical_mask_owner_node(node)
     node_ptr = node.as_pointer()
     c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
     layer_uid = int(c_layer.uid)
@@ -1076,17 +1556,75 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
     radius = float(np.clip(eff.get("gen_radius", 0.35), 0.0, 1.0))
     noise = float(np.clip(eff.get("gen_noise", 0.0), 0.0, 1.0))
     noise_scale = max(float(eff.get("gen_noise_scale", 8.0)), 0.1)
+    use_global_ao = bool(eff.get("gen_global_ao", True))
+
+    mst = _get_mesh_maps_state(owner_node)
+    use_baked = bool(mst.get("use_baked_maps", True))
+    maps_dict = mst.get("maps", {})
+    baked_sig = tuple((k, maps_dict.get(k, "")) for k in ("ao", "curvature", "normal_ws", "position")) if use_baked else ()
 
     sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(node)
+    scene_obs = [
+        o for o in bpy.data.objects
+        if o.type == 'MESH' and o.data is not None and not o.hide_get() and len(o.data.vertices) > 0 and len(o.data.polygons) > 0
+    ]
     obs_sig = tuple(
-        (o.name, o.data.as_pointer(), len(o.data.vertices), len(o.data.polygons))
-        for o in sharing_obs
+        (o.name, o.data.as_pointer(), len(o.data.vertices), len(o.data.polygons), tuple(round(v, 3) for row in o.matrix_world for v in row))
+        for o in (scene_obs if use_global_ao else sharing_obs)
     )
 
-    sig = ("GEN", gen_type_int, round(radius, 4), round(noise, 4), round(noise_scale, 4), w, h, obs_sig)
+    sig = ("GEN", gen_type_int, round(radius, 4), round(noise, 4), round(noise_scale, 4), use_global_ao, baked_sig, w, h, obs_sig)
     cached = _EFFECT_RAW_CACHE.get(rkey)
     if not force and cached is not None and cached.get("sig") == sig:
         return cached["raw_u8"]
+
+    # 1. Check if Baked Mesh Maps in the Hub can directly supply or enrich this generator
+    if use_baked:
+        ao_ima = bpy.data.images.get(maps_dict.get("ao", "")) if maps_dict.get("ao") else None
+        curv_ima = bpy.data.images.get(maps_dict.get("curvature", "")) if maps_dict.get("curvature") else None
+        nws_ima = bpy.data.images.get(maps_dict.get("normal_ws", "")) if maps_dict.get("normal_ws") else None
+        pos_ima = bpy.data.images.get(maps_dict.get("position", "")) if maps_dict.get("position") else None
+
+        baked_2d = None
+        r_blur = max(1, int(round(radius * 12.0)))
+        if gen_type_str == 'AO' and ao_ima is not None:
+            ao_f = _read_baked_image_channel_f32(ao_ima, w, h, 0)
+            if ao_f is not None:
+                baked_2d = ao_f if radius <= 0.05 else (ao_f * (1.0 - radius * 0.65) + _fast_mask_box_blur_2d_f32(ao_f, r_blur) * (radius * 0.65))
+        elif gen_type_str == 'CURVATURE' and curv_ima is not None:
+            c_f = _read_baked_image_channel_f32(curv_ima, w, h, 0)
+            if c_f is not None:
+                baked_2d = c_f if radius <= 0.05 else (c_f * (1.0 - radius * 0.65) + _fast_mask_box_blur_2d_f32(c_f, r_blur) * (radius * 0.65))
+        elif gen_type_str == 'CAVITY' and (curv_ima is not None or ao_ima is not None):
+            c_f = _read_baked_image_channel_f32(curv_ima, w, h, 0) if curv_ima is not None else np.full((h, w), 0.5, dtype=np.float32)
+            a_f = _read_baked_image_channel_f32(ao_ima, w, h, 0) if ao_ima is not None else np.ones((h, w), dtype=np.float32)
+            if c_f is not None and a_f is not None:
+                if radius > 0.05:
+                    c_f = c_f * (1.0 - radius * 0.6) + _fast_mask_box_blur_2d_f32(c_f, r_blur) * (radius * 0.6)
+                conc = np.maximum(0.5 - c_f, 0.0) * 2.0
+                baked_2d = np.clip(conc * 1.6 + (1.0 - a_f) * 0.55, 0.0, 1.0)
+        elif gen_type_str == 'EDGE_WEAR' and (curv_ima is not None or ao_ima is not None):
+            c_f = _read_baked_image_channel_f32(curv_ima, w, h, 0) if curv_ima is not None else np.full((h, w), 0.5, dtype=np.float32)
+            a_f = _read_baked_image_channel_f32(ao_ima, w, h, 0) if ao_ima is not None else np.ones((h, w), dtype=np.float32)
+            if c_f is not None and a_f is not None:
+                if radius > 0.05:
+                    c_f = c_f * (1.0 - radius * 0.6) + _fast_mask_box_blur_2d_f32(c_f, r_blur) * (radius * 0.6)
+                conv = np.maximum(c_f - 0.5, 0.0) * 2.0
+                baked_2d = np.clip(conv * 1.85 * (0.35 + 0.65 * a_f), 0.0, 1.0)
+        elif gen_type_str == 'NORMAL_UP' and nws_ima is not None:
+            baked_2d = _read_baked_image_channel_f32(nws_ima, w, h, 2)
+        elif gen_type_str == 'POSITION_Z' and pos_ima is not None:
+            baked_2d = _read_baked_image_channel_f32(pos_ima, w, h, 2)
+
+        if baked_2d is not None:
+            if noise > 1e-4:
+                ys = np.linspace(0.0, noise_scale * 2.0 * math.pi, h, dtype=np.float32)[:, None]
+                xs = np.linspace(0.0, noise_scale * 2.0 * math.pi, w, dtype=np.float32)[None, :]
+                g = np.sin(xs + np.cos(ys * 1.3)) * 0.5 + np.cos(ys * 1.7 - xs * 0.8) * 0.5
+                baked_2d = np.clip(baked_2d + g * (noise * 0.42), 0.0, 1.0)
+            raw_u8 = (np.clip(baked_2d.ravel(), 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            _EFFECT_RAW_CACHE[rkey] = {"sig": sig, "raw_u8": raw_u8}
+            return raw_u8
 
     orig_gen_type = c_layer.mask_gen_type
     orig_gen_blend = c_layer.mask_gen_blend
@@ -1106,6 +1644,13 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
     eval_obs = sharing_obs if sharing_obs else ([first_c_ob] if first_c_ob is not None else [])
     raw_u8 = np.zeros(w * h, dtype=np.uint8)
 
+    # Precompute assembly world Z span for continuous multi-part POSITION_Z when use_global_ao is True
+    asm_zmin, asm_zmax = 0.0, 1.0
+    if use_global_ao and gen_type_str == 'POSITION_Z' and len(eval_obs) > 1:
+        all_wz = [float((o.matrix_world @ Vector(co)).z) for o in eval_obs for co in o.bound_box]
+        if all_wz:
+            asm_zmin, asm_zmax = min(all_wz), max(all_wz)
+
     _INTERNAL_REPROJECTING = True
     try:
         c_node_id.value = 0
@@ -1116,30 +1661,42 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
         c_layer.mask_gen_noise = noise
         c_layer.mask_gen_invert = 0
 
-        if len(eval_obs) <= 1:
-            if eval_obs and c_data_slot is not None and eval_obs[0].data is not None:
-                c_data_slot.value = eval_obs[0].data.as_pointer()
+        for idx, ob_part in enumerate(eval_obs):
+            if ob_part is None or ob_part.data is None:
+                continue
+            if c_data_slot is not None:
+                c_data_slot.value = ob_part.data.as_pointer()
             c_layer.mask_gen_type = gen_type_int
             layer.mask_gen_noise_scale = noise_scale
-            raw_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
-        else:
-            for idx, ob_part in enumerate(eval_obs):
-                if ob_part.data is None:
-                    continue
-                if c_data_slot is not None:
-                    c_data_slot.value = ob_part.data.as_pointer()
-                c_layer.mask_gen_type = gen_type_int
+            part_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+
+            # Apply Global Scene AO (interaction with surrounding scene objects & shared modular parts)
+            if use_global_ao and gen_type_str in {'AO', 'CAVITY', 'EDGE_WEAR'} and len(scene_obs) > 1:
+                ext_occ_u8 = _compute_part_external_scene_occlusion(ob_part, scene_obs, w, h, radius)
+                if ext_occ_u8 is not None:
+                    p16 = part_u8.astype(np.uint16)
+                    o16 = ext_occ_u8.astype(np.uint16)
+                    if gen_type_str == 'AO':
+                        part_u8 = ((p16 * (255 - o16)) // 255).astype(np.uint8)
+                    elif gen_type_str == 'CAVITY':
+                        part_u8 = np.minimum(255, p16 + (o16 * 150) // 255).astype(np.uint8)
+                    elif gen_type_str == 'EDGE_WEAR':
+                        part_u8 = ((p16 * (255 - (o16 * 185) // 255)) // 255).astype(np.uint8)
+            elif use_global_ao and gen_type_str == 'POSITION_Z' and len(eval_obs) > 1 and (asm_zmax - asm_zmin) > 1e-5:
+                pwz = [float((ob_part.matrix_world @ Vector(co)).z) for co in ob_part.bound_box]
+                pz_min, pz_max = min(pwz), max(pwz)
+                part_f = part_u8.astype(np.float32) * (1.0 / 255.0)
+                world_z = pz_min + part_f * (pz_max - pz_min)
+                part_u8 = (np.clip((world_z - asm_zmin) / (asm_zmax - asm_zmin), 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+            if idx == 0:
+                raw_u8 = part_u8
+            else:
+                c_layer.mask_gen_type = 99
                 layer.mask_gen_noise_scale = noise_scale
-                part_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
-                if idx == 0:
-                    raw_u8 = part_u8
-                else:
-                    # Evaluate UV island coverage mask (gen_type=99 hits default: raw=1.0f using cached UV tiles)
-                    c_layer.mask_gen_type = 99
-                    layer.mask_gen_noise_scale = noise_scale
-                    cov_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
-                    mask_sel = cov_u8 > 0
-                    raw_u8[mask_sel] = part_u8[mask_sel]
+                cov_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+                mask_sel = cov_u8 > 0
+                raw_u8[mask_sel] = part_u8[mask_sel]
     finally:
         if c_data_slot is not None and orig_mesh_ptr is not None:
             c_data_slot.value = orig_mesh_ptr
@@ -1608,6 +2165,7 @@ def _effect_state_sig(node_ptr, layer_uid, eff):
             round(float(eff.get("gen_radius", 0.35)), 4),
             round(float(eff.get("gen_noise", 0.0)), 4),
             round(float(eff.get("gen_noise_scale", 8.0)), 4),
+            bool(eff.get("gen_global_ao", True)),
         )
     elif etype == 'PAINT':
         pbuf = _PAINT_EFFECT_BUFFERS.get((node_ptr, layer_uid, int(eff["uid"])))
@@ -1617,6 +2175,13 @@ def _effect_state_sig(node_ptr, layer_uid, eff):
         return common + (
             round(float(eff.get("lvl_balance", 0.5)), 4),
             round(float(eff.get("lvl_contrast", 0.0)), 4),
+        )
+    elif etype == 'FILTER':
+        return common + (
+            eff.get("filter_type", "BLUR"),
+            round(float(eff.get("flt_radius", 6.0)), 3),
+            round(float(eff.get("flt_strength", 1.0)), 4),
+            round(float(eff.get("flt_scale", 8.0)), 3),
         )
     else:
         return common + (
@@ -1637,6 +2202,119 @@ def _effect_state_sig(node_ptr, layer_uid, eff):
             round(float(eff.get("offset_y", 0.0)), 4),
             round(float(eff.get("box_blend", 0.5)), 4),
         )
+
+
+def _fast_mask_box_blur_2d_f32(img_2d, radius_px):
+    """Separable 2-pass cumulative box blur on float32[H, W] (~2ms at 2K)."""
+    import numpy as np
+    r = max(int(round(radius_px)), 1)
+    arr = img_2d
+    for _ in range(2):
+        pad_y = np.pad(arr, ((r, r), (0, 0)), mode='edge')
+        cs_y = np.cumsum(pad_y, axis=0, dtype=np.float32)
+        arr = (cs_y[2 * r:] - cs_y[:-2 * r]) * (1.0 / float(2 * r))
+        pad_x = np.pad(arr, ((0, 0), (r, r)), mode='edge')
+        cs_x = np.cumsum(pad_x, axis=1, dtype=np.float32)
+        arr = (cs_x[:, 2 * r:] - cs_x[:, :-2 * r]) * (1.0 / float(2 * r))
+    return arr
+
+
+def _evaluate_filter_effect_onto_acc_u8(acc_u8, w, h, eff, blend_mode, opacity, invert):
+    """Evaluate a Substance-Painter-style Mask Filter (Blur, Blur Slope, Sharpen, Grow/Shrink, Bevel, Threshold, Posterize, Highpass)."""
+    import numpy as np
+    if opacity <= 1e-5:
+        return acc_u8
+
+    ftype = eff.get("filter_type", "BLUR")
+    rad = float(eff.get("flt_radius", 6.0))
+    strength = float(eff.get("flt_strength", 1.0))
+    scale = max(float(eff.get("flt_scale", 8.0)), 0.5)
+
+    src_2d = acc_u8.reshape(h, w).astype(np.float32) * (1.0 / 255.0)
+    r_px = max(1, min(int(round(rad)), 64))
+
+    if ftype == 'BLUR':
+        blurred = _fast_mask_box_blur_2d_f32(src_2d, r_px)
+        out_2d = src_2d + (blurred - src_2d) * min(max(strength, 0.0), 1.0)
+
+    elif ftype == 'BLUR_SLOPE':
+        # Substance Painter Blur Slope / Directional Noise Warp:
+        # Multi-octave smooth procedural slope field warps and feathers mask edges organically!
+        ys = np.linspace(0.0, scale * 2.0 * math.pi, h, dtype=np.float32)[:, None]
+        xs = np.linspace(0.0, scale * 2.0 * math.pi, w, dtype=np.float32)[None, :]
+        dx = (
+            np.sin(xs * 1.0 + np.cos(ys * 1.3 + 0.7)) * 0.65
+            + np.cos(xs * 2.3 - ys * 1.9 + 1.4) * 0.35
+        )
+        dy = (
+            np.cos(ys * 1.0 + np.sin(xs * 1.3 - 0.5)) * 0.65
+            + np.sin(ys * 2.1 + xs * 1.7 - 1.1) * 0.35
+        )
+        amp = rad * strength * (max(w, h) / 1024.0)
+        iy_base = np.arange(h, dtype=np.float32)[:, None]
+        ix_base = np.arange(w, dtype=np.float32)[None, :]
+        # 3-tap directional slope accumulation (matches Substance Blur Slope directional smear)
+        acc_slope = np.zeros((h, w), dtype=np.float32)
+        for t_step in (0.35, 0.70, 1.0):
+            sy = np.clip((iy_base + dy * (amp * t_step)).astype(np.int32), 0, h - 1)
+            sx = np.clip((ix_base + dx * (amp * t_step)).astype(np.int32), 0, w - 1)
+            acc_slope += src_2d[sy, sx]
+        out_2d = acc_slope * (1.0 / 3.0)
+
+    elif ftype == 'SHARPEN':
+        blurred = _fast_mask_box_blur_2d_f32(src_2d, max(r_px // 2, 1))
+        out_2d = np.clip(src_2d + (src_2d - blurred) * (strength * 2.5), 0.0, 1.0)
+
+    elif ftype == 'DILATE_ERODE':
+        # strength > 0.5 = Grow (Dilate), strength < 0.5 = Shrink (Erode)
+        signed = (strength - 0.5) * 2.0
+        steps = max(1, int(round(abs(signed) * r_px)))
+        cur = src_2d.copy()
+        if signed >= 0.0:
+            for s in range(1, steps + 1):
+                cur = np.maximum(cur, np.roll(src_2d, s, axis=0))
+                cur = np.maximum(cur, np.roll(src_2d, -s, axis=0))
+                cur = np.maximum(cur, np.roll(cur, s, axis=1))
+                cur = np.maximum(cur, np.roll(cur, -s, axis=1))
+        else:
+            for s in range(1, steps + 1):
+                cur = np.minimum(cur, np.roll(src_2d, s, axis=0))
+                cur = np.minimum(cur, np.roll(src_2d, -s, axis=0))
+                cur = np.minimum(cur, np.roll(cur, s, axis=1))
+                cur = np.minimum(cur, np.roll(cur, -s, axis=1))
+        out_2d = _fast_mask_box_blur_2d_f32(cur, 1) if steps > 1 else cur
+
+    elif ftype == 'BEVEL':
+        cur = src_2d.copy()
+        for s in range(1, max(r_px // 2, 1) + 1):
+            cur = np.maximum(cur, np.roll(src_2d, s, axis=0))
+            cur = np.maximum(cur, np.roll(src_2d, -s, axis=0))
+            cur = np.maximum(cur, np.roll(cur, s, axis=1))
+            cur = np.maximum(cur, np.roll(cur, -s, axis=1))
+        out_2d = _fast_mask_box_blur_2d_f32(cur, r_px)
+        if abs(strength - 1.0) > 1e-3:
+            out_2d = np.clip((out_2d - 0.5) * (0.5 + strength) + 0.5, 0.0, 1.0)
+
+    elif ftype == 'THRESHOLD':
+        thr = min(max(1.0 - strength * 0.5, 0.02), 0.98)
+        soft = max(rad / 128.0, 0.005)
+        out_2d = np.clip((src_2d - (thr - soft)) / (2.0 * soft), 0.0, 1.0)
+
+    elif ftype == 'POSTERIZE':
+        bands = float(max(2, min(int(round(rad)), 16)))
+        out_2d = np.round(src_2d * bands) / bands
+
+    else:  # HIGHPASS
+        blurred = _fast_mask_box_blur_2d_f32(src_2d, r_px)
+        out_2d = np.clip(0.5 + (src_2d - blurred) * (strength * 2.0), 0.0, 1.0)
+
+    if invert:
+        out_2d = 1.0 - out_2d
+
+    flt_u8 = (np.clip(out_2d, 0.0, 1.0).ravel() * 255.0 + 0.5).astype(np.uint8)
+    id_curve = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    _blend_1d_curve_onto_acc_u8(acc_u8, flt_u8, id_curve, blend_mode, opacity, is_first_effect=False)
+    return acc_u8
 
 
 def _evaluate_single_effect_onto_acc(node, layer, eff, acc_u8, w, h, context=None, force_reproject=False, from_gizmo=False, is_first=False, interactive=False):
@@ -1660,6 +2338,8 @@ def _evaluate_single_effect_onto_acc(node, layer, eff, acc_u8, w, h, context=Non
     elif etype == 'LEVELS':
         s_curve = _effect_curve_256(eff)
         _blend_1d_curve_onto_acc_u8(acc_u8, acc_u8, s_curve, 'REPLACE', opacity, is_first_effect=False)
+    elif etype == 'FILTER':
+        _evaluate_filter_effect_onto_acc_u8(acc_u8, w, h, eff, blend_mode, opacity, invert)
     elif etype == 'PAINT':
         node_ptr = _canonical_mask_owner_node(node).as_pointer()
         layer_uid = _layer_uid(layer)
@@ -4257,10 +4937,11 @@ class NODE_OT_tex_paint_mask_effect_add(Operator):
     effect_type: EnumProperty(
         name="Effect Type",
         items=(
-            ('GENERATOR', "Procedural (Smart Mask)", "Add a 3D geometry generator (Edge Wear, Curvature, Cavity, AO, Top Dust, Height)", 'MODIFIER', 0),
-            ('PAINT', "Paint Mask", "Add a non-destructive hand-painted mask layer (paint White to Reveal, Black to Hide)", 'BRUSH_DATA', 1),
-            ('GRUNGE', "Mask Fill (Image / Grunge)", "Fill the mask with any custom grayscale/alpha image or Substance Grunge texture with 2D/3D projection", 'TEXTURE', 2),
-            ('LEVELS', "Levels & Contrast", "Add a non-destructive Balance / Contrast / Invert filter over the mask stack below", 'SEQ_LUMA_WAVEFORM', 3),
+            ('GENERATOR', "Generator", "Add a 3D geometry generator (Edge Wear, Curvature, Cavity, AO, Top Dust, Height)", 'MODIFIER', 0),
+            ('PAINT', "Paint", "Add a non-destructive hand-painted mask layer (paint White to Reveal, Black to Hide)", 'BRUSH_DATA', 1),
+            ('GRUNGE', "Fill (Image / Grunge)", "Fill the mask with any custom grayscale/alpha image or Substance Grunge texture with 2D/3D projection", 'TEXTURE', 2),
+            ('LEVELS', "Levels", "Add a non-destructive Balance / Contrast / Invert remapping over the mask stack below", 'SEQ_LUMA_WAVEFORM', 3),
+            ('FILTER', "Filter (Blur / Warp / Bevel)", "Add a Substance-style spatial filter (Blur, Blur Slope, Sharpen, Grow/Shrink, Bevel, Threshold, Posterize, Highpass)", 'SHADERFX', 4),
         ),
         default='GRUNGE',
     )
@@ -4276,6 +4957,11 @@ class NODE_OT_tex_paint_mask_effect_add(Operator):
     gen_type: StringProperty(
         name="Generator Preset",
         default="EDGE_WEAR",
+        options={'SKIP_SAVE'},
+    )
+    filter_type: StringProperty(
+        name="Filter Type",
+        default="BLUR",
         options={'SKIP_SAVE'},
     )
     blend_override: StringProperty(
@@ -4316,6 +5002,7 @@ class NODE_OT_tex_paint_mask_effect_add(Operator):
             is_first=is_first,
             gen_type=self.gen_type or 'EDGE_WEAR',
             fill_source=self.fill_source or 'GRUNGE',
+            filter_type=self.filter_type or 'BLUR',
         )
         if self.blend_override:
             eff["blend_mode"] = self.blend_override
@@ -6924,6 +7611,847 @@ class NODE_OT_tex_paint_make_material_unique(Operator):
         return {'CANCELLED'}
 
 
+# ---------------------------------------------------------------------------
+# Substance-Painter-Style Mesh Maps & High-Poly to Low-Poly Baker Hub
+# ---------------------------------------------------------------------------
+
+def _apply_baked_normal_map_to_shader(mat, node, normal_ima):
+    """Wire the baked Tangent-Space Normal Map (`normal_ima`) into `mat`'s Principled BSDF Normal input
+    (chaining cleanly with any existing Height/Bump node).
+    """
+    if mat is None or mat.node_tree is None or normal_ima is None:
+        return False
+    ntree = mat.node_tree
+    bsdf = None
+    for n in ntree.nodes:
+        if n.bl_idname == "ShaderNodeBsdfPrincipled":
+            bsdf = n
+            break
+    if bsdf is None:
+        return False
+
+    try:
+        normal_ima.colorspace_settings.name = 'Non-Color'
+    except Exception:
+        pass
+
+    tex_node = ntree.nodes.get("TexPaint_BakedNormal_Tex")
+    if tex_node is None or tex_node.bl_idname != "ShaderNodeTexImage":
+        tex_node = ntree.nodes.new("ShaderNodeTexImage")
+        tex_node.name = "TexPaint_BakedNormal_Tex"
+        tex_node.label = "Baked Mesh Normal Map"
+        tex_node.location = (bsdf.location.x - 680, bsdf.location.y - 420)
+    tex_node.image = normal_ima
+
+    nmap_node = ntree.nodes.get("TexPaint_BakedNormal_Map")
+    if nmap_node is None or nmap_node.bl_idname != "ShaderNodeNormalMap":
+        nmap_node = ntree.nodes.new("ShaderNodeNormalMap")
+        nmap_node.name = "TexPaint_BakedNormal_Map"
+        nmap_node.label = "Baked Normal Map"
+        nmap_node.location = (bsdf.location.x - 380, bsdf.location.y - 420)
+
+    ntree.links.new(tex_node.outputs["Color"], nmap_node.inputs["Color"])
+
+    norm_in = bsdf.inputs.get("Normal")
+    if norm_in is not None:
+        # If a Bump node is already connected to Principled BSDF Normal, feed Baked Normal into Bump.Normal!
+        existing_bump = None
+        if norm_in.is_linked:
+            for lk in norm_in.links:
+                if lk.from_node.bl_idname == "ShaderNodeBump":
+                    existing_bump = lk.from_node
+                    break
+        if existing_bump is not None and "Normal" in existing_bump.inputs:
+            ntree.links.new(nmap_node.outputs["Normal"], existing_bump.inputs["Normal"])
+        else:
+            ntree.links.new(nmap_node.outputs["Normal"], norm_in)
+    return True
+
+
+def _ensure_baked_map_image(mat_prefix, slot_key, w, h, is_color=False):
+    """Create or resize a `bpy.data.images` target for a Mesh Map slot (`normal`, `ao`, `curvature`, etc.)."""
+    suffix_map = {
+        "normal": "Normal",
+        "normal_ws": "WorldNormal",
+        "id_map": "ID",
+        "ao": "AO",
+        "curvature": "Curvature",
+        "position": "Position",
+        "thickness": "Thickness",
+    }
+    img_name = f"{mat_prefix}_{suffix_map.get(slot_key, slot_key)}"
+    ima = bpy.data.images.get(img_name)
+    if ima is None:
+        ima = bpy.data.images.new(name=img_name, width=int(w), height=int(h), alpha=False, float_buffer=False)
+    elif int(ima.size[0]) != int(w) or int(ima.size[1]) != int(h):
+        try:
+            ima.scale(int(w), int(h))
+        except Exception:
+            pass
+    try:
+        ima.colorspace_settings.name = 'sRGB' if is_color else 'Non-Color'
+    except Exception:
+        pass
+    return ima
+
+
+def _write_rgb_f32_to_image(ima, rgb_f32, w, h):
+    """Write float32[H, W, 3] into `ima.pixels` and pack for persistence."""
+    import numpy as np
+    rgba = np.ones((h, w, 4), dtype=np.float32)
+    rgba[:, :, :3] = np.clip(rgb_f32, 0.0, 1.0)
+    ima.pixels.foreach_set(rgba.ravel())
+    ima.update()
+    try:
+        ima.pack()
+    except Exception:
+        pass
+
+
+def _golden_ratio_color_rgb(idx):
+    """Generate a distinct saturated RGB color for Color ID map index `idx`."""
+    import colorsys
+    h = (float(idx) * 0.61803398875 + 0.13) % 1.0
+    s = 0.78 if (idx % 2 == 0) else 0.62
+    v = 0.92 if (idx % 3 != 0) else 0.76
+    return colorsys.hsv_to_rgb(h, s, v)
+
+
+def _build_high_poly_bvh_and_data(hp_obs, context=None):
+    """Build a combined World-Space C++ `BVHTree` plus per-triangle vertex normals, positions, and Color IDs
+    from High-Poly source objects `hp_obs` (evaluating modifiers when depsgraph is available).
+    """
+    import numpy as np
+    from mathutils.bvhtree import BVHTree
+
+    depsgraph = None
+    if context is not None:
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+        except Exception:
+            depsgraph = None
+
+    all_verts = []
+    all_vnorms = []
+    all_tris = []
+    all_tri_colors = []
+    v_offset = 0
+
+    for ob_idx, ob in enumerate(hp_obs):
+        if ob is None or ob.type != 'MESH' or ob.data is None:
+            continue
+        eval_ob = ob.evaluated_get(depsgraph) if depsgraph is not None else ob
+        mesh = eval_ob.to_mesh() if depsgraph is not None else ob.data
+        if mesh is None:
+            continue
+        try:
+            nv = len(mesh.vertices)
+            if nv == 0 or len(mesh.polygons) == 0:
+                continue
+            mesh.calc_loop_triangles()
+            nt = len(mesh.loop_triangles)
+            if nt == 0:
+                continue
+
+            v_co = np.empty(nv * 3, dtype=np.float32)
+            v_no = np.empty(nv * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("co", v_co)
+            mesh.vertices.foreach_get("normal", v_no)
+            v_co = v_co.reshape(nv, 3)
+            v_no = v_no.reshape(nv, 3)
+
+            mw = np.array(eval_ob.matrix_world, dtype=np.float32)
+            rot = mw[:3, :3]
+            inv_t = np.linalg.inv(rot).T
+            v_w = v_co @ rot.T + mw[:3, 3]
+            n_w = v_no @ inv_t.T
+            n_len = np.maximum(np.linalg.norm(n_w, axis=1, keepdims=True), 1e-6)
+            n_w /= n_len
+
+            t_v = np.empty(nt * 3, dtype=np.int32)
+            t_m = np.empty(nt, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("vertices", t_v)
+            mesh.loop_triangles.foreach_get("material_index", t_m)
+            t_v = t_v.reshape(nt, 3) + v_offset
+
+            # Per-triangle Color ID based on High-Poly object + material index (or object color)
+            ob_col = getattr(ob, "color", None)
+            use_ob_col = (
+                ob_col is not None and
+                (abs(float(ob_col[0]) - 1.0) > 1e-3 or abs(float(ob_col[1]) - 1.0) > 1e-3 or abs(float(ob_col[2]) - 1.0) > 1e-3)
+            )
+            tri_cols = np.empty((nt, 3), dtype=np.float32)
+            if use_ob_col:
+                tri_cols[:] = (float(ob_col[0]), float(ob_col[1]), float(ob_col[2]))
+            else:
+                unique_mats = np.unique(t_m)
+                for m_idx in unique_mats:
+                    rgb = _golden_ratio_color_rgb(ob_idx * 7 + int(m_idx) + 1)
+                    tri_cols[t_m == m_idx] = rgb
+
+            all_verts.append(v_w)
+            all_vnorms.append(n_w)
+            all_tris.append(t_v)
+            all_tri_colors.append(tri_cols)
+            v_offset += nv
+        finally:
+            if depsgraph is not None and mesh is not ob.data:
+                try:
+                    eval_ob.to_mesh_clear()
+                except Exception:
+                    pass
+
+    if not all_verts:
+        return None
+
+    V = np.vstack(all_verts)
+    N = np.vstack(all_vnorms)
+    T = np.vstack(all_tris)
+    C = np.vstack(all_tri_colors)
+    bvh = BVHTree.FromPolygons(V.tolist(), T.tolist())
+    return {
+        "bvh": bvh,
+        "verts": V,
+        "vnorms": N,
+        "tris": T,
+        "tri_colors": C,
+    }
+
+
+def _bake_mesh_maps_for_node(node, context=None, target_map='ALL'):
+    """Bake Substance-Painter-style Mesh Maps (`normal`, `normal_ws`, `id_map`, `ao`, `curvature`, `position`, `thickness`)
+    across all Low-Poly mesh objects sharing `node`'s material, optionally transferring details from High-Poly mesh(es)
+    and evaluating Global Scene AO across surrounding objects.
+    """
+    global _INTERNAL_REPROJECTING
+    import numpy as np
+
+    if node is None:
+        return False, "No active Layered Texture Paint node"
+
+    owner_node = _canonical_mask_owner_node(node)
+    mat = _get_material_for_node(owner_node, context)
+    st = _get_mesh_maps_state(owner_node)
+
+    sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(owner_node, context)
+    low_obs = sharing_obs if sharing_obs else ([first_c_ob] if first_c_ob is not None else [])
+    low_obs = [o for o in low_obs if o is not None and o.type == 'MESH' and o.data is not None and len(o.data.vertices) > 0 and len(o.data.polygons) > 0]
+    if not low_obs:
+        return False, "No mesh objects with UVs found for this material"
+
+    # Determine output resolution
+    res_mode = st.get("bake_res", "MATCH")
+    if res_mode == 'MATCH' and owner_node.image is not None:
+        out_w = max(int(owner_node.image.size[0]), 64)
+        out_h = max(int(owner_node.image.size[1]), 64)
+    else:
+        try:
+            r_val = int(res_mode)
+        except Exception:
+            r_val = 1024
+        out_w, out_h = r_val, r_val
+
+    # Evaluation grid resolution for raycast maps (up to 1024x1024 for fast raycasting, upsampled to out_w x out_h)
+    eval_w = min(out_w, 1024)
+    eval_h = min(out_h, 1024)
+
+    source_mode = st.get("source_mode", "LOW_POLY")
+    ao_scope = st.get("ao_scope", "GLOBAL")
+    cage_dist = max(float(st.get("cage_dist", 0.08)), 1e-4)
+    ao_dist_factor = max(float(st.get("ao_dist", 0.65)), 0.02)
+
+    hp_obs = []
+    if source_mode == 'HIGH_POLY_OB':
+        hp_ob = bpy.data.objects.get(st.get("high_poly_ob", ""))
+        if hp_ob is not None and hp_ob.type == 'MESH':
+            hp_obs = [hp_ob]
+    elif source_mode == 'HIGH_POLY_COL':
+        hp_col = bpy.data.collections.get(st.get("high_poly_col", ""))
+        if hp_col is not None:
+            hp_obs = [o for o in hp_col.all_objects if o.type == 'MESH' and o.data is not None]
+
+    hp_data = _build_high_poly_bvh_and_data(hp_obs, context=context) if hp_obs else None
+
+    all_slots = ("normal", "normal_ws", "id_map", "ao", "curvature", "position", "thickness")
+    bake_slots = all_slots if target_map == 'ALL' else (target_map,)
+
+    # Compute assembly world-space bounding box across all low_obs
+    all_w_pts = [o.matrix_world @ Vector(co) for o in low_obs for co in o.bound_box]
+    asm_bmin = np.array([min(p.x for p in all_w_pts), min(p.y for p in all_w_pts), min(p.z for p in all_w_pts)], dtype=np.float32)
+    asm_bmax = np.array([max(p.x for p in all_w_pts), max(p.y for p in all_w_pts), max(p.z for p in all_w_pts)], dtype=np.float32)
+    asm_span = np.maximum(asm_bmax - asm_bmin, 1e-5)
+    asm_extent = float(np.max(asm_span))
+
+    # Accumulator buffers at (eval_h, eval_w)
+    acc_normal = np.dstack([
+        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
+        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
+        np.ones((eval_h, eval_w), dtype=np.float32),
+    ])
+    acc_normal_ws = np.dstack([
+        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
+        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
+        np.ones((eval_h, eval_w), dtype=np.float32),
+    ])
+    acc_id = np.zeros((eval_h, eval_w, 3), dtype=np.float32)
+    acc_pos = np.zeros((eval_h, eval_w, 3), dtype=np.float32)
+    acc_thick = np.ones((eval_h, eval_w), dtype=np.float32)
+
+    # Scene objects for Global AO
+    scene_obs = [
+        o for o in bpy.data.objects
+        if o.type == 'MESH' and o.data is not None and not o.hide_get() and o not in hp_obs and len(o.data.vertices) > 0 and len(o.data.polygons) > 0
+    ]
+
+    need_surf = any(s in bake_slots for s in ("normal", "normal_ws", "id_map", "position", "curvature"))
+    need_thick = ("thickness" in bake_slots)
+
+    for part_idx, ob_part in enumerate(low_obs):
+        tmap = _build_uv_texel_map(ob_part, eval_w, eval_h)
+        if tmap is None or len(tmap["pix_idx"]) == 0:
+            continue
+
+        mesh = ob_part.data
+        nv = len(mesh.vertices)
+        nt = len(mesh.loop_triangles)
+        v_co = np.empty(nv * 3, dtype=np.float32)
+        v_no = np.empty(nv * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", v_co)
+        mesh.vertices.foreach_get("normal", v_no)
+        v_co = v_co.reshape(nv, 3)
+        v_no = v_no.reshape(nv, 3)
+
+        mw = np.array(ob_part.matrix_world, dtype=np.float32)
+        rot = mw[:3, :3]
+        inv_t = np.linalg.inv(rot).T
+        V_w = v_co @ rot.T + mw[:3, 3]
+        N_w = v_no @ inv_t.T
+        N_w /= np.maximum(np.linalg.norm(N_w, axis=1, keepdims=True), 1e-6)
+
+        pix_idx = tmap["pix_idx"]
+        tri_idx = tmap["tri_idx"]
+        w0, w1, w2 = tmap["w0"], tmap["w1"], tmap["w2"]
+        tv = tmap["tri_verts"][tri_idx]
+        cov_2d = np.zeros((eval_h, eval_w), dtype=bool)
+        cov_2d.ravel()[pix_idx] = True
+
+        if need_surf:
+            # Interpolate Low-Poly world position & normal at each covered UV texel
+            P_low = V_w[tv[:, 0]] * w0[:, None] + V_w[tv[:, 1]] * w1[:, None] + V_w[tv[:, 2]] * w2[:, None]
+            N_low = N_w[tv[:, 0]] * w0[:, None] + N_w[tv[:, 1]] * w1[:, None] + N_w[tv[:, 2]] * w2[:, None]
+            N_low /= np.maximum(np.linalg.norm(N_low, axis=1, keepdims=True), 1e-6)
+
+            # Per-triangle Tangent & Bitangent in World Space from UV derivatives
+            tl = tmap["tri_loops"]
+            uvs = tmap["uvs"]
+            dp1 = V_w[tmap["tri_verts"][:, 1]] - V_w[tmap["tri_verts"][:, 0]]
+            dp2 = V_w[tmap["tri_verts"][:, 2]] - V_w[tmap["tri_verts"][:, 0]]
+            duv1 = uvs[tl[:, 1]] - uvs[tl[:, 0]]
+            duv2 = uvs[tl[:, 2]] - uvs[tl[:, 0]]
+            det = duv1[:, 0] * duv2[:, 1] - duv1[:, 1] * duv2[:, 0]
+            inv_det = np.where(np.abs(det) > 1e-8, 1.0 / np.where(np.abs(det) > 1e-8, det, 1.0), 1.0)[:, None]
+            T_tri = (dp1 * duv2[:, 1:2] - dp2 * duv1[:, 1:2]) * inv_det
+            t_len = np.linalg.norm(T_tri, axis=1, keepdims=True)
+            T_tri = np.where(t_len > 1e-6, T_tri / np.maximum(t_len, 1e-6), np.array([1.0, 0.0, 0.0], dtype=np.float32))
+
+            T_low = T_tri[tri_idx]
+            # Gram-Schmidt orthogonalize T_low against N_low
+            T_low = T_low - N_low * np.sum(T_low * N_low, axis=1, keepdims=True)
+            T_low /= np.maximum(np.linalg.norm(T_low, axis=1, keepdims=True), 1e-6)
+            B_low = np.cross(N_low, T_low)
+
+            if hp_data is not None:
+                # Raycast from Low-Poly UV texels onto High-Poly BVHTree!
+                hp_bvh = hp_data["bvh"]
+                hp_V = hp_data["verts"]
+                hp_N = hp_data["vnorms"]
+                hp_T = hp_data["tris"]
+                hp_C = hp_data["tri_colors"]
+                ray_cast = hp_bvh.ray_cast
+                find_nearest = hp_bvh.find_nearest
+
+                N_surf = N_low.copy()
+                P_surf = P_low.copy()
+                ID_surf = np.full((len(pix_idx), 3), _golden_ratio_color_rgb(part_idx + 1), dtype=np.float32)
+                max_ray = cage_dist * 2.5
+
+                for k in range(len(pix_idx)):
+                    px, py, pz = float(P_low[k, 0]), float(P_low[k, 1]), float(P_low[k, 2])
+                    nx, ny, nz = float(N_low[k, 0]), float(N_low[k, 1]), float(N_low[k, 2])
+                    orig = Vector((px + nx * cage_dist, py + ny * cage_dist, pz + nz * cage_dist))
+                    rdir = Vector((-nx, -ny, -nz))
+                    hit_loc, _hit_no, hit_i, _hit_d = ray_cast(orig, rdir, max_ray)
+                    if hit_loc is None or hit_i is None:
+                        hit_loc, _hit_no, hit_i, _hit_d = find_nearest(Vector((px, py, pz)), max_ray)
+                    if hit_loc is not None and hit_i is not None:
+                        P_surf[k] = (float(hit_loc.x), float(hit_loc.y), float(hit_loc.z))
+                        ID_surf[k] = hp_C[hit_i]
+                        # Barycentric smooth normal interpolation on High-Poly triangle hit_i
+                        iv0, iv1, iv2 = int(hp_T[hit_i, 0]), int(hp_T[hit_i, 1]), int(hp_T[hit_i, 2])
+                        a = hp_V[iv0]
+                        b = hp_V[iv1]
+                        c = hp_V[iv2]
+                        v0_hp = b - a
+                        v1_hp = c - a
+                        v2_hp = P_surf[k] - a
+                        d00 = float(np.dot(v0_hp, v0_hp))
+                        d01 = float(np.dot(v0_hp, v1_hp))
+                        d11 = float(np.dot(v1_hp, v1_hp))
+                        d20 = float(np.dot(v2_hp, v0_hp))
+                        d21 = float(np.dot(v2_hp, v1_hp))
+                        den = d00 * d11 - d01 * d01
+                        if abs(den) > 1e-10:
+                            bv = max(0.0, min(1.0, (d11 * d20 - d01 * d21) / den))
+                            bw = max(0.0, min(1.0 - bv, (d00 * d21 - d01 * d20) / den))
+                            bu = max(0.0, 1.0 - bv - bw)
+                            nh = hp_N[iv0] * bu + hp_N[iv1] * bv + hp_N[iv2] * bw
+                        else:
+                            nh = hp_N[iv0]
+                        n_l = max(float(np.linalg.norm(nh)), 1e-6)
+                        N_surf[k] = nh / n_l
+
+                # Project High-Poly world normal N_surf into Low-Poly tangent space (T_low, B_low, N_low)
+                tan_x = np.sum(N_surf * T_low, axis=1)
+                tan_y = np.sum(N_surf * B_low, axis=1)
+                tan_z = np.maximum(np.sum(N_surf * N_low, axis=1), 0.05)
+                tan_len = np.maximum(np.sqrt(tan_x * tan_x + tan_y * tan_y + tan_z * tan_z), 1e-6)
+                N_tan = np.stack([
+                    0.5 + 0.5 * (tan_x / tan_len),
+                    0.5 + 0.5 * (tan_y / tan_len),
+                    0.5 + 0.5 * (tan_z / tan_len),
+                ], axis=1)
+            else:
+                # Low-Poly mode: smooth bevel normal variations across edges + part/material Color ID
+                P_surf = P_low
+                N_surf = N_low
+                N_tan = np.column_stack([
+                    np.full(len(pix_idx), 0.5, dtype=np.float32),
+                    np.full(len(pix_idx), 0.5, dtype=np.float32),
+                    np.ones(len(pix_idx), dtype=np.float32),
+                ])
+                t_m = np.empty(nt, dtype=np.int32)
+                mesh.loop_triangles.foreach_get("material_index", t_m)
+                ob_col = getattr(ob_part, "color", None)
+                use_ob_col = (
+                    ob_col is not None and
+                    (abs(float(ob_col[0]) - 1.0) > 1e-3 or abs(float(ob_col[1]) - 1.0) > 1e-3 or abs(float(ob_col[2]) - 1.0) > 1e-3)
+                )
+                if use_ob_col:
+                    ID_surf = np.full((len(pix_idx), 3), (float(ob_col[0]), float(ob_col[1]), float(ob_col[2])), dtype=np.float32)
+                else:
+                    tri_cols = np.empty((nt, 3), dtype=np.float32)
+                    for m_idx in np.unique(t_m):
+                        tri_cols[t_m == m_idx] = _golden_ratio_color_rgb(part_idx * 7 + int(m_idx) + 1)
+                    ID_surf = tri_cols[tri_idx]
+
+            # Write part texels into dilated 2D maps
+            for c_i in range(3):
+                ch_n = acc_normal[:, :, c_i].copy()
+                ch_n.ravel()[pix_idx] = N_tan[:, c_i]
+                acc_normal[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_n, cov_2d, iterations=3)
+
+                ch_ws = acc_normal_ws[:, :, c_i].copy()
+                ch_ws.ravel()[pix_idx] = 0.5 + 0.5 * N_surf[:, c_i]
+                acc_normal_ws[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_ws, cov_2d, iterations=3)
+
+                ch_id = acc_id[:, :, c_i].copy()
+                ch_id.ravel()[pix_idx] = ID_surf[:, c_i]
+                acc_id[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_id, cov_2d, iterations=3)
+
+                ch_pos = acc_pos[:, :, c_i].copy()
+                ch_pos.ravel()[pix_idx] = np.clip((P_surf[:, c_i] - asm_bmin[c_i]) / asm_span[c_i], 0.0, 1.0)
+                acc_pos[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_pos, cov_2d, iterations=3)
+
+        if need_thick:
+            # Interior cone raycast at texel resolution (up to 64x64 per part) so flat low-poly faces
+            # still capture thin edges/corners vs thick face interiors, as well as High-Poly thickness.
+            bvh_thick = hp_data["bvh"] if hp_data is not None else _build_world_bvh_for_objects([ob_part])
+            if bvh_thick is not None:
+                th_w = min(eval_w, 64)
+                th_h = min(eval_h, 64)
+                tmap_th = _build_uv_texel_map(ob_part, th_w, th_h)
+                if tmap_th is not None and len(tmap_th["pix_idx"]) > 0:
+                    p_th = tmap_th["pix_idx"]
+                    tv_th = tmap_th["tri_verts"][tmap_th["tri_idx"]]
+                    w0_t, w1_t, w2_t = tmap_th["w0"], tmap_th["w1"], tmap_th["w2"]
+                    P_th = V_w[tv_th[:, 0]] * w0_t[:, None] + V_w[tv_th[:, 1]] * w1_t[:, None] + V_w[tv_th[:, 2]] * w2_t[:, None]
+                    # Use geometric triangle normal blended with vertex normal for accurate inward cone
+                    e1_t = V_w[tv_th[:, 1]] - V_w[tv_th[:, 0]]
+                    e2_t = V_w[tv_th[:, 2]] - V_w[tv_th[:, 0]]
+                    FN_th = np.cross(e1_t, e2_t)
+                    FN_th /= np.maximum(np.linalg.norm(FN_th, axis=1, keepdims=True), 1e-6)
+                    VN_th = N_w[tv_th[:, 0]] * w0_t[:, None] + N_w[tv_th[:, 1]] * w1_t[:, None] + N_w[tv_th[:, 2]] * w2_t[:, None]
+                    N_th = FN_th * 0.65 + VN_th * 0.35
+                    N_th /= np.maximum(np.linalg.norm(N_th, axis=1, keepdims=True), 1e-6)
+
+                    max_thick = max(1.15 * asm_extent, 0.05)
+                    eps_t = 0.004 * asm_extent
+                    rc_t = bvh_thick.ray_cast
+                    pix_th = np.ones(len(p_th), dtype=np.float32)
+                    cone_dirs = (
+                        (0.0, 0.0, 1.0),
+                        (0.65, 0.0, 0.76),
+                        (-0.65, 0.0, 0.76),
+                        (0.0, 0.65, 0.76),
+                        (0.0, -0.65, 0.76),
+                    )
+                    for k in range(len(p_th)):
+                        px, py, pz = float(P_th[k, 0]), float(P_th[k, 1]), float(P_th[k, 2])
+                        inx, iny, inz = -float(N_th[k, 0]), -float(N_th[k, 1]), -float(N_th[k, 2])
+                        in_vec = Vector((inx, iny, inz))
+                        up = Vector((0.0, 0.0, 1.0)) if abs(inz) < 0.92 else Vector((1.0, 0.0, 0.0))
+                        tan = in_vec.cross(up).normalized()
+                        bitan = in_vec.cross(tan).normalized()
+                        orig = Vector((px + inx * eps_t, py + iny * eps_t, pz + inz * eps_t))
+                        d_sum = 0.0
+                        for lx, ly, lz in cone_dirs:
+                            rdir = tan * lx + bitan * ly + in_vec * lz
+                            hit_loc, _hit_no, _hit_i, hit_d = rc_t(orig, rdir, max_thick)
+                            if hit_loc is not None and hit_d is not None:
+                                d_sum += min(max(float(hit_d) / max_thick, 0.0), 1.0)
+                            else:
+                                d_sum += 1.0
+                        pix_th[k] = d_sum / float(len(cone_dirs))
+
+                    # Normalize part thickness contrast so thin vs thick regions span [0.05..0.98]
+                    t_min, t_max = float(np.min(pix_th)), float(np.max(pix_th))
+                    if (t_max - t_min) > 1e-4:
+                        pix_th = 0.05 + 0.93 * ((pix_th - t_min) / (t_max - t_min))
+
+                    th_small = np.ones((th_h, th_w), dtype=np.float32)
+                    cov_small = np.zeros((th_h, th_w), dtype=bool)
+                    th_small.ravel()[p_th] = pix_th
+                    cov_small.ravel()[p_th] = True
+                    th_small = _dilate_2d_buffer_into_gutter(th_small, cov_small, iterations=2)
+                    th_small = _fast_mask_box_blur_2d_f32(th_small, 1)
+
+                    if th_w != eval_w or th_h != eval_h:
+                        ys_t = np.clip((np.linspace(0.0, th_h - 1.0, eval_h)).astype(np.int32), 0, th_h - 1)
+                        xs_t = np.clip((np.linspace(0.0, th_w - 1.0, eval_w)).astype(np.int32), 0, th_w - 1)
+                        th_up = th_small[ys_t[:, None], xs_t[None, :]]
+                    else:
+                        th_up = th_small
+                    acc_thick[cov_2d] = th_up[cov_2d]
+                    acc_thick = _dilate_2d_buffer_into_gutter(acc_thick, cov_2d, iterations=3)
+
+    # Evaluate AO and Curvature at full (out_w, out_h) using C++ generator + Global Scene AO + High-Poly Normal Curvature
+    ao_2d = None
+    curv_2d = None
+    act_layer = owner_node.active_layer or (owner_node.layers[0] if len(owner_node.layers) > 0 else None)
+
+    if ("ao" in bake_slots or "curvature" in bake_slots) and act_layer is not None:
+        c_layer = _C_TexPaintLayer.from_address(act_layer.as_pointer())
+        saved_mask_bytes = None
+        orig_use_mask = bool(act_layer.use_mask)
+        if not orig_use_mask:
+            act_layer.use_mask = True
+            c_layer = _C_TexPaintLayer.from_address(act_layer.as_pointer())
+        if c_layer.mask_ibuf:
+            c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
+            mw_i, mh_i = int(c_imb.x), int(c_imb.y)
+            if c_imb.byte_data and mw_i > 0 and mh_i > 0:
+                saved_mask_bytes = ctypes.string_at(c_imb.byte_data, mw_i * mh_i * 4)
+        else:
+            mw_i, mh_i = out_w, out_h
+
+        try:
+            # Temporarily disable use_baked_maps so _ensure_generator_raw_u8 computes fresh geometry + Global AO
+            _save_mesh_maps_state(owner_node, updates={"use_baked_maps": False})
+            if "ao" in bake_slots:
+                dummy_ao_eff = {
+                    "uid": -9991,
+                    "gen_type": "AO",
+                    "gen_radius": min(max(ao_dist_factor * 0.6, 0.1), 1.0),
+                    "gen_noise": 0.0,
+                    "gen_noise_scale": 8.0,
+                    "gen_global_ao": (ao_scope in {'GLOBAL', 'MATERIAL'}),
+                }
+                ao_u8 = _ensure_generator_raw_u8(owner_node, act_layer, dummy_ao_eff, mw_i, mh_i, force=True)
+                ao_raw_2d = ao_u8.reshape(mh_i, mw_i).astype(np.float32) * (1.0 / 255.0)
+                if mw_i != out_w or mh_i != out_h:
+                    ys = np.clip((np.linspace(0.0, mh_i - 1.0, out_h)).astype(np.int32), 0, mh_i - 1)
+                    xs = np.clip((np.linspace(0.0, mw_i - 1.0, out_w)).astype(np.int32), 0, mw_i - 1)
+                    ao_2d = ao_raw_2d[ys[:, None], xs[None, :]]
+                else:
+                    ao_2d = ao_raw_2d
+
+            if "curvature" in bake_slots:
+                dummy_curv_eff = {
+                    "uid": -9992,
+                    "gen_type": "CURVATURE",
+                    "gen_radius": 0.35,
+                    "gen_noise": 0.0,
+                    "gen_noise_scale": 8.0,
+                    "gen_global_ao": False,
+                }
+                curv_u8 = _ensure_generator_raw_u8(owner_node, act_layer, dummy_curv_eff, mw_i, mh_i, force=True)
+                curv_raw_2d = curv_u8.reshape(mh_i, mw_i).astype(np.float32) * (1.0 / 255.0)
+                if mw_i != out_w or mh_i != out_h:
+                    ys = np.clip((np.linspace(0.0, mh_i - 1.0, out_h)).astype(np.int32), 0, mh_i - 1)
+                    xs = np.clip((np.linspace(0.0, mw_i - 1.0, out_w)).astype(np.int32), 0, mw_i - 1)
+                    curv_2d = curv_raw_2d[ys[:, None], xs[None, :]]
+                else:
+                    curv_2d = curv_raw_2d
+        finally:
+            _save_mesh_maps_state(owner_node, updates={"use_baked_maps": True})
+            if saved_mask_bytes is not None and c_layer.mask_ibuf:
+                c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
+                if c_imb.byte_data:
+                    ctypes.memmove(c_imb.byte_data, saved_mask_bytes, len(saved_mask_bytes))
+            if not orig_use_mask:
+                act_layer.use_mask = False
+
+    # Upsample eval_w x eval_h maps to out_w x out_h if needed
+    def _upsample_to_out(arr_2d_or_3d):
+        if eval_w == out_w and eval_h == out_h:
+            return arr_2d_or_3d
+        ys = np.clip((np.linspace(0.0, eval_h - 1.0, out_h)).astype(np.int32), 0, eval_h - 1)
+        xs = np.clip((np.linspace(0.0, eval_w - 1.0, out_w)).astype(np.int32), 0, eval_w - 1)
+        return arr_2d_or_3d[ys[:, None], xs[None, :]]
+
+    # Fuse Tangent-Space Normal Map UV derivatives into Curvature map (captures High-Poly sculpted bevels & grooves!)
+    if curv_2d is not None:
+        n_full = _upsample_to_out(acc_normal)
+        nx_2d = n_full[:, :, 0] * 2.0 - 1.0
+        ny_2d = n_full[:, :, 1] * 2.0 - 1.0
+        dnx_dx = (np.roll(nx_2d, -1, axis=1) - np.roll(nx_2d, 1, axis=1)) * 0.5
+        dny_dy = (np.roll(ny_2d, -1, axis=0) - np.roll(ny_2d, 1, axis=0)) * 0.5
+        normal_curv_delta = (dnx_dx + dny_dy) * 1.45
+        curv_2d = np.clip(curv_2d + normal_curv_delta, 0.0, 1.0)
+        # Also enrich AO crevices with deep concave High-Poly normal cavities
+        if ao_2d is not None and hp_data is not None:
+            hp_cav = np.maximum(-normal_curv_delta, 0.0) * 0.65
+            ao_2d = np.clip(ao_2d - hp_cav, 0.0, 1.0)
+
+    mat_prefix = (mat.name if mat else (owner_node.image.name if owner_node.image else "TexSet")).replace(" ", "_")
+    baked_names = {}
+
+    if "normal" in bake_slots:
+        ima = _ensure_baked_map_image(mat_prefix, "normal", out_w, out_h, is_color=False)
+        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_normal), out_w, out_h)
+        baked_names["normal"] = ima.name
+        if bool(st.get("apply_normal_to_shader", True)):
+            _apply_baked_normal_map_to_shader(mat, owner_node, ima)
+
+    if "normal_ws" in bake_slots:
+        ima = _ensure_baked_map_image(mat_prefix, "normal_ws", out_w, out_h, is_color=False)
+        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_normal_ws), out_w, out_h)
+        baked_names["normal_ws"] = ima.name
+
+    if "id_map" in bake_slots:
+        ima = _ensure_baked_map_image(mat_prefix, "id_map", out_w, out_h, is_color=True)
+        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_id), out_w, out_h)
+        baked_names["id_map"] = ima.name
+
+    if "ao" in bake_slots and ao_2d is not None:
+        ima = _ensure_baked_map_image(mat_prefix, "ao", out_w, out_h, is_color=False)
+        _write_rgb_f32_to_image(ima, np.dstack([ao_2d, ao_2d, ao_2d]), out_w, out_h)
+        baked_names["ao"] = ima.name
+
+    if "curvature" in bake_slots and curv_2d is not None:
+        ima = _ensure_baked_map_image(mat_prefix, "curvature", out_w, out_h, is_color=False)
+        _write_rgb_f32_to_image(ima, np.dstack([curv_2d, curv_2d, curv_2d]), out_w, out_h)
+        baked_names["curvature"] = ima.name
+
+    if "position" in bake_slots:
+        ima = _ensure_baked_map_image(mat_prefix, "position", out_w, out_h, is_color=False)
+        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_pos), out_w, out_h)
+        baked_names["position"] = ima.name
+
+    if "thickness" in bake_slots:
+        ima = _ensure_baked_map_image(mat_prefix, "thickness", out_w, out_h, is_color=False)
+        th_out = _upsample_to_out(acc_thick)
+        _write_rgb_f32_to_image(ima, np.dstack([th_out, th_out, th_out]), out_w, out_h)
+        baked_names["thickness"] = ima.name
+
+    _save_mesh_maps_state(owner_node, updates={"use_baked_maps": True}, map_updates=baked_names)
+
+    # Clear generator raw cache and re-evaluate active layer masks so Smart Masks immediately reflect the baked maps
+    _EFFECT_RAW_CACHE.clear()
+    _GLOBAL_AO_CACHE.clear()
+    for l_item in owner_node.layers:
+        if getattr(l_item, "use_mask", False):
+            st_l = _get_layer_grunge_state(owner_node, l_item)
+            if st_l.get("effects"):
+                _evaluate_layer_grunge_mask(owner_node, l_item, context=context, force_reproject=True, skip_absorb=True)
+
+    return True, f"Baked {len(baked_names)} Mesh Map(s) ({out_w}×{out_h}) across {len(low_obs)} part(s)"
+
+
+class NODE_OT_tex_paint_bake_mesh_maps(Operator):
+    """Bake Substance-Painter-style Mesh Maps (Normal, World Space Normal, ID, Ambient Occlusion, Curvature, Position, Thickness) from Low-Poly + Global Scene or High-Poly source mesh(es)"""
+    bl_idname = "node.tex_paint_bake_mesh_maps"
+    bl_label = "Bake Mesh Maps"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    map_type: EnumProperty(
+        name="Map to Bake",
+        items=(
+            ('ALL', "All Mesh Maps", "Bake all 7 Mesh Maps (Normal, World Normal, ID, AO, Curvature, Position, Thickness)"),
+            ('normal', "Normal (Tangent Space)", "Bake Tangent-Space Normal Map"),
+            ('normal_ws', "World Space Normal", "Bake World-Space Normal Map"),
+            ('id_map', "ID (Color / Part)", "Bake Part / Material Color ID Map"),
+            ('ao', "Ambient Occlusion (Global / Self)", "Bake Ambient Occlusion Map (including surrounding scene objects when Global AO is active)"),
+            ('curvature', "Curvature", "Bake Curvature Map (geometry + normal-map derivatives)"),
+            ('position', "Position", "Bake normalized World-Space XYZ Position Map"),
+            ('thickness', "Thickness", "Bake interior raycast Thickness Map"),
+        ),
+        default='ALL',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return tex_paint_node_from_context(context) is not None
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        ok, msg = _bake_mesh_maps_for_node(node, context=context, target_map=self.map_type)
+        if not ok:
+            self.report({'WARNING'}, msg)
+            return {'CANCELLED'}
+        _tag_view3d_gizmo_refresh(context)
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class NODE_OT_tex_paint_mesh_map_action(Operator):
+    """Preview, Clear, or Connect a baked Mesh Map in the Texture Set Mesh Maps Hub"""
+    bl_idname = "node.tex_paint_mesh_map_action"
+    bl_label = "Mesh Map Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: EnumProperty(
+        name="Action",
+        items=(
+            ('PREVIEW_2D', "Preview in 2D Image Editor", "Display this Mesh Map in an open 2D Image Editor"),
+            ('APPLY_NORMAL', "Connect Normal Map to Shader", "Wire the baked Tangent-Space Normal Map into the material's Principled BSDF Normal input"),
+            ('CLEAR_SLOT', "Clear Mesh Map Slot", "Unlink this Mesh Map slot"),
+            ('CLEAR_ALL', "Clear All Mesh Map Slots", "Unlink all 7 Mesh Map slots on this material"),
+        ),
+        default='PREVIEW_2D',
+    )
+    slot: StringProperty(name="Slot", default="ao")
+
+    @classmethod
+    def poll(cls, context):
+        return tex_paint_node_from_context(context) is not None
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        if node is None:
+            return {'CANCELLED'}
+        owner = _canonical_mask_owner_node(node)
+        st = _get_mesh_maps_state(owner)
+        maps = st.get("maps", {})
+
+        if self.action == 'CLEAR_ALL':
+            _save_mesh_maps_state(owner, map_updates={k: "" for k in maps})
+            _EFFECT_RAW_CACHE.clear()
+            for l_item in owner.layers:
+                if getattr(l_item, "use_mask", False):
+                    _evaluate_layer_grunge_mask(owner, l_item, context=context, force_reproject=True, skip_absorb=True)
+            self.report({'INFO'}, "Cleared all Mesh Map slots")
+            return {'FINISHED'}
+
+        if self.action == 'CLEAR_SLOT':
+            _save_mesh_maps_state(owner, map_updates={self.slot: ""})
+            _EFFECT_RAW_CACHE.clear()
+            for l_item in owner.layers:
+                if getattr(l_item, "use_mask", False):
+                    _evaluate_layer_grunge_mask(owner, l_item, context=context, force_reproject=True, skip_absorb=True)
+            return {'FINISHED'}
+
+        im_name = maps.get(self.slot, "")
+        ima = bpy.data.images.get(im_name) if im_name else None
+        if ima is None:
+            self.report({'WARNING'}, f"No image assigned to '{self.slot}' slot")
+            return {'CANCELLED'}
+
+        if self.action == 'APPLY_NORMAL':
+            mat = _get_material_for_node(owner, context)
+            if _apply_baked_normal_map_to_shader(mat, owner, ima):
+                self.report({'INFO'}, f"Connected '{ima.name}' to Principled BSDF Normal")
+                return {'FINISHED'}
+            return {'CANCELLED'}
+
+        if self.action == 'PREVIEW_2D':
+            wm = getattr(context, "window_manager", None)
+            shown = False
+            if wm:
+                for win in wm.windows:
+                    if win.screen:
+                        for area in win.screen.areas:
+                            if area.type == 'IMAGE_EDITOR':
+                                for sp in area.spaces:
+                                    if sp.type == 'IMAGE_EDITOR':
+                                        sp.image = ima
+                                        shown = True
+                                area.tag_redraw()
+            if shown:
+                self.report({'INFO'}, f"Displaying '{ima.name}' in 2D Image Editor")
+            else:
+                self.report({'INFO'}, f"Mesh Map '{ima.name}' ready (open an Image Editor to view 2D)")
+            return {'FINISHED'}
+
+        return {'CANCELLED'}
+
+
+class NODE_OT_tex_paint_import_mesh_map(Operator):
+    """Import an external baked image file (Normal, AO, Curvature, ID, Position, Thickness) from disk into a Mesh Map slot"""
+    bl_idname = "node.tex_paint_import_mesh_map"
+    bl_label = "Open Mesh Map Image..."
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(
+        name="File Path",
+        description="Image file to load into the selected Mesh Map slot",
+        maxlen=1024,
+        subtype='FILE_PATH',
+    )
+    filter_image: BoolProperty(default=True, options={'HIDDEN', 'SKIP_SAVE'})
+    filter_folder: BoolProperty(default=True, options={'HIDDEN', 'SKIP_SAVE'})
+    slot: StringProperty(name="Mesh Map Slot", default="ao")
+
+    @classmethod
+    def poll(cls, context):
+        return tex_paint_node_from_context(context) is not None
+
+    def invoke(self, context, _event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        if node is None or not self.filepath or not os.path.isfile(self.filepath):
+            return {'CANCELLED'}
+        try:
+            ima = bpy.data.images.load(self.filepath, check_existing=True)
+        except Exception as ex:
+            self.report({'ERROR'}, f"Failed to load image: {ex}")
+            return {'CANCELLED'}
+
+        try:
+            ima.colorspace_settings.name = 'sRGB' if self.slot == 'id_map' else 'Non-Color'
+        except Exception:
+            pass
+
+        owner = _canonical_mask_owner_node(node)
+        _save_mesh_maps_state(owner, updates={"use_baked_maps": True}, map_updates={self.slot: ima.name})
+        if self.slot == 'normal':
+            st = _get_mesh_maps_state(owner)
+            if st.get("apply_normal_to_shader", True):
+                mat = _get_material_for_node(owner, context)
+                _apply_baked_normal_map_to_shader(mat, owner, ima)
+
+        _EFFECT_RAW_CACHE.clear()
+        for l_item in owner.layers:
+            if getattr(l_item, "use_mask", False):
+                _evaluate_layer_grunge_mask(owner, l_item, context=context, force_reproject=True, skip_absorb=True)
+
+        self.report({'INFO'}, f"Loaded '{ima.name}' into '{self.slot}' Mesh Map slot")
+        return {'FINISHED'}
+
+
 class TEXPAINT_MT_layer_specials(Menu):
     """Special layer operations (Fill, Clear, Invert, Flip, Rasterize, Copy Mask, Merge Visible, Flatten, Export Texture Set)"""
     bl_idname = "TEXPAINT_MT_layer_specials"
@@ -6956,20 +8484,22 @@ class TEXPAINT_MT_layer_specials(Menu):
 
 
 class NODE_OT_tex_paint_smart_mask_recipe(Operator):
-    """Apply a 1-click Substance Painter multi-layer Smart Weathering Mask Recipe (Generator + Grunge + Levels/Paint)"""
+    """Apply a 1-click Substance Painter multi-layer Smart Weathering Mask Preset (Generator + Grunge + Filter + Levels/Paint)"""
     bl_idname = "node.tex_paint_smart_mask_recipe"
-    bl_label = "Apply Smart Mask Recipe"
+    bl_label = "Apply Smart Mask Preset"
     bl_options = {'REGISTER', 'UNDO'}
 
     recipe: EnumProperty(
-        name="Smart Mask Recipe",
+        name="Smart Mask Preset",
         items=(
             ('EDGE_SCRATCHES', "Edge Wear + Scratches", "Sharp edge wear broken up by concrete/scratch grunge + Paint touchup layer", 'MOD_BEVEL', 0),
-            ('CAVITY_DIRT', "Cavity Dirt & Grime", "Concave crevices & seams multiplied with organic dirt grunge", 'SHARPCURVE', 1),
-            ('TOP_DUST', "Top-Down Dust / Moss", "Upward-facing surface normals broken up with soft procedural noise", 'NORMALS_FACE', 2),
-            ('RUST_LEAKS', "Rust & Vertical Streaks", "Occluded crevices combined with vertical leak grunge and contrast boost", 'MOD_FLUIDSIM', 3),
-            ('HEAVY_CHIPPING', "Heavy Paint Chipping", "Broad edge wear chipped away with high-contrast procedural spots", 'MOD_EXPLODE', 4),
-            ('PAINT_PEEL', "Weathered Surface Peel", "Curvature base + Overlay cracked concrete grunge + hand-paintable mask layer", 'BRUSH_DATA', 5),
+            ('SLOPE_CHIPPED_EDGES', "Chipped Edges (Blur Slope)", "Edge Wear + Blur Slope directional edge warp + sharp threshold levels", 'MOD_NOISE', 1),
+            ('HEAVY_CHIPPING', "Heavy Paint Chipping", "Broad edge wear chipped away with high-contrast procedural spots", 'MOD_EXPLODE', 2),
+            ('CAVITY_DIRT', "Cavity Dirt & Grime", "Concave crevices & seams multiplied with organic dirt grunge", 'SHARPCURVE', 3),
+            ('SOFT_BLURRED_AO', "Soft Crevice Dust (Blurred AO)", "Ambient Occlusion crevices softened with a Blur filter and dust breakup", 'SHADING_RENDERED', 4),
+            ('TOP_DUST', "Top-Down Dust / Moss", "Upward-facing surface normals broken up with soft procedural noise", 'NORMALS_FACE', 5),
+            ('RUST_LEAKS', "Rust & Vertical Streaks", "Occluded crevices combined with vertical leak grunge and contrast boost", 'MOD_FLUIDSIM', 6),
+            ('PAINT_PEEL', "Weathered Surface Peel", "Curvature base + Overlay cracked concrete grunge + Bevel rim + Paint layer", 'BRUSH_DATA', 7),
         ),
         default='EDGE_SCRATCHES',
     )
@@ -7017,6 +8547,15 @@ class NODE_OT_tex_paint_smart_mask_recipe(Operator):
             e3.update({"name": "Hand Paint Touchup"})
             effects = [e1, e2, e3]
 
+        elif self.recipe == 'SLOPE_CHIPPED_EDGES':
+            e1 = _make_default_mask_effect('GENERATOR', uid=1, is_first=True, gen_type='EDGE_WEAR')
+            e1.update({"name": "Edge Wear Base", "gen_balance": 0.58, "gen_contrast": 0.45, "gen_radius": 0.42, "gen_noise": 0.20})
+            e2 = _make_default_mask_effect('FILTER', uid=2, is_first=False, filter_type='BLUR_SLOPE')
+            e2.update({"name": "Filter: Blur Slope", "flt_radius": 7.5, "flt_strength": 1.15, "flt_scale": 10.0})
+            e3 = _make_default_mask_effect('LEVELS', uid=3, is_first=False)
+            e3.update({"name": "Crisp Chipped Threshold", "lvl_balance": 0.52, "lvl_contrast": 0.58})
+            effects = [e1, e2, e3]
+
         elif self.recipe == 'CAVITY_DIRT':
             e1 = _make_default_mask_effect('GENERATOR', uid=1, is_first=True, gen_type='CAVITY')
             e1.update({"name": "Cavity Crevices", "gen_balance": 0.58, "gen_contrast": 0.45, "gen_radius": 0.42, "gen_noise": 0.20})
@@ -7032,6 +8571,24 @@ class NODE_OT_tex_paint_smart_mask_recipe(Operator):
                 "contrast": 0.35,
             })
             effects = [e1, e2]
+
+        elif self.recipe == 'SOFT_BLURRED_AO':
+            e1 = _make_default_mask_effect('GENERATOR', uid=1, is_first=True, gen_type='AO')
+            e1.update({"name": "Ambient Occlusion", "invert": True, "gen_balance": 0.55, "gen_contrast": 0.42, "gen_radius": 0.45})
+            e2 = _make_default_mask_effect('FILTER', uid=2, is_first=False, filter_type='BLUR')
+            e2.update({"name": "Filter: Soft Blur", "flt_radius": 8.0, "flt_strength": 1.0})
+            e3 = _make_default_mask_effect('GRUNGE', uid=3, is_first=False)
+            e3.update({
+                "name": "Fine Dust Grain",
+                "blend_mode": 'MULTIPLY',
+                "opacity": 0.65,
+                "category": 'NOISES',
+                "texture": _pick_grunge('NOISES', "clouds"),
+                "scale": 3.2,
+                "balance": 0.58,
+                "contrast": 0.25,
+            })
+            effects = [e1, e2, e3]
 
         elif self.recipe == 'TOP_DUST':
             e1 = _make_default_mask_effect('GENERATOR', uid=1, is_first=True, gen_type='NORMAL_UP')
@@ -7118,15 +8675,76 @@ class NODE_OT_tex_paint_smart_mask_recipe(Operator):
 
 
 class TEXPAINT_MT_smart_mask_recipes(Menu):
-    """Substance-Painter-style 1-click multi-layer Smart Weathering Mask Recipes"""
+    """Substance-Painter-style Smart Masks preset menu (multi-effect stacks: Generator + Grunge + Filter + Levels)"""
     bl_idname = "TEXPAINT_MT_smart_mask_recipes"
-    bl_label = "Smart Weathering Mask Recipes"
+    bl_label = "Smart Masks (Multi-Effect Presets)"
 
     def draw(self, _context):
         layout = self.layout
-        for rec_id, rec_lbl, _desc, rec_icon, _idx in NODE_OT_tex_paint_smart_mask_recipe.bl_rna.properties["recipe"].enum_items:
+        layout.label(text="Edge Wear & Chipping Presets", icon='MOD_BEVEL')
+        for rec_id, rec_lbl, rec_icon in (
+            ('EDGE_SCRATCHES', "Edge Wear + Scratches", 'MOD_BEVEL'),
+            ('SLOPE_CHIPPED_EDGES', "Chipped Edges (Blur Slope)", 'MOD_NOISE'),
+            ('HEAVY_CHIPPING', "Heavy Paint Chipping", 'MOD_EXPLODE'),
+            ('PAINT_PEEL', "Weathered Surface Peel", 'BRUSH_DATA'),
+        ):
             op = layout.operator("node.tex_paint_smart_mask_recipe", text=rec_lbl, icon=rec_icon)
             op.recipe = rec_id
+
+        layout.separator()
+        layout.label(text="Dirt, Dust & Rust Presets", icon='SHADING_RENDERED')
+        for rec_id, rec_lbl, rec_icon in (
+            ('CAVITY_DIRT', "Cavity Dirt & Grime", 'SHARPCURVE'),
+            ('SOFT_BLURRED_AO', "Soft Crevice Dust (Blurred AO)", 'SHADING_RENDERED'),
+            ('TOP_DUST', "Top-Down Dust / Moss", 'NORMALS_FACE'),
+            ('RUST_LEAKS', "Rust & Vertical Streaks", 'MOD_FLUIDSIM'),
+        ):
+            op = layout.operator("node.tex_paint_smart_mask_recipe", text=rec_lbl, icon=rec_icon)
+            op.recipe = rec_id
+
+
+class TEXPAINT_MT_add_mask_generator(Menu):
+    """Substance-Painter-style Add Generator submenu inside + Add Effect"""
+    bl_idname = "TEXPAINT_MT_add_mask_generator"
+    bl_label = "Add Generator"
+
+    def draw(self, _context):
+        layout = self.layout
+        gen_items = (
+            ('EDGE_WEAR', "Edge Wear (Convex Sharp Edges)", 'MOD_BEVEL'),
+            ('CAVITY', "Cavity & Dirt (Concave Crevices)", 'SHARPCURVE'),
+            ('CURVATURE', "Curvature (Concave to Convex)", 'SMOOTHCURVE'),
+            ('AO', "Ambient Occlusion (Mesh Shading)", 'SHADING_RENDERED'),
+            ('NORMAL_UP', "Top-Down Dust (World Space Normal)", 'NORMALS_FACE'),
+            ('POSITION_Z', "Vertical Height (Bottom-to-Top Gradient)", 'EMPTY_SINGLE_ARROW'),
+        )
+        for g_id, g_lbl, g_icon in gen_items:
+            op_g = layout.operator("node.tex_paint_mask_effect_add", text=g_lbl, icon=g_icon)
+            op_g.effect_type = 'GENERATOR'
+            op_g.gen_type = g_id
+
+
+class TEXPAINT_MT_add_mask_filter(Menu):
+    """Substance-Painter-style Add Filter submenu inside + Add Effect (Blur, Blur Slope, Sharpen, Bevel, Dilate/Erode, etc.)"""
+    bl_idname = "TEXPAINT_MT_add_mask_filter"
+    bl_label = "Add Filter"
+
+    def draw(self, _context):
+        layout = self.layout
+        filter_items = (
+            ('BLUR', "Blur (Gaussian / Box Softening)", 'MOD_SMOOTH'),
+            ('BLUR_SLOPE', "Blur Slope (Directional Edge Warp)", 'MOD_NOISE'),
+            ('SHARPEN', "Sharpen (Unsharp Mask Crispness)", 'SHARPCURVE'),
+            ('DILATE_ERODE', "Grow / Shrink (Dilate / Erode)", 'FULLSCREEN_ENTER'),
+            ('BEVEL', "Bevel (Edge Distance Ramp)", 'MOD_BEVEL'),
+            ('THRESHOLD', "Threshold (Hard Binary Stencil)", 'IPO_CONSTANT'),
+            ('POSTERIZE', "Posterize (Stepped Contour Bands)", 'LINENUMBERS_ON'),
+            ('HIGHPASS', "Highpass (Edge Accentuation)", 'SEQ_HISTOGRAM'),
+        )
+        for f_id, f_lbl, f_icon in filter_items:
+            op_f = layout.operator("node.tex_paint_mask_effect_add", text=f_lbl, icon=f_icon)
+            op_f.effect_type = 'FILTER'
+            op_f.filter_type = f_id
 
 
 class TEXPAINT_MT_add_layer(Menu):
@@ -7177,13 +8795,13 @@ class TEXPAINT_MT_add_layer(Menu):
         op_wm.mode = 'WHITE'
         layout.operator("node.tex_paint_grunge_open_image", text="Open Image into Mask...", icon='FILE_FOLDER')
         if not is_2d_only:
-            layout.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Weathering Masks", icon='PRESET')
+            layout.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Masks (Presets)", icon='PRESET')
 
 
 class TEXPAINT_MT_add_mask_effect(Menu):
-    """Substance-Painter-style + Add Effect dropdown menu between the Up/Down arrows on the Mask Stack"""
+    """Substance-Painter-style + Add Effect menu (Generator, Paint, Fill, Filter, Levels)"""
     bl_idname = "TEXPAINT_MT_add_mask_effect"
-    bl_label = "Add Mask Sub-Layer"
+    bl_label = "Add Mask Effect"
 
     def draw(self, context):
         layout = self.layout
@@ -7191,42 +8809,28 @@ class TEXPAINT_MT_add_mask_effect(Menu):
         node = tex_paint_node_from_context(context)
         is_2d_only = bool((space and space.type == 'IMAGE_EDITOR') or _is_standalone_2d_node(node))
 
-        op_fill = layout.operator("node.tex_paint_mask_effect_add", text="Add Fill (Image / Stencil)", icon='FILE_IMAGE')
-        op_fill.effect_type = 'GRUNGE'
-        op_fill.fill_source = 'CUSTOM_IMAGE'
+        if not is_2d_only:
+            layout.menu("TEXPAINT_MT_add_mask_generator", text="Add Generator", icon='MODIFIER')
 
-        layout.operator("node.tex_paint_grunge_open_image", text="Open Image File into Mask...", icon='FILE_FOLDER')
+        op_pnt = layout.operator("node.tex_paint_mask_effect_add", text="Add Paint", icon='BRUSH_DATA')
+        op_pnt.effect_type = 'PAINT'
 
-        op_grn = layout.operator("node.tex_paint_mask_effect_add", text="Add Grunge Fill (275 Library)", icon='TEXTURE')
+        op_grn = layout.operator("node.tex_paint_mask_effect_add", text="Add Fill (Grunge / Procedural)", icon='TEXTURE')
         op_grn.effect_type = 'GRUNGE'
         op_grn.fill_source = 'GRUNGE'
 
-        op_pnt = layout.operator("node.tex_paint_mask_effect_add", text="Add Paint (Hand Brush)", icon='BRUSH_DATA')
-        op_pnt.effect_type = 'PAINT'
+        op_fill = layout.operator("node.tex_paint_mask_effect_add", text="Add Bitmap Fill (Image / Stencil)", icon='FILE_IMAGE')
+        op_fill.effect_type = 'GRUNGE'
+        op_fill.fill_source = 'CUSTOM_IMAGE'
 
-        op_lvl = layout.operator("node.tex_paint_mask_effect_add", text="Add Levels (Balance / Contrast)", icon='SEQ_LUMA_WAVEFORM')
+        layout.menu("TEXPAINT_MT_add_mask_filter", text="Add Filter (Blur / Slope / Bevel)", icon='SHADERFX')
+
+        op_lvl = layout.operator("node.tex_paint_mask_effect_add", text="Add Levels", icon='SEQ_LUMA_WAVEFORM')
         op_lvl.effect_type = 'LEVELS'
 
-        if not is_2d_only:
-            layout.separator()
-            gen_items = (
-                ('EDGE_WEAR', "Add Generator: Edge Wear", 'MOD_BEVEL'),
-                ('CAVITY', "Add Generator: Cavity & Dirt", 'SHARPCURVE'),
-                ('CURVATURE', "Add Generator: Curvature", 'SMOOTHCURVE'),
-                ('AO', "Add Generator: Ambient Occlusion", 'SHADING_RENDERED'),
-                ('NORMAL_UP', "Add Generator: Top-Down Dust", 'NORMALS_FACE'),
-                ('POSITION_Z', "Add Generator: Vertical Height", 'EMPTY_SINGLE_ARROW'),
-            )
-            for g_id, g_lbl, g_icon in gen_items:
-                op_g = layout.operator("node.tex_paint_mask_effect_add", text=g_lbl, icon=g_icon)
-                op_g.effect_type = 'GENERATOR'
-                op_g.gen_type = g_id
-
-            layout.separator()
-            layout.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Weathering Recipes", icon='PRESET')
-
         layout.separator()
-        layout.operator("node.tex_paint_mask_effect_duplicate", text="Duplicate Active Sub-Layer", icon='DUPLICATE')
+        layout.operator("node.tex_paint_grunge_open_image", text="Open Image File into Mask...", icon='FILE_FOLDER')
+        layout.operator("node.tex_paint_mask_effect_duplicate", text="Duplicate Active Effect", icon='DUPLICATE')
         layout.operator("node.tex_paint_layer_pixel_action", text="Copy Mask from Layer Below", icon='PASTEDOWN').action = 'COPY_MASK_BELOW'
 
         layout.separator()
@@ -7333,6 +8937,7 @@ class TEXPAINT_UL_layers(UIList):
                         'GENERATOR': 'MODIFIER',
                         'PAINT': 'BRUSH_DATA',
                         'GRUNGE': 'TEXTURE',
+                        'FILTER': 'SHADERFX',
                         'LEVELS': 'SEQ_LUMA_WAVEFORM',
                     }.get(et, 'MOD_MASK')
                 else:
@@ -7432,6 +9037,7 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
         'GENERATOR': 'MODIFIER',
         'PAINT': 'BRUSH_DATA',
         'GRUNGE': 'TEXTURE',
+        'FILTER': 'SHADERFX',
         'LEVELS': 'SEQ_LUMA_WAVEFORM',
     }
 
@@ -7683,14 +9289,139 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
         if float(act_eff.get("gen_noise", 0.0)) > 0.001:
             rn_row.prop(node, "tex_paint_mask_eff_gen_noise_scale", text="Scale", slider=True)
 
+        if not is_2d_only:
+            g_type = act_eff.get("gen_type", "EDGE_WEAR")
+            ao_row = gen_col.row(align=True)
+            ao_lbl = "Global Scene AO (Nearby Objects)" if g_type in {'AO', 'CAVITY', 'EDGE_WEAR'} else "Global World-Space Assembly"
+            if hasattr(node, "tex_paint_mask_eff_gen_global_ao"):
+                ao_row.prop(node, "tex_paint_mask_eff_gen_global_ao", text=ao_lbl, toggle=True, icon='WORLD')
+            if wm and hasattr(wm, "tex_paint_show_mesh_maps_hub"):
+                ao_row.prop(wm, "tex_paint_show_mesh_maps_hub", text="Mesh Maps", toggle=True, icon='SHADING_RENDERED')
+
     elif etype == 'PAINT':
         _draw_mask_brush_bar(layout, context, node, layer, is_paint_sublayer=True)
+
+    elif etype == 'FILTER':
+        flt_col = layout.column(align=True)
+        ft = act_eff.get("filter_type", "BLUR")
+        ft_row = flt_col.row(align=True)
+        ft_row.prop(node, "tex_paint_mask_eff_filter_type", text="")
+        ft_row.prop(node, "tex_paint_grunge_invert", text="", toggle=True, icon='ARROW_LEFTRIGHT')
+
+        rs_row = flt_col.row(align=True)
+        if ft not in {'THRESHOLD', 'POSTERIZE'}:
+            rs_row.prop(node, "tex_paint_mask_eff_flt_radius", text="Radius", slider=True)
+        str_labels = {
+            'BLUR': "Intensity",
+            'BLUR_SLOPE': "Slope Warp",
+            'SHARPEN': "Sharpen",
+            'DILATE_ERODE': "Grow (+) / Shrink (-)",
+            'BEVEL': "Bevel Width",
+            'THRESHOLD': "Threshold",
+            'POSTERIZE': "Steps Banding",
+            'HIGHPASS': "Strength",
+        }
+        rs_row.prop(node, "tex_paint_mask_eff_flt_strength", text=str_labels.get(ft, "Strength"), slider=True)
+        if ft == 'BLUR_SLOPE':
+            sc_row = flt_col.row(align=True)
+            sc_row.prop(node, "tex_paint_mask_eff_flt_scale", text="Slope Noise Scale", slider=True)
 
     elif etype == 'LEVELS':
         lvl_row = layout.row(align=True)
         lvl_row.prop(node, "tex_paint_mask_eff_lvl_balance", text="Balance", slider=True)
         lvl_row.prop(node, "tex_paint_mask_eff_lvl_contrast", text="Contrast", slider=True)
         lvl_row.prop(node, "tex_paint_grunge_invert", text="", toggle=True, icon='ARROW_LEFTRIGHT')
+
+
+def _draw_mesh_maps_hub(layout, _context, node, wm):
+    """Draw the collapsible Substance-Painter-style Mesh Maps & High-Poly Baker Hub."""
+    owner = _canonical_mask_owner_node(node)
+    st = _get_mesh_maps_state(owner)
+    maps = st.get("maps", {})
+    linked_count = sum(1 for k, _lbl, _ic in _MESH_MAP_SLOTS if maps.get(k) and bpy.data.images.get(maps.get(k)) is not None)
+    expanded = bool(getattr(wm, "tex_paint_show_mesh_maps_hub", False)) if wm else False
+
+    hub_box = layout.box()
+    hub_col = hub_box.column(align=True)
+    hdr = hub_col.row(align=True)
+    if wm and hasattr(wm, "tex_paint_show_mesh_maps_hub"):
+        hdr.prop(
+            wm,
+            "tex_paint_show_mesh_maps_hub",
+            text=f"Mesh Maps & Baker ({linked_count}/7)",
+            icon='TRIA_DOWN' if expanded else 'TRIA_RIGHT',
+            emboss=True,
+        )
+    else:
+        hdr.label(text=f"Mesh Maps & Baker ({linked_count}/7)", icon='SHADING_RENDERED')
+
+    op_bake_all = hdr.operator("node.tex_paint_bake_mesh_maps", text="Bake Mesh Maps", icon='RENDER_STILL')
+    op_bake_all.map_type = 'ALL'
+    if linked_count > 0 and hasattr(owner, "tex_paint_use_baked_mesh_maps"):
+        hdr.prop(owner, "tex_paint_use_baked_mesh_maps", text="", toggle=True, icon='CHECKMARK')
+
+    if not expanded:
+        return
+
+    hub_col.separator(factor=0.3)
+
+    # 1. High-Poly / Low-Poly Source & Global AO Baker Settings
+    src_mode = st.get("source_mode", "LOW_POLY")
+    b_row1 = hub_col.row(align=True)
+    b_row1.prop(owner, "tex_paint_bake_source_mode", text="Source")
+
+    if src_mode == 'HIGH_POLY_OB':
+        hp_row = hub_col.row(align=True)
+        hp_row.prop_search(owner, "tex_paint_bake_high_poly_ob", bpy.data, "objects", text="High-Poly", icon='MESH_ICOSPHERE')
+        hp_row.prop(owner, "tex_paint_bake_cage_dist", text="Cage Dist", slider=True)
+    elif src_mode == 'HIGH_POLY_COL':
+        hp_row = hub_col.row(align=True)
+        hp_row.prop_search(owner, "tex_paint_bake_high_poly_col", bpy.data, "collections", text="High-Poly Col", icon='OUTLINER_COLLECTION')
+        hp_row.prop(owner, "tex_paint_bake_cage_dist", text="Cage Dist", slider=True)
+
+    b_row2 = hub_col.row(align=True)
+    b_row2.prop(owner, "tex_paint_bake_ao_scope", text="AO Scope")
+    b_row2.prop(owner, "tex_paint_bake_ao_dist", text="AO Spread", slider=True)
+
+    b_row3 = hub_col.row(align=True)
+    b_row3.prop(owner, "tex_paint_bake_res", text="Size")
+    b_row3.prop(owner, "tex_paint_bake_apply_normal", text="Wire Normal to BSDF", toggle=True, icon='NODE_SEL')
+    if linked_count > 0:
+        op_ca = b_row3.operator("node.tex_paint_mesh_map_action", text="", icon='TRASH')
+        op_ca.action = 'CLEAR_ALL'
+
+    hub_col.separator(factor=0.35)
+
+    # 2. The 7 Substance Painter Mesh Map Slots (Normal, World Normal, ID, AO, Curvature, Position, Thickness)
+    for slot_key, slot_label, slot_icon in _MESH_MAP_SLOTS:
+        s_row = hub_col.row(align=True)
+        lbl_sub = s_row.row(align=True)
+        lbl_sub.ui_units_x = 5.2
+        lbl_sub.label(text=slot_label, icon=slot_icon)
+
+        prop_name = f"tex_paint_mesh_map_{slot_key}"
+        if hasattr(owner, prop_name):
+            s_row.prop_search(owner, prop_name, bpy.data, "images", text="", icon='IMAGE_DATA')
+
+        op_bk = s_row.operator("node.tex_paint_bake_mesh_maps", text="", icon='RENDER_STILL')
+        op_bk.map_type = slot_key
+
+        op_im = s_row.operator("node.tex_paint_import_mesh_map", text="", icon='FILE_FOLDER')
+        op_im.slot = slot_key
+
+        im_name = maps.get(slot_key, "")
+        has_im = bool(im_name and bpy.data.images.get(im_name) is not None)
+        if has_im:
+            if slot_key == "normal":
+                op_con = s_row.operator("node.tex_paint_mesh_map_action", text="", icon='NODE_SEL')
+                op_con.action = 'APPLY_NORMAL'
+                op_con.slot = slot_key
+            op_prv = s_row.operator("node.tex_paint_mesh_map_action", text="", icon='HIDE_OFF')
+            op_prv.action = 'PREVIEW_2D'
+            op_prv.slot = slot_key
+            op_clr = s_row.operator("node.tex_paint_mesh_map_action", text="", icon='X')
+            op_clr.action = 'CLEAR_SLOT'
+            op_clr.slot = slot_key
 
 
 def draw_tex_paint_layers(layout, context, node, compact=False):
@@ -7793,6 +9524,8 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             sh_row.operator("node.tex_paint_make_material_unique", text="Re-Bake All", icon='FILE_REFRESH').mode = 'REBAKE_ALL'
             sh_row.operator("node.tex_paint_make_material_unique", text="Unique Part", icon='DUPLICATE').mode = 'ACTIVE_OBJECT'
             sh_row.operator("node.tex_paint_make_material_unique", text="Split All", icon='MOD_EXPLODE').mode = 'ALL_SHARED_OBJECTS'
+
+        _draw_mesh_maps_hub(layout, context, node, wm)
 
     # 1. Layer Stack List + Right-Side Column (Up ▲, Add + Dropdown in the middle, Down ▼, Remove -, Specials ▾)
     row = layout.row()
@@ -8239,6 +9972,12 @@ def _read_active_2d_rgba_f32(context):
     layer = node.active_layer if node is not None else None
     if node is not None and layer is not None and layer.type == 'PAINT':
         c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
+        if not c_layer.ibuf:
+            try:
+                layer.opacity = layer.opacity
+            except Exception:
+                pass
+            c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
         if c_layer.ibuf:
             c_imb = _C_ImBuf.from_address(c_layer.ibuf)
             w, h = int(c_imb.x), int(c_imb.y)
@@ -10981,6 +12720,132 @@ def _register_node_grunge_props():
         update=_update_reproject,
     )
 
+    Node.tex_paint_mask_eff_gen_global_ao = BoolProperty(
+        name="Global Scene AO (Surrounding Objects)",
+        description="Include Ambient Occlusion and contact shadows from all surrounding objects in the scene (and across shared modular parts)",
+        default=True,
+        get=lambda self: bool(_active_eff_val(self, "gen_global_ao", True)),
+        set=lambda self, val: _set_eff(self, {"gen_global_ao": bool(val)}, ensure_type='GENERATOR'),
+        update=_update_reproject,
+    )
+
+    # Substance-Painter-style Mesh Maps & High-Poly Baker Hub properties
+    _bake_src_items = (
+        ('LOW_POLY', "Low-Poly + Scene", "Compute Mesh Maps from the Low-Poly mesh(es) and surrounding scene objects", 'MESH_DATA', 0),
+        ('HIGH_POLY_OB', "High-Poly Object -> Low-Poly", "Raycast normal, curvature, AO, and ID details from a High-Poly mesh object onto the Low-Poly mesh(es)", 'MESH_ICOSPHERE', 1),
+        ('HIGH_POLY_COL', "High-Poly Collection -> Low-Poly", "Raycast details from all meshes in a High-Poly Collection onto the Low-Poly mesh(es)", 'OUTLINER_COLLECTION', 2),
+    )
+    _bake_ao_scope_items = (
+        ('GLOBAL', "Global Scene (Nearby Objects)", "Ambient Occlusion interacts with all visible objects around each part in the scene", 'WORLD', 0),
+        ('MATERIAL', "Shared Material Parts", "Ambient Occlusion interacts only between modular parts sharing this material", 'LINKED', 1),
+        ('SELF', "Self Only (Isolated)", "Ambient Occlusion is computed per isolated object ignoring surrounding objects", 'OBJECT_DATA', 2),
+    )
+    _bake_res_items = (
+        ('MATCH', "Match Canvas", "Match the resolution of the material's layered texture canvas"),
+        ('512', "512 × 512", "512 × 512"),
+        ('1024', "1024 × 1024 (1K)", "1024 × 1024"),
+        ('2048', "2048 × 2048 (2K)", "2048 × 2048"),
+        ('4096', "4096 × 4096 (4K)", "4096 × 4096"),
+    )
+
+    def _on_mesh_map_changed(self, context):
+        _EFFECT_RAW_CACHE.clear()
+        owner = _canonical_mask_owner_node(self)
+        for l_item in owner.layers:
+            if getattr(l_item, "use_mask", False):
+                _evaluate_layer_grunge_mask(owner, l_item, context=context, force_reproject=True, skip_absorb=True)
+        return None
+
+    Node.tex_paint_use_baked_mesh_maps = BoolProperty(
+        name="Use Baked Mesh Maps in Smart Masks",
+        description="Automatically drive AO, Curvature, Edge Wear, Cavity, Dust, and Height generators from the baked Mesh Maps in this Hub",
+        default=True,
+        get=lambda self: bool(_get_mesh_maps_state(self).get("use_baked_maps", True)),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"use_baked_maps": bool(val)}),
+        update=_on_mesh_map_changed,
+    )
+
+    Node.tex_paint_bake_source_mode = EnumProperty(
+        name="Baker Mesh Source",
+        description="Choose whether to bake Mesh Maps from Low-Poly + Scene or transfer details from a High-Poly Object / Collection",
+        items=_bake_src_items,
+        get=lambda self: _enum_idx(_bake_src_items, _get_mesh_maps_state(self).get("source_mode", "LOW_POLY"), 0),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"source_mode": _bake_src_items[val][0]}),
+    )
+
+    Node.tex_paint_bake_high_poly_ob = StringProperty(
+        name="High-Poly Source Object",
+        description="High-Poly mesh object to bake Normal, Curvature, AO, and Color ID maps from",
+        get=lambda self: str(_get_mesh_maps_state(self).get("high_poly_ob", "")),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"high_poly_ob": str(val)}),
+    )
+
+    Node.tex_paint_bake_high_poly_col = StringProperty(
+        name="High-Poly Source Collection",
+        description="Collection of High-Poly meshes to bake Normal, Curvature, AO, and Color ID maps from",
+        get=lambda self: str(_get_mesh_maps_state(self).get("high_poly_col", "")),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"high_poly_col": str(val)}),
+    )
+
+    Node.tex_paint_bake_ao_scope = EnumProperty(
+        name="AO Interaction Scope",
+        description="Whether Ambient Occlusion includes all surrounding objects in the scene (Global), only shared material parts, or only self",
+        items=_bake_ao_scope_items,
+        get=lambda self: _enum_idx(_bake_ao_scope_items, _get_mesh_maps_state(self).get("ao_scope", "GLOBAL"), 0),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"ao_scope": _bake_ao_scope_items[val][0]}),
+    )
+
+    Node.tex_paint_bake_cage_dist = FloatProperty(
+        name="Max Ray / Cage Distance",
+        description="Ray extrusion distance when projecting High-Poly surface details onto the Low-Poly mesh",
+        min=0.0001,
+        max=10.0,
+        soft_min=0.005,
+        soft_max=1.0,
+        default=0.08,
+        get=lambda self: float(_get_mesh_maps_state(self).get("cage_dist", 0.08)),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"cage_dist": float(val)}),
+    )
+
+    Node.tex_paint_bake_ao_dist = FloatProperty(
+        name="AO Occlusion Distance",
+        description="Relative distance spread for Ambient Occlusion raycasting across self and surrounding objects",
+        min=0.05,
+        max=2.0,
+        default=0.65,
+        subtype='FACTOR',
+        get=lambda self: float(_get_mesh_maps_state(self).get("ao_dist", 0.65)),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"ao_dist": float(val)}),
+    )
+
+    Node.tex_paint_bake_res = EnumProperty(
+        name="Bake Resolution",
+        description="Resolution for baked Mesh Maps",
+        items=_bake_res_items,
+        get=lambda self: _enum_idx(_bake_res_items, _get_mesh_maps_state(self).get("bake_res", "MATCH"), 0),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"bake_res": _bake_res_items[val][0]}),
+    )
+
+    Node.tex_paint_bake_apply_normal = BoolProperty(
+        name="Auto-Connect Baked Normal to Shader",
+        description="Automatically connect the baked Tangent-Space Normal Map to the material's Principled BSDF Normal input",
+        default=True,
+        get=lambda self: bool(_get_mesh_maps_state(self).get("apply_normal_to_shader", True)),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={"apply_normal_to_shader": bool(val)}),
+    )
+
+    def _make_mesh_map_slot_prop(slot_k, slot_lbl):
+        return StringProperty(
+            name=f"{slot_lbl} Map",
+            description=f"Assigned or baked {slot_lbl} image for this material",
+            get=lambda self: str(_get_mesh_maps_state(self).get("maps", {}).get(slot_k, "")),
+            set=lambda self, val: _save_mesh_maps_state(self, map_updates={slot_k: str(val)}),
+            update=_on_mesh_map_changed,
+        )
+
+    for _sk, _slbl, _sic in _MESH_MAP_SLOTS:
+        setattr(Node, f"tex_paint_mesh_map_{_sk}", _make_mesh_map_slot_prop(_sk, _slbl))
+
     # Levels Sub-Layer Sliders
     Node.tex_paint_mask_eff_lvl_balance = FloatProperty(
         name="Levels Balance",
@@ -11003,6 +12868,66 @@ def _register_node_grunge_props():
         subtype='FACTOR',
         get=lambda self: float(_active_eff_val(self, "lvl_contrast", 0.0)),
         set=lambda self, val: _set_eff(self, {"lvl_contrast": float(val)}, ensure_type='LEVELS'),
+        update=_update_lut,
+    )
+
+    # Filter Sub-Layer Type & Sliders (Blur, Blur Slope, Sharpen, Grow/Shrink, Bevel, Threshold, Posterize, Highpass)
+    _filter_type_items = (
+        ('BLUR', "Filter: Blur", "Gaussian / box softening filter on the mask stack below", 'MOD_SMOOTH', 0),
+        ('BLUR_SLOPE', "Filter: Blur Slope", "Substance-style directional slope warp along mask edges", 'MOD_NOISE', 1),
+        ('SHARPEN', "Filter: Sharpen", "Unsharp mask edge crispness enhancement on the mask stack below", 'SHARPCURVE', 2),
+        ('DILATE_ERODE', "Filter: Grow / Shrink", "Dilate (expand, positive) or Erode (shrink, negative) the mask boundary", 'FULLSCREEN_ENTER', 3),
+        ('BEVEL', "Filter: Bevel", "Smooth distance bevel ramp around mask silhouettes", 'MOD_BEVEL', 4),
+        ('THRESHOLD', "Filter: Threshold", "Hard binary stencil cutoff", 'IPO_CONSTANT', 5),
+        ('POSTERIZE', "Filter: Posterize", "Quantize mask gradients into stepped contour bands", 'LINENUMBERS_ON', 6),
+        ('HIGHPASS', "Filter: Highpass", "Isolate high-frequency transitions and edge details", 'SEQ_HISTOGRAM', 7),
+    )
+
+    Node.tex_paint_mask_eff_filter_type = EnumProperty(
+        name="Filter Type",
+        description="2D image-processing filter algorithm applied to the mask stack below",
+        items=_filter_type_items,
+        get=lambda self: _enum_idx(_filter_type_items, _active_eff_val(self, "filter_type", "BLUR"), 0),
+        set=lambda self, val: _set_eff(self, {"filter_type": _filter_type_items[val][0]}, ensure_type='FILTER'),
+        update=_update_lut,
+    )
+
+    Node.tex_paint_mask_eff_flt_radius = FloatProperty(
+        name="Filter Radius",
+        description="Pixel radius of the Blur, Blur Slope, Sharpen, Grow/Shrink, Bevel, or Highpass kernel",
+        min=0.5,
+        max=64.0,
+        soft_min=1.0,
+        soft_max=32.0,
+        default=6.0,
+        get=lambda self: float(_active_eff_val(self, "flt_radius", 6.0)),
+        set=lambda self, val: _set_eff(self, {"flt_radius": float(val)}, ensure_type='FILTER'),
+        update=_update_lut,
+    )
+
+    Node.tex_paint_mask_eff_flt_strength = FloatProperty(
+        name="Filter Strength",
+        description="Intensity of the filter (or positive to Grow / negative to Shrink when using Dilate / Erode)",
+        min=-2.0,
+        max=2.0,
+        soft_min=-1.0,
+        soft_max=1.5,
+        default=1.0,
+        get=lambda self: float(_active_eff_val(self, "flt_strength", 1.0)),
+        set=lambda self, val: _set_eff(self, {"flt_strength": float(val)}, ensure_type='FILTER'),
+        update=_update_lut,
+    )
+
+    Node.tex_paint_mask_eff_flt_scale = FloatProperty(
+        name="Slope Noise Scale",
+        description="Frequency / scale of the procedural slope field for Blur Slope edge warping",
+        min=1.0,
+        max=64.0,
+        soft_min=2.0,
+        soft_max=32.0,
+        default=8.0,
+        get=lambda self: float(_active_eff_val(self, "flt_scale", 8.0)),
+        set=lambda self, val: _set_eff(self, {"flt_scale": float(val)}, ensure_type='FILTER'),
         update=_update_lut,
     )
 
@@ -11200,8 +13125,29 @@ def _unregister_node_grunge_props():
         "tex_paint_mask_eff_gen_radius",
         "tex_paint_mask_eff_gen_noise",
         "tex_paint_mask_eff_gen_noise_scale",
+        "tex_paint_mask_eff_gen_global_ao",
+        "tex_paint_use_baked_mesh_maps",
+        "tex_paint_bake_source_mode",
+        "tex_paint_bake_high_poly_ob",
+        "tex_paint_bake_high_poly_col",
+        "tex_paint_bake_ao_scope",
+        "tex_paint_bake_cage_dist",
+        "tex_paint_bake_ao_dist",
+        "tex_paint_bake_res",
+        "tex_paint_bake_apply_normal",
+        "tex_paint_mesh_map_normal",
+        "tex_paint_mesh_map_normal_ws",
+        "tex_paint_mesh_map_id_map",
+        "tex_paint_mesh_map_ao",
+        "tex_paint_mesh_map_curvature",
+        "tex_paint_mesh_map_position",
+        "tex_paint_mesh_map_thickness",
         "tex_paint_mask_eff_lvl_balance",
         "tex_paint_mask_eff_lvl_contrast",
+        "tex_paint_mask_eff_filter_type",
+        "tex_paint_mask_eff_flt_radius",
+        "tex_paint_mask_eff_flt_strength",
+        "tex_paint_mask_eff_flt_scale",
         "tex_paint_fill_base_color",
         "tex_paint_fill_roughness",
         "tex_paint_fill_metallic",
@@ -11336,9 +13282,14 @@ classes = (
     NODE_OT_tex_paint_export_texture_set,
     NODE_OT_tex_paint_reconnect_live_layers,
     NODE_OT_tex_paint_make_material_unique,
+    NODE_OT_tex_paint_bake_mesh_maps,
+    NODE_OT_tex_paint_mesh_map_action,
+    NODE_OT_tex_paint_import_mesh_map,
     TEXPAINT_MT_layer_specials,
     NODE_OT_tex_paint_smart_mask_recipe,
     TEXPAINT_MT_smart_mask_recipes,
+    TEXPAINT_MT_add_mask_generator,
+    TEXPAINT_MT_add_mask_filter,
     TEXPAINT_MT_add_layer,
     TEXPAINT_MT_add_mask_effect,
     NODE_OT_tex_paint_quick_uv,
@@ -11481,6 +13432,8 @@ def _clear_all_runtime_mask_caches(clear_raw_cache=False):
     if clear_raw_cache:
         _EFFECT_RAW_CACHE.clear()
         _MESH_UV_WIRE_CACHE.clear()
+        _GLOBAL_AO_CACHE.clear()
+        _UV_TEXEL_GRID_CACHE.clear()
 
 
 @bpy.app.handlers.persistent
@@ -11497,23 +13450,124 @@ def _on_blend_load_post(_dummy):
         pass
 
 
+def _sync_mask_stack_from_restored_mask_ibuf(node, layer):
+    """After an ImageUndoStep restores layer.mask_ibuf, sync _LAST_COMPOSITED_MASK and any PAINT sub-layer
+    to match the restored mask pixels without overwriting layer.mask_ibuf.
+    """
+    if node is None or layer is None or not getattr(layer, "use_mask", False):
+        return
+    c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
+    if not c_layer.mask_ibuf:
+        return
+    c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
+    w, h = int(c_imb.x), int(c_imb.y)
+    if w <= 0 or h <= 0:
+        return
+
+    import numpy as np
+    cur_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+    node_ptr = node.as_pointer()
+    layer_uid = int(c_layer.uid)
+    key = (node_ptr, layer_uid)
+    step = max(1, (w * h) // 1024)
+    _LAST_COMPOSITED_MASK[key] = cur_u8.copy()
+    _LAST_MASK_SAMPLE[key] = cur_u8[::step].copy()
+
+    st = _get_layer_grunge_state(node, layer)
+    effects = st.get("effects", [])
+    if not effects:
+        _sync_layer_mask_to_companion_channels(node, layer)
+        return
+
+    target_eff = None
+    target_idx = -1
+    act_uid = st.get("active_effect_uid", 0)
+    for idx, eff in enumerate(effects):
+        if eff["uid"] == act_uid and eff["type"] == 'PAINT' and eff.get("enabled", True):
+            target_eff = eff
+            target_idx = idx
+            break
+    if target_eff is None:
+        for idx in range(len(effects) - 1, -1, -1):
+            if effects[idx]["type"] == 'PAINT' and effects[idx].get("enabled", True):
+                target_eff = effects[idx]
+                target_idx = idx
+                break
+
+    if target_eff is not None:
+        enabled_indices = [i for i, e in enumerate(effects) if e.get("enabled", True)]
+        first_enabled = effects[enabled_indices[0]] if enabled_indices else None
+        if first_enabled is None:
+            init_val = int(st.get("base_value", 255))
+        elif first_enabled["type"] != 'PAINT' and first_enabled.get("blend_mode", "REPLACE") in {'ADD', 'SCREEN', 'MAX'}:
+            init_val = 0
+        elif first_enabled["type"] != 'PAINT' and first_enabled.get("blend_mode", "REPLACE") in {'MULTIPLY', 'SUBTRACT', 'MIN'}:
+            init_val = 255
+        else:
+            init_val = int(st.get("base_value", 255))
+
+        below_u8 = np.full(w * h, init_val, dtype=np.uint8)
+        for i in range(target_idx):
+            _evaluate_single_effect_onto_acc(
+                node, layer, effects[i], below_u8, w, h,
+                context=bpy.context, force_reproject=False, from_gizmo=False, is_first=(i == 0),
+            )
+
+        canon_ptr = _canonical_mask_owner_node(node).as_pointer()
+        pbuf = _ensure_paint_effect_buffer(canon_ptr, layer_uid, target_eff, w, h)
+        val_u8 = pbuf["val_u8"]
+        alpha_u8 = pbuf["alpha_u8"]
+        val_u8.fill(0)
+        alpha_u8.fill(0)
+
+        diff_idx = np.flatnonzero(cur_u8 != below_u8)
+        if len(diff_idx) > 0:
+            c = cur_u8[diff_idx].astype(np.float32)
+            b = below_u8[diff_idx].astype(np.float32)
+            brighter = c > b
+            s_alpha = np.where(
+                brighter,
+                (c - b) / np.maximum(255.0 - b, 1.0),
+                (b - c) / np.maximum(b, 1.0),
+            )
+            s_alpha = np.clip(s_alpha, 0.0, 1.0)
+            val_u8[diff_idx] = np.where(brighter, 255, 0).astype(np.uint8)
+            alpha_u8[diff_idx] = (s_alpha * 255.0 + 0.5).astype(np.uint8)
+
+        pbuf["rev"] = int(pbuf.get("rev", 1)) + 1
+        _sync_paint_effect_z64(target_eff, pbuf)
+        _save_layer_grunge_state(node, layer, st, flush_json=True)
+
+    _sync_layer_mask_to_companion_channels(node, layer)
+
+
 @bpy.app.handlers.persistent
 def _on_undo_redo_post(_dummy):
-    """Invalidate stale Python caches after Undo/Redo and unpack restored layer buffers."""
+    """Invalidate stale Python caches after Undo/Redo and unpack restored layer buffers without clobbering stroke undo."""
     try:
         _clear_all_runtime_mask_caches(clear_raw_cache=False)
         trees = [m.node_tree for m in bpy.data.materials if m.node_tree] + list(bpy.data.node_groups)
         for ntree in trees:
             for node in ntree.nodes:
                 if node.bl_idname == "ShaderNodeTexPaint" and len(node.layers) > 0:
-                    node.layers[0].opacity = node.layers[0].opacity
+                    # Check if C++ ImageUndoStep just restored a stroke buffer (sets runtime_dirty = 1)
                     act_layer = node.active_layer
+                    was_stroke_undo = False
+                    if act_layer is not None:
+                        c_act = _C_TexPaintLayer.from_address(act_layer.as_pointer())
+                        was_stroke_undo = bool(c_act.runtime_dirty)
+
+                    node.layers[0].opacity = node.layers[0].opacity
+
                     if act_layer is not None and getattr(act_layer, "use_mask", False):
-                        st = _get_layer_grunge_state(node, act_layer)
-                        if st.get("effects"):
-                            _evaluate_layer_grunge_mask(
-                                node, act_layer, context=bpy.context, force_reproject=False, skip_absorb=True
-                            )
+                        if was_stroke_undo:
+                            _sync_mask_stack_from_restored_mask_ibuf(node, act_layer)
+                        else:
+                            st = _get_layer_grunge_state(node, act_layer)
+                            if st.get("effects"):
+                                _evaluate_layer_grunge_mask(
+                                    node, act_layer, context=bpy.context, force_reproject=False, skip_absorb=True
+                                )
     except Exception:
         pass
 
@@ -11553,6 +13607,12 @@ def register():
         name="Show Mask Stack Inspector",
         description="Expand or collapse the Substance Mask Stack inspector",
         default=True,
+    )
+
+    WindowManager.tex_paint_show_mesh_maps_hub = BoolProperty(
+        name="Show Mesh Maps & High-Poly Baker Hub",
+        description="Expand or collapse the Substance-Painter-style Mesh Maps (Normal, AO, Curvature, ID, Position, Thickness) & High-Poly Baker Hub",
+        default=False,
     )
 
     WindowManager.tex_paint_2d_new_res = EnumProperty(
@@ -11701,6 +13761,7 @@ def unregister():
     for wm_prop in (
         "tex_paint_gizmo_mode",
         "tex_paint_ui_show_mask_stack",
+        "tex_paint_show_mesh_maps_hub",
         "tex_paint_2d_new_res",
         "tex_paint_2d_shape_radius",
         "tex_paint_2d_shape_thickness",

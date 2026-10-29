@@ -500,6 +500,23 @@ UndoStep *BKE_undosys_step_push_init_with_type(UndoStack *ustack,
       undosys_stack_clear_all_last(ustack, ustack->step_active->next);
     }
 
+#ifdef WITH_GLOBAL_UNDO_ENSURE_UPDATED
+    if (ut->step_foreach_ID_ref != nullptr) {
+      if (G_MAIN->is_memfile_undo_written == false) {
+        const char *name_internal = "MemFile Internal (pre)";
+        const bool ok = undosys_stack_push_main(ustack, name_internal, G_MAIN);
+        if (ok) {
+          UndoStep *us_mem = ustack->steps.last();
+          BLI_assert(STREQ(us_mem->name, name_internal));
+          us_mem->skip = true;
+#  ifdef WITH_GLOBAL_UNDO_CORRECT_ORDER
+          ustack->step_active_memfile = us_mem;
+#  endif
+        }
+      }
+    }
+#endif
+
     UndoStep *us = static_cast<UndoStep *>(MEM_new_zeroed(ut->step_size, __func__));
     if (name != nullptr) {
       STRNCPY(us->name, name);
@@ -849,6 +866,17 @@ bool BKE_undosys_step_load_data_ex(UndoStack *ustack,
     }
 
     undosys_step_decode(C, G_MAIN, ustack, us_iter, undo_dir, is_final);
+    if (undo_dir == STEP_UNDO && us_iter->type == BKE_UNDOSYS_TYPE_MEMFILE &&
+        us_iter->next != nullptr && us_iter->next->type == BKE_UNDOSYS_TYPE_IMAGE &&
+        us_iter->next->is_applied == false)
+    {
+      /* Decoding a MemFile step reloads G_MAIN and unpacks layer buffers from the MemFile's
+       * packed state, which can overwrite image undo buffers restored by the immediately
+       * following ImageUndoStep. Re-apply that ImageUndoStep's pre-stroke state onto the
+       * newly loaded G_MAIN. */
+      us_iter->next->is_applied = true;
+      undosys_step_decode(C, G_MAIN, ustack, us_iter->next, STEP_UNDO, false);
+    }
     ustack->step_active = us_iter;
 
     if (us_iter == us_target) {
