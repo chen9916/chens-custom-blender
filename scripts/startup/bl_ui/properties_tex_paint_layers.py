@@ -468,6 +468,91 @@ def _migrate_legacy_state_if_needed(st, layer=None):
     return st
 
 
+def _find_layer_by_uid(node, target_uid):
+    if node is None or target_uid <= 0:
+        return None
+    for l_item in getattr(node, "layers", ()):
+        if _layer_uid(l_item) == target_uid:
+            return l_item
+    return None
+
+
+def _canonical_mask_owner_node(node):
+    """Return the primary Base Color ShaderNodeTexPaint in a 3D material node tree so all PBR channels share one Mask Stack per layer UID."""
+    if node is None:
+        return None
+    ntree = getattr(node, "id_data", None)
+    if ntree is None or getattr(ntree, "name", "") == ".TexPaint_2D_Layers":
+        return node
+    try:
+        fallback = None
+        for cand in ntree.nodes:
+            if cand.bl_idname == "ShaderNodeTexPaint" and cand.image is not None:
+                if fallback is None:
+                    fallback = cand
+                out_c = cand.outputs.get("Color")
+                if out_c and out_c.is_linked:
+                    for lk in out_c.links:
+                        if lk.to_node.bl_idname == "ShaderNodeBsdfPrincipled" and lk.to_socket and lk.to_socket.name == "Base Color":
+                            return cand
+                lbl = (cand.label or cand.image.name or cand.name).lower().replace("_", "").replace(" ", "")
+                if "base" in lbl or lbl == "paintedtexture":
+                    return cand
+        return fallback or node
+    except Exception:
+        return node
+
+
+def _sync_layer_mask_to_companion_channels(node, layer=None):
+    """Mirror `layer.mask_ibuf` bytes and mask flags to all companion PBR channel nodes in the same material tree that share `layer`'s UID."""
+    if node is None:
+        return
+    if layer is None:
+        layer = getattr(node, "active_layer", None)
+    if layer is None:
+        return
+    ntree = getattr(node, "id_data", None)
+    if ntree is None or getattr(ntree, "name", "") == ".TexPaint_2D_Layers":
+        return
+    target_uid = _layer_uid(layer)
+    if target_uid <= 0:
+        return
+    c_src = _C_TexPaintLayer.from_address(layer.as_pointer())
+    use_m = bool(getattr(layer, "use_mask", False))
+    inv_m = bool(getattr(layer, "invert_mask", False))
+
+    for other_node in ntree.nodes:
+        if other_node == node or other_node.bl_idname != "ShaderNodeTexPaint" or other_node.image is None:
+            continue
+        other_layer = _find_layer_by_uid(other_node, target_uid)
+        if other_layer is None:
+            continue
+        if not use_m:
+            if getattr(other_layer, "use_mask", False):
+                other_layer.use_mask = False
+            continue
+        if not getattr(other_layer, "use_mask", False):
+            other_layer.use_mask = True
+        if getattr(other_layer, "invert_mask", False) != inv_m:
+            other_layer.invert_mask = inv_m
+        c_dst = _C_TexPaintLayer.from_address(other_layer.as_pointer())
+        if not c_dst.mask_ibuf:
+            other_layer.opacity = other_layer.opacity
+            c_dst = _C_TexPaintLayer.from_address(other_layer.as_pointer())
+        if c_src.mask_ibuf and c_dst.mask_ibuf:
+            imb_s = _C_ImBuf.from_address(c_src.mask_ibuf)
+            imb_d = _C_ImBuf.from_address(c_dst.mask_ibuf)
+            w, h = int(imb_s.x), int(imb_s.y)
+            if int(imb_d.x) == w and int(imb_d.y) == h and w > 0 and h > 0:
+                if imb_s.byte_data and imb_d.byte_data:
+                    ctypes.memmove(imb_d.byte_data, imb_s.byte_data, w * h * 4)
+                    c_dst.runtime_dirty = 1
+                elif imb_s.float_data and imb_d.float_data:
+                    ctypes.memmove(imb_d.float_data, imb_s.float_data, w * h * 16)
+                    c_dst.runtime_dirty = 1
+                other_layer.opacity = other_layer.opacity
+
+
 def _get_layer_grunge_state(node, layer=None):
     """Read-only lookup of the Mask Stack state for (node, layer), safe to call inside UI draw()."""
     if node is None:
@@ -478,8 +563,9 @@ def _get_layer_grunge_state(node, layer=None):
     if uid <= 0:
         return dict(_DEFAULT_LAYER_MASK_STATE, effects=[])
 
-    node_ptr = node.as_pointer()
-    raw_json = node.get("_grunge_layers_json", "")
+    owner_node = _canonical_mask_owner_node(node)
+    node_ptr = owner_node.as_pointer()
+    raw_json = owner_node.get("_grunge_layers_json", "")
     if node_ptr not in _DIRTY_JSON_NODES and _NODE_LAST_JSON_STR.get(node_ptr) != raw_json:
         _NODE_LAST_JSON_STR[node_ptr] = raw_json
         _NODE_JSON_CACHE.pop(node_ptr, None)
@@ -518,12 +604,13 @@ def _get_layer_grunge_state(node, layer=None):
 def _flush_dirty_node_json(node=None):
     """Write pending Mask Stack state dicts into node['_grunge_layers_json']."""
     if node is not None:
-        node_ptr = node.as_pointer()
+        owner_node = _canonical_mask_owner_node(node)
+        node_ptr = owner_node.as_pointer()
         all_data = _NODE_JSON_CACHE.get(node_ptr)
         if all_data is not None:
             try:
                 dumped = json.dumps(all_data)
-                node["_grunge_layers_json"] = dumped
+                owner_node["_grunge_layers_json"] = dumped
                 _NODE_LAST_JSON_STR[node_ptr] = dumped
             except Exception:
                 pass
@@ -552,8 +639,9 @@ def _save_layer_grunge_state(node, layer, updates=None, flush_json=True):
     if uid <= 0:
         return None
 
-    node_ptr = node.as_pointer()
-    st = _get_layer_grunge_state(node, layer)
+    owner_node = _canonical_mask_owner_node(node)
+    node_ptr = owner_node.as_pointer()
+    st = _get_layer_grunge_state(owner_node, layer)
     if updates and updates is not st:
         st.update(updates)
     _migrate_legacy_state_if_needed(st, layer)
@@ -562,7 +650,7 @@ def _save_layer_grunge_state(node, layer, updates=None, flush_json=True):
     all_data = _NODE_JSON_CACHE.get(node_ptr)
     if not isinstance(all_data, dict):
         try:
-            raw_json = node.get("_grunge_layers_json", "")
+            raw_json = owner_node.get("_grunge_layers_json", "")
             all_data = json.loads(raw_json) if raw_json else {}
             if not isinstance(all_data, dict):
                 all_data = {}
@@ -572,9 +660,9 @@ def _save_layer_grunge_state(node, layer, updates=None, flush_json=True):
 
     all_data[str(uid)] = st
     if flush_json or bpy.app.background:
-        _flush_dirty_node_json(node)
+        _flush_dirty_node_json(owner_node)
     else:
-        _DIRTY_JSON_NODES[node_ptr] = node
+        _DIRTY_JSON_NODES[node_ptr] = owner_node
     return None
 
 
@@ -757,7 +845,8 @@ def _absorb_pending_brush_strokes(node, layer=None):
         st["active_effect_uid"] = uid
         _save_layer_grunge_state(node, layer, st)
 
-    pbuf = _ensure_paint_effect_buffer(node_ptr, layer_uid, target_eff, w, h)
+    canon_ptr = _canonical_mask_owner_node(node).as_pointer()
+    pbuf = _ensure_paint_effect_buffer(canon_ptr, layer_uid, target_eff, w, h)
     val_u8 = pbuf["val_u8"]
     alpha_u8 = pbuf["alpha_u8"]
 
@@ -807,6 +896,7 @@ def _absorb_pending_brush_strokes(node, layer=None):
     else:
         last_u8[diff_idx] = cur_u8[diff_idx]
         _LAST_MASK_SAMPLE[key] = cur_u8[::step].copy()
+        _sync_layer_mask_to_companion_channels(node, layer)
     return True
 
 
@@ -1380,7 +1470,7 @@ def _evaluate_single_effect_onto_acc(node, layer, eff, acc_u8, w, h, context=Non
         s_curve = _effect_curve_256(eff)
         _blend_1d_curve_onto_acc_u8(acc_u8, acc_u8, s_curve, 'REPLACE', opacity, is_first_effect=False)
     elif etype == 'PAINT':
-        node_ptr = node.as_pointer()
+        node_ptr = _canonical_mask_owner_node(node).as_pointer()
         layer_uid = _layer_uid(layer)
         pbuf = _ensure_paint_effect_buffer(node_ptr, layer_uid, eff, w, h)
         _blend_paint_effect_onto_acc_u8(acc_u8, pbuf, blend_mode, opacity, invert)
@@ -1627,6 +1717,7 @@ def _evaluate_layer_grunge_mask(node, layer=None, context=None, force_reproject=
     if getattr(node, "paint_target", None) != 'MASK':
         node.paint_target = 'MASK'
     layer.invert_mask = layer.invert_mask
+    _sync_layer_mask_to_companion_channels(node, layer)
     return True
 
 
@@ -4516,6 +4607,7 @@ class NODE_OT_tex_paint_mask_stack_init(Operator):
         _save_layer_grunge_state(node, layer, st)
 
         bpy.ops.node.tex_paint_layer_mask_init(mode=self.mode)
+        _sync_layer_mask_to_companion_channels(node, layer)
         if self.mode == 'BLACK':
             # Black mask hides all -> set brush to White (1.0) so painting immediately reveals!
             _configure_paint_mask_brush(context, 1.0)
@@ -5167,14 +5259,27 @@ class NODE_OT_tex_paint_pbr_channel(Operator):
 
             _wire_tex_paint_node_to_pbr_channel(ntree, bsdf, target_node, ch_id, sock_name)
 
-        # Activate target_node in node_tree and sync paint_active_slot
-        for n in ntree.nodes:
-            n.select = (n == target_node)
-        ntree.nodes.active = target_node
+        primary_node = _canonical_mask_owner_node(target_node)
+        if primary_node is not None and primary_node != target_node:
+            _ensure_companion_node_layers_synced(context, mat, primary_node, target_node, self.channel)
 
-        if target_node.image is not None and hasattr(mat, "texture_paint_images"):
+        # If the user is currently on a Fill Layer and adds/clicks a PBR channel, enable that channel
+        # on the Fill Layer and keep the unified Primary Node active so all channels stay in one panel!
+        act_p_layer = primary_node.active_layer if primary_node is not None else None
+        if act_p_layer is not None and act_p_layer.type == 'FILL' and primary_node is not None:
+            _set_fill_channel_enabled(context, mat, primary_node, act_p_layer, self.channel, True)
+            focus_node = primary_node
+        else:
+            focus_node = target_node
+
+        # Activate focus_node in node_tree and sync paint_active_slot
+        for n in ntree.nodes:
+            n.select = (n == focus_node)
+        ntree.nodes.active = focus_node
+
+        if focus_node.image is not None and hasattr(mat, "texture_paint_images"):
             for slot_i, slot_ima in enumerate(mat.texture_paint_images):
-                if slot_ima == target_node.image:
+                if slot_ima == focus_node.image:
                     mat.paint_active_slot = slot_i
                     break
 
@@ -5200,6 +5305,397 @@ class TEXPAINT_MT_add_pbr_channel(Menu):
             op = layout.operator("node.tex_paint_pbr_channel", text=ch_lbl, icon=ch_icon)
             op.channel = ch_id
             op.node_name = ""
+
+
+# ---------------------------------------------------------------------------
+# Substance Painter Multi-Channel Fill Layer Sync & Channel Toggles
+# ---------------------------------------------------------------------------
+
+_FILL_CHANNEL_PILLS = (
+    ('BASE_COLOR', "Color", 'COLOR', True),
+    ('ROUGHNESS', "Rough", 'MATSPHERE', True),
+    ('METALLIC', "Metal", 'SHADING_RENDERED', True),
+    ('BUMP', "Height", 'MOD_NORMALEDIT', True),
+    ('EMISSION', "Emis", 'LIGHT_SUN', True),
+    ('NORMAL', "Nrm", 'NORMALS_VERTEX_FACE', False),
+    ('SPECULAR', "Spec", 'NODE_MATERIAL', False),
+    ('ALPHA', "Alpha", 'IMAGE_ALPHA', False),
+    ('DISPLACEMENT', "Disp", 'MOD_DISPLACE', False),
+)
+
+_FILL_CHANNEL_DEFAULT_RGB = {
+    'BASE_COLOR': (0.80, 0.80, 0.80),
+    'ROUGHNESS': (0.45, 0.45, 0.45),
+    'METALLIC': (0.00, 0.00, 0.00),
+    'BUMP': (0.50, 0.50, 0.50),
+    'EMISSION': (1.00, 0.45, 0.10),
+    'NORMAL': (0.50, 0.50, 1.00),
+    'SPECULAR': (0.50, 0.50, 0.50),
+    'ALPHA': (1.00, 1.00, 1.00),
+    'DISPLACEMENT': (0.50, 0.50, 0.50),
+}
+
+
+def _get_material_for_node(node, context=None):
+    if node is None or _is_standalone_2d_node(node):
+        return None
+    ntree = getattr(node, "id_data", None)
+    if ntree is None:
+        return None
+    if context is not None:
+        ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
+        if ob is not None and ob.type == 'MESH' and ob.active_material and ob.active_material.node_tree == ntree:
+            return ob.active_material
+    for m in bpy.data.materials:
+        if m.node_tree == ntree:
+            return m
+    return None
+
+
+def _get_material_channel_node(mat, ch_id):
+    if mat is None or mat.node_tree is None:
+        return None
+    for n, cid, _lbl, _icon in _get_material_tex_paint_channels(mat):
+        if cid == ch_id:
+            return n
+    return None
+
+
+def _resolve_primary_node_and_layer(node, layer=None, context=None):
+    """Return (mat, primary_node, primary_layer) for any channel node & layer in a 3D material."""
+    if node is None:
+        return None, None, None
+    if layer is None:
+        layer = getattr(node, "active_layer", None)
+    mat = _get_material_for_node(node, context)
+    if mat is None:
+        return None, node, layer
+    p_node = _canonical_mask_owner_node(node) or node
+    if p_node == node or layer is None:
+        return mat, p_node, layer
+    p_layer = _find_layer_by_uid(p_node, _layer_uid(layer))
+    if p_layer is None and 0 <= p_node.active_layer_index < len(p_node.layers):
+        p_layer = p_node.layers[p_node.active_layer_index]
+    return mat, p_node, p_layer
+
+
+def _ensure_companion_node_layers_synced(context, mat, primary_node, comp_node, ch_id):
+    """Ensure `comp_node` has the exact same layer stack (UIDs, order, names, flags, masks) as `primary_node`."""
+    if primary_node is None or comp_node is None or primary_node == comp_node:
+        return
+    p_layers = list(primary_node.layers)
+    if not p_layers:
+        return
+    orig_active_idx = int(primary_node.active_layer_index)
+
+    # 1. Sync base layer UID if comp_node only has its initial Base layer
+    if len(comp_node.layers) >= 1:
+        c0 = _C_TexPaintLayer.from_address(comp_node.layers[0].as_pointer())
+        p0_uid = _layer_uid(p_layers[0])
+        if c0.uid != p0_uid and _find_layer_by_uid(comp_node, p0_uid) is None:
+            c0.uid = p0_uid
+            comp_node.layers[0].name = p_layers[0].name
+
+    def_rgb = _FILL_CHANNEL_DEFAULT_RGB.get(ch_id, (0.5, 0.5, 0.5))
+
+    # 2. Ensure every layer in primary_node exists in comp_node with matching UID, type, flags, and mask
+    for idx, p_layer in enumerate(p_layers):
+        p_uid = _layer_uid(p_layer)
+        c_layer = _find_layer_by_uid(comp_node, p_uid)
+        if c_layer is None:
+            comp_node.active_layer_index = max(0, min(idx - 1, len(comp_node.layers) - 1))
+            with context.temp_override(node=comp_node):
+                bpy.ops.node.tex_paint_layer_add(type=p_layer.type)
+            c_layer = comp_node.active_layer
+            if c_layer is not None:
+                c_struct = _C_TexPaintLayer.from_address(c_layer.as_pointer())
+                c_struct.uid = p_uid
+                c_layer.name = p_layer.name
+                c_layer.opacity = p_layer.opacity
+                c_layer.hide = p_layer.hide
+                c_layer.use_clipping = p_layer.use_clipping
+                if p_layer.type == 'FILL':
+                    c_layer.fill_color = (def_rgb[0], def_rgb[1], def_rgb[2], 0.0)
+
+        if c_layer is not None and getattr(p_layer, "use_mask", False):
+            if not c_layer.use_mask:
+                c_layer.use_mask = True
+            c_layer.invert_mask = p_layer.invert_mask
+            c_src = _C_TexPaintLayer.from_address(p_layer.as_pointer())
+            c_dst = _C_TexPaintLayer.from_address(c_layer.as_pointer())
+            if not c_dst.mask_ibuf:
+                c_layer.opacity = c_layer.opacity
+                c_dst = _C_TexPaintLayer.from_address(c_layer.as_pointer())
+            if c_src.mask_ibuf and c_dst.mask_ibuf:
+                imb_s = _C_ImBuf.from_address(c_src.mask_ibuf)
+                imb_d = _C_ImBuf.from_address(c_dst.mask_ibuf)
+                w, h = int(imb_s.x), int(imb_s.y)
+                if int(imb_d.x) == w and int(imb_d.y) == h and w > 0 and h > 0:
+                    if imb_s.byte_data and imb_d.byte_data:
+                        ctypes.memmove(imb_d.byte_data, imb_s.byte_data, w * h * 4)
+                        c_dst.runtime_dirty = 1
+                    elif imb_s.float_data and imb_d.float_data:
+                        ctypes.memmove(imb_d.float_data, imb_s.float_data, w * h * 16)
+                        c_dst.runtime_dirty = 1
+
+    if 0 <= orig_active_idx < len(primary_node.layers):
+        primary_node.active_layer_index = orig_active_idx
+    if 0 <= orig_active_idx < len(comp_node.layers):
+        comp_node.active_layer_index = orig_active_idx
+    if comp_node.active_layer is not None:
+        comp_node.active_layer.opacity = comp_node.active_layer.opacity
+
+
+def _ensure_material_pbr_channel_node(context, mat, primary_node, ch_id, keep_primary_active=True):
+    """Find or create the `ShaderNodeTexPaint` node for `ch_id` in `mat`, wire it to Principled BSDF, and sync its layers."""
+    if mat is None or mat.node_tree is None:
+        return None
+    if ch_id == 'BASE_COLOR' and primary_node is not None:
+        return primary_node
+
+    comp_node = _get_material_channel_node(mat, ch_id)
+    if comp_node is None:
+        bpy.ops.node.tex_paint_pbr_channel(channel=ch_id, node_name="")
+        comp_node = _get_material_channel_node(mat, ch_id)
+
+    if comp_node is not None and primary_node is not None and comp_node != primary_node:
+        _ensure_companion_node_layers_synced(context, mat, primary_node, comp_node, ch_id)
+
+    if keep_primary_active and primary_node is not None and mat.node_tree is not None:
+        for n in mat.node_tree.nodes:
+            n.select = (n == primary_node)
+        mat.node_tree.nodes.active = primary_node
+        if primary_node.image is not None and hasattr(mat, "texture_paint_images"):
+            for slot_i, slot_ima in enumerate(mat.texture_paint_images):
+                if slot_ima == primary_node.image:
+                    mat.paint_active_slot = slot_i
+                    break
+    return comp_node
+
+
+def _get_fill_channel_layer(mat, primary_node, primary_layer, ch_id):
+    if primary_layer is None or primary_layer.type != 'FILL':
+        return None
+    if ch_id == 'BASE_COLOR':
+        return primary_layer
+    comp_node = _get_material_channel_node(mat, ch_id)
+    if comp_node is None:
+        return None
+    return _find_layer_by_uid(comp_node, _layer_uid(primary_layer))
+
+
+def _is_fill_channel_enabled(mat, primary_node, primary_layer, ch_id):
+    ch_layer = _get_fill_channel_layer(mat, primary_node, primary_layer, ch_id)
+    if ch_layer is None or ch_layer.type != 'FILL':
+        return False
+    return float(ch_layer.fill_color[3]) > 0.001
+
+
+def _set_fill_channel_enabled(context, mat, primary_node, primary_layer, ch_id, enabled):
+    if primary_layer is None or primary_layer.type != 'FILL':
+        return None
+    if ch_id == 'BASE_COLOR':
+        fc = primary_layer.fill_color
+        primary_layer.fill_color = (fc[0], fc[1], fc[2], 1.0 if enabled else 0.0)
+        return primary_layer
+
+    if enabled:
+        comp_node = _ensure_material_pbr_channel_node(context, mat, primary_node, ch_id, keep_primary_active=True)
+        if comp_node is None:
+            return None
+        comp_layer = _find_layer_by_uid(comp_node, _layer_uid(primary_layer))
+        if comp_layer is not None:
+            fc = comp_layer.fill_color
+            comp_layer.fill_color = (fc[0], fc[1], fc[2], 1.0)
+            if getattr(primary_layer, "use_mask", False):
+                _sync_layer_mask_to_companion_channels(primary_node, primary_layer)
+        return comp_layer
+    else:
+        comp_node = _get_material_channel_node(mat, ch_id)
+        if comp_node is not None:
+            comp_layer = _find_layer_by_uid(comp_node, _layer_uid(primary_layer))
+            if comp_layer is not None:
+                fc = comp_layer.fill_color
+                comp_layer.fill_color = (fc[0], fc[1], fc[2], 0.0)
+            return comp_layer
+        return None
+
+
+def _get_enabled_fill_channel_badges(mat, primary_node, primary_layer):
+    """Return short badge string (e.g. 'R·M·H') for non-color channels enabled on a Fill Layer."""
+    if mat is None or primary_layer is None or primary_layer.type != 'FILL':
+        return ""
+    short_codes = (
+        ('ROUGHNESS', "R"),
+        ('METALLIC', "M"),
+        ('BUMP', "H"),
+        ('EMISSION', "E"),
+        ('NORMAL', "N"),
+        ('SPECULAR', "S"),
+        ('ALPHA', "A"),
+        ('DISPLACEMENT', "D"),
+    )
+    active_codes = [code for cid, code in short_codes if _is_fill_channel_enabled(mat, primary_node, primary_layer, cid)]
+    if not _is_fill_channel_enabled(mat, primary_node, primary_layer, 'BASE_COLOR') and active_codes:
+        return "·".join(active_codes)
+    if active_codes:
+        return "C·" + "·".join(active_codes)
+    return ""
+
+
+class NODE_OT_tex_paint_fill_channel_toggle(Operator):
+    """Toggle individual PBR channels (Color, Roughness, Metallic, Height, Emission, Normal, etc.) on/off for the active Fill Layer, or apply a Substance PBR Material Preset"""
+    bl_idname = "node.tex_paint_fill_channel_toggle"
+    bl_label = "Toggle Fill Layer PBR Channel"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    channel: EnumProperty(
+        name="Channel",
+        items=(
+            ('BASE_COLOR', "Base Color", "Toggle Base Color (Albedo) on this Fill Layer", 'COLOR', 0),
+            ('ROUGHNESS', "Roughness", "Toggle Roughness (0.0 Shiny to 1.0 Rough) on this Fill Layer", 'MATSPHERE', 1),
+            ('METALLIC', "Metallic", "Toggle Metallic (0.0 Dielectric to 1.0 Metal) on this Fill Layer", 'SHADING_RENDERED', 2),
+            ('BUMP', "Height / Bump", "Toggle Height / Bump (-1.0 Indented to +1.0 Raised) on this Fill Layer", 'MOD_NORMALEDIT', 3),
+            ('EMISSION', "Emission", "Toggle Emission Glow on this Fill Layer", 'LIGHT_SUN', 4),
+            ('NORMAL', "Normal", "Toggle Normal Map channel on this Fill Layer", 'NORMALS_VERTEX_FACE', 5),
+            ('SPECULAR', "Specular", "Toggle Specular IOR Level on this Fill Layer", 'NODE_MATERIAL', 6),
+            ('ALPHA', "Alpha / Opacity", "Toggle Surface Alpha / Opacity on this Fill Layer", 'IMAGE_ALPHA', 7),
+            ('DISPLACEMENT', "Displacement", "Toggle Displacement Height on this Fill Layer", 'MOD_DISPLACE', 8),
+        ),
+        default='ROUGHNESS',
+    )
+    action: EnumProperty(
+        name="Action",
+        items=(
+            ('TOGGLE', "Toggle Channel", "Turn the specified channel ON or OFF on this Fill Layer"),
+            ('ENABLE_CORE_PBR', "Enable Color + Rough + Metal + Height", "Turn on all 4 core Substance Painter PBR channels on this Fill Layer"),
+            ('ONLY_COLOR', "Color Only", "Enable only Base Color and turn off other channels on this Fill Layer"),
+            ('ONLY_HEIGHT', "Height Stamp Only (No Color)", "Turn off Base Color and enable only Height / Bump for pure surface carving or embossing"),
+            ('PRESET_GOLD', "Preset: Pure Gold", "Metallic gold fill (Color + Roughness 0.18 + Metallic 1.0 + Height +0.05)"),
+            ('PRESET_STEEL', "Preset: Brushed Steel", "Raw steel fill (Color + Roughness 0.28 + Metallic 1.0)"),
+            ('PRESET_COPPER', "Preset: Burnished Copper", "Warm copper fill (Color + Roughness 0.24 + Metallic 1.0 + Height +0.02)"),
+            ('PRESET_RUST', "Preset: Coarse Rust", "Matte oxidized rust fill (Color + Roughness 0.88 + Metallic 0.0 + Height +0.10)"),
+            ('PRESET_PAINTED_METAL', "Preset: Glossy Paint Coat", "Glossy painted coat (Color + Roughness 0.20 + Metallic 0.0 + Height +0.08)"),
+            ('PRESET_PLASTIC', "Preset: Smooth Plastic", "Smooth dielectric plastic (Color + Roughness 0.22 + Metallic 0.0)"),
+            ('PRESET_RUBBER', "Preset: Matte Rubber", "Dark high-roughness rubber (Color + Roughness 0.85 + Metallic 0.0)"),
+            ('PRESET_CARVE', "Preset: Carved Groove (-Height)", "Height-only indentation (-0.45 Height, Color & Roughness OFF)"),
+            ('PRESET_EMBOSS', "Preset: Raised Emboss (+Height)", "Height-only raised detail (+0.45 Height, Color & Roughness OFF)"),
+        ),
+        default='TOGGLE',
+        options={'SKIP_SAVE'},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        node = tex_paint_node_from_context(context)
+        layer = node.active_layer if node else None
+        return layer is not None and layer.type == 'FILL'
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        mat, p_node, p_layer = _resolve_primary_node_and_layer(node, None, context)
+        if p_node is None or p_layer is None or p_layer.type != 'FILL':
+            return {'CANCELLED'}
+        if mat is None:
+            ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
+            mat = ob.active_material if (ob and ob.type == 'MESH') else None
+        if mat is None:
+            return {'CANCELLED'}
+
+        if self.action == 'TOGGLE':
+            cur_on = _is_fill_channel_enabled(mat, p_node, p_layer, self.channel)
+            _set_fill_channel_enabled(context, mat, p_node, p_layer, self.channel, not cur_on)
+            _tag_view3d_gizmo_refresh(context)
+            return {'FINISHED'}
+
+        if self.action == 'ENABLE_CORE_PBR':
+            for cid in ('BASE_COLOR', 'ROUGHNESS', 'METALLIC', 'BUMP'):
+                _set_fill_channel_enabled(context, mat, p_node, p_layer, cid, True)
+            _tag_view3d_gizmo_refresh(context)
+            return {'FINISHED'}
+
+        if self.action == 'ONLY_COLOR':
+            _set_fill_channel_enabled(context, mat, p_node, p_layer, 'BASE_COLOR', True)
+            for cid, _lbl, _ic, _core in _FILL_CHANNEL_PILLS:
+                if cid != 'BASE_COLOR':
+                    _set_fill_channel_enabled(context, mat, p_node, p_layer, cid, False)
+            _tag_view3d_gizmo_refresh(context)
+            return {'FINISHED'}
+
+        if self.action in {'ONLY_HEIGHT', 'PRESET_CARVE', 'PRESET_EMBOSS'}:
+            for cid, _lbl, _ic, _core in _FILL_CHANNEL_PILLS:
+                _set_fill_channel_enabled(context, mat, p_node, p_layer, cid, cid == 'BUMP')
+            if self.action == 'PRESET_CARVE':
+                p_node.tex_paint_fill_height = -0.45
+            elif self.action == 'PRESET_EMBOSS':
+                p_node.tex_paint_fill_height = 0.45
+            _tag_view3d_gizmo_refresh(context)
+            return {'FINISHED'}
+
+        presets = {
+            'PRESET_GOLD': ((0.94, 0.74, 0.24), 0.18, 1.0, 0.05),
+            'PRESET_STEEL': ((0.66, 0.70, 0.74), 0.28, 1.0, 0.00),
+            'PRESET_COPPER': ((0.88, 0.42, 0.26), 0.24, 1.0, 0.02),
+            'PRESET_RUST': ((0.35, 0.12, 0.05), 0.88, 0.0, 0.10),
+            'PRESET_PAINTED_METAL': ((0.14, 0.36, 0.68), 0.20, 0.0, 0.08),
+            'PRESET_PLASTIC': ((0.82, 0.16, 0.14), 0.22, 0.0, 0.00),
+            'PRESET_RUBBER': ((0.09, 0.09, 0.10), 0.85, 0.0, 0.00),
+        }
+        if self.action in presets:
+            col_rgb, rough_v, metal_v, height_v = presets[self.action]
+            for cid in ('BASE_COLOR', 'ROUGHNESS', 'METALLIC', 'BUMP'):
+                _set_fill_channel_enabled(context, mat, p_node, p_layer, cid, True)
+            p_layer.fill_color = (col_rgb[0], col_rgb[1], col_rgb[2], 1.0)
+            p_node.tex_paint_fill_roughness = rough_v
+            p_node.tex_paint_fill_metallic = metal_v
+            p_node.tex_paint_fill_height = height_v
+            _tag_view3d_gizmo_refresh(context)
+            return {'FINISHED'}
+
+        return {'FINISHED'}
+
+
+class TEXPAINT_MT_fill_channels_and_presets(Menu):
+    """Toggle extra PBR channels (Normal, Specular, Alpha, Displacement) or apply 1-click Substance PBR Material Presets on the active Fill Layer"""
+    bl_idname = "TEXPAINT_MT_fill_channels_and_presets"
+    bl_label = "Fill Layer Channels & PBR Presets"
+
+    def draw(self, context):
+        layout = self.layout
+        node = tex_paint_node_from_context(context)
+        mat, p_node, p_layer = _resolve_primary_node_and_layer(node, None, context)
+
+        layout.label(text="Toggle Fill Layer Channels", icon='RENDERLAYERS')
+        for cid, ch_lbl, _sock, ch_icon, _col, _nc in _PBR_CHANNEL_DEFS:
+            is_on = _is_fill_channel_enabled(mat, p_node, p_layer, cid)
+            op = layout.operator(
+                "node.tex_paint_fill_channel_toggle",
+                text=f"{ch_lbl} ({'ON' if is_on else 'OFF'})",
+                icon='CHECKBOX_HLT' if is_on else ch_icon,
+            )
+            op.channel = cid
+            op.action = 'TOGGLE'
+
+        layout.separator()
+        layout.operator("node.tex_paint_fill_channel_toggle", text="Enable Core PBR (Color + Rough + Metal + Height)", icon='SHADING_RENDERED').action = 'ENABLE_CORE_PBR'
+        layout.operator("node.tex_paint_fill_channel_toggle", text="Height Stamp Only (Turn Off Color)", icon='MOD_NORMALEDIT').action = 'ONLY_HEIGHT'
+        layout.operator("node.tex_paint_fill_channel_toggle", text="Color Only (Turn Off Other Channels)", icon='COLOR').action = 'ONLY_COLOR'
+
+        layout.separator()
+        layout.label(text="Substance PBR Fill Presets", icon='MATERIAL')
+        preset_items = (
+            ('PRESET_GOLD', "Pure Gold (Metal + Shiny + +Height)", 'SOLO_ON'),
+            ('PRESET_STEEL', "Brushed Steel (Metal + Semi-Rough)", 'SHADING_RENDERED'),
+            ('PRESET_COPPER', "Burnished Copper (Metal + Warm)", 'COLOR'),
+            ('PRESET_RUST', "Coarse Rust (Matte + +Height)", 'FORCE_TURBULENCE'),
+            ('PRESET_PAINTED_METAL', "Glossy Paint Coat (Shiny + +Height)", 'BRUSH_DATA'),
+            ('PRESET_PLASTIC', "Smooth Plastic (Glossy Dielectric)", 'MATSPHERE'),
+            ('PRESET_RUBBER', "Matte Rubber (Dark Rough Dielectric)", 'MESH_CIRCLE'),
+            ('PRESET_CARVE', "Carved Groove (Height -0.45 Only)", 'REMOVE'),
+            ('PRESET_EMBOSS', "Raised Emboss (Height +0.45 Only)", 'ADD'),
+        )
+        for act_id, lbl, ic in preset_items:
+            layout.operator("node.tex_paint_fill_channel_toggle", text=lbl, icon=ic).action = act_id
 
 
 class NODE_OT_tex_paint_layer_pixel_action(Operator):
@@ -5439,6 +5935,7 @@ class NODE_OT_tex_paint_layer_pixel_action(Operator):
             st_dup = json.loads(json.dumps(below_st))
             _save_layer_grunge_state(node, layer, st_dup)
             layer.opacity = layer.opacity
+            _sync_layer_mask_to_companion_channels(node, layer)
             return {'FINISHED'}
 
         if self.action in {'MERGE_VISIBLE', 'FLATTEN_ALL'}:
@@ -5711,7 +6208,11 @@ class TEXPAINT_MT_add_layer(Menu):
 
         op_p = layout.operator("node.tex_paint_layer_add", text="Add Paint Layer", icon='BRUSH_DATA')
         op_p.type = 'PAINT'
-        op_f = layout.operator("node.tex_paint_layer_add", text="Add Fill Layer (Color)", icon='COLOR')
+        op_f = layout.operator(
+            "node.tex_paint_layer_add",
+            text="Add Fill Layer (Color)" if is_2d_only else "Add Fill Layer (Multi-Channel PBR)",
+            icon='COLOR',
+        )
         op_f.type = 'FILL'
         op_a = layout.operator("node.tex_paint_layer_add", text="Add Adjustment Layer (HSV / Contrast)", icon='MODIFIER')
         op_a.type = 'ADJUSTMENT'
@@ -5885,12 +6386,25 @@ class TEXPAINT_UL_layers(UIList):
         op_col.layer_index = index
         op_col.target = 'COLOR'
 
+        ch_badge = ""
         if layer.type == 'FILL':
-            swatch = row.row(align=True)
-            swatch.scale_x = 0.38
-            swatch.prop(layer, "fill_color", text="")
+            mat_ul = _get_material_for_node(node)
+            p_node_ul = (_get_material_channel_node(mat_ul, 'BASE_COLOR') or node) if mat_ul else node
+            p_layer_ul = (_find_layer_by_uid(p_node_ul, _layer_uid(layer)) or layer) if p_node_ul else layer
+            if mat_ul is None or _is_fill_channel_enabled(mat_ul, p_node_ul, p_layer_ul, 'BASE_COLOR'):
+                swatch = row.row(align=True)
+                swatch.scale_x = 0.38
+                swatch.prop(p_layer_ul, "fill_color", text="")
+            if mat_ul is not None:
+                ch_badge = _get_enabled_fill_channel_badges(mat_ul, p_node_ul, p_layer_ul)
 
         row.prop(layer, "name", text="", emboss=False)
+
+        if ch_badge:
+            ch_sub = row.row(align=True)
+            ch_sub.ui_units_x = max(1.1, 0.42 * len(ch_badge))
+            ch_sub.enabled = False
+            ch_sub.label(text=ch_badge)
 
         # Compact Blend Mode + Opacity badge when non-default
         b_short = _LAYER_BLEND_SHORT_LABELS.get(getattr(layer, "blend_mode", "MIX"), "")
@@ -6429,9 +6943,9 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     layer_box = layout.box()
     layer_col = layer_box.column(align=True)
 
-    # Row 1: Fill Color Swatch (if Fill) + Blend Mode + Opacity on ONE row!
+    # Row 1: Fill Color Swatch (if 2D Fill) + Blend Mode + Opacity on ONE row!
     bo_row = layer_col.row(align=True)
-    if layer.type == 'FILL':
+    if layer.type == 'FILL' and (is_2d_only or mat is None):
         sw = bo_row.row(align=True)
         sw.scale_x = 0.55
         sw.prop(layer, "fill_color", text="")
@@ -6461,6 +6975,120 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
         op_wm.mode = 'WHITE'
     else:
         flag_row.prop(layer, "use_mask", text="Mask", toggle=True, icon='MOD_MASK')
+
+    # Substance-Painter-Style Multi-Channel Fill Layer Controls (Base Color / Roughness / Metallic / Height / Emission + Extras)
+    if layer.type == 'FILL' and not is_2d_only and mat is not None:
+        _r_mat, p_node, p_layer = _resolve_primary_node_and_layer(node, layer, context)
+        if p_node is not None and p_layer is not None:
+            layer_col.separator(factor=0.35)
+
+            # Channel Toggle Bar: [Color] [Rough] [Metal] [Height] [Emis] [Presets ▾]
+            ch_bar = layer_col.row(align=True)
+            for ch_id, pill_lbl, _pill_ic, is_core in _FILL_CHANNEL_PILLS:
+                if not is_core:
+                    continue
+                is_on = _is_fill_channel_enabled(mat, p_node, p_layer, ch_id)
+                op_t = ch_bar.operator(
+                    "node.tex_paint_fill_channel_toggle",
+                    text=pill_lbl,
+                    depress=is_on,
+                )
+                op_t.channel = ch_id
+                op_t.action = 'TOGGLE'
+            ch_bar.menu("TEXPAINT_MT_fill_channels_and_presets", text="", icon='PRESET')
+
+            # Secondary channels pill bar if any of Normal / Specular / Alpha / Displacement are active
+            extra_pills = (
+                ('NORMAL', "Normal"),
+                ('SPECULAR', "Specular"),
+                ('ALPHA', "Alpha"),
+                ('DISPLACEMENT', "Displace"),
+            )
+            enabled_extras = [
+                (cid, clbl) for cid, clbl in extra_pills
+                if _is_fill_channel_enabled(mat, p_node, p_layer, cid)
+            ]
+            if enabled_extras:
+                ex_bar = layer_col.row(align=True)
+                for cid, clbl in enabled_extras:
+                    op_ex = ex_bar.operator(
+                        "node.tex_paint_fill_channel_toggle",
+                        text=clbl,
+                        depress=True,
+                        icon='CHECKMARK',
+                    )
+                    op_ex.channel = cid
+                    op_ex.action = 'TOGGLE'
+
+            # Per-channel sliders/color pickers ONLY for enabled channels
+            any_ch_on = False
+            non_color_ch_on = False
+            ch_val_col = layer_col.column(align=True)
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'BASE_COLOR'):
+                any_ch_on = True
+                c_row = ch_val_col.row(align=True)
+                c_split = c_row.split(factor=0.38, align=True)
+                c_split.label(text="Base Color")
+                c_split.prop(node, "tex_paint_fill_base_color", text="")
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'ROUGHNESS'):
+                any_ch_on = True
+                non_color_ch_on = True
+                ch_val_col.prop(node, "tex_paint_fill_roughness", text="Roughness", slider=True)
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'METALLIC'):
+                any_ch_on = True
+                non_color_ch_on = True
+                ch_val_col.prop(node, "tex_paint_fill_metallic", text="Metallic", slider=True)
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'BUMP'):
+                any_ch_on = True
+                non_color_ch_on = True
+                ch_val_col.prop(node, "tex_paint_fill_height", text="Height", slider=True)
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'EMISSION'):
+                any_ch_on = True
+                non_color_ch_on = True
+                e_row = ch_val_col.row(align=True)
+                e_split = e_row.split(factor=0.38, align=True)
+                e_split.label(text="Emission")
+                e_split.prop(node, "tex_paint_fill_emission", text="")
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'NORMAL'):
+                any_ch_on = True
+                non_color_ch_on = True
+                n_row = ch_val_col.row(align=True)
+                n_split = n_row.split(factor=0.38, align=True)
+                n_split.label(text="Normal")
+                n_split.prop(node, "tex_paint_fill_normal", text="")
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'SPECULAR'):
+                any_ch_on = True
+                non_color_ch_on = True
+                ch_val_col.prop(node, "tex_paint_fill_specular", text="Specular", slider=True)
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'ALPHA'):
+                any_ch_on = True
+                non_color_ch_on = True
+                ch_val_col.prop(node, "tex_paint_fill_alpha", text="Alpha", slider=True)
+
+            if _is_fill_channel_enabled(mat, p_node, p_layer, 'DISPLACEMENT'):
+                any_ch_on = True
+                non_color_ch_on = True
+                ch_val_col.prop(node, "tex_paint_fill_displacement", text="Displacement", slider=True)
+
+            if not any_ch_on:
+                off_row = ch_val_col.row(align=True)
+                off_row.enabled = False
+                off_row.label(text="All channels off — toggle a channel above", icon='INFO')
+            elif non_color_ch_on and v3d is not None and v3d.shading.type == 'SOLID':
+                sh_hint = layer_col.row(align=True)
+                sh_hint.operator(
+                    "node.tex_paint_viewport_shading",
+                    text="Preview PBR Channels (Material View)",
+                    icon='SHADING_RENDERED',
+                ).mode = 'MATERIAL'
 
     if layer.type == 'ADJUSTMENT':
         layer_col.separator(factor=0.25)
@@ -8039,6 +8667,157 @@ def _register_node_grunge_props():
         update=_update_lut,
     )
 
+    # -------------------------------------------------------------------
+    # Substance-Painter-Style Multi-Channel Fill Layer Properties
+    # -------------------------------------------------------------------
+    def _get_fill_ch_rgb(node, ch_id, default_rgb):
+        mat, p_node, p_layer = _resolve_primary_node_and_layer(node)
+        if p_node is None or p_layer is None:
+            return default_rgb
+        if ch_id == 'BASE_COLOR':
+            fc = p_layer.fill_color
+            return (float(fc[0]), float(fc[1]), float(fc[2]))
+        ch_layer = _get_fill_channel_layer(mat, p_node, p_layer, ch_id)
+        if ch_layer is None:
+            return default_rgb
+        fc = ch_layer.fill_color
+        return (float(fc[0]), float(fc[1]), float(fc[2]))
+
+    def _set_fill_ch_rgb(node, ch_id, rgb_val):
+        mat, p_node, p_layer = _resolve_primary_node_and_layer(node)
+        if p_node is None or p_layer is None:
+            return
+        if ch_id == 'BASE_COLOR':
+            p_layer.fill_color = (float(rgb_val[0]), float(rgb_val[1]), float(rgb_val[2]), 1.0)
+            return
+        if mat is None:
+            return
+        ch_node = _ensure_material_pbr_channel_node(bpy.context, mat, p_node, ch_id, keep_primary_active=True)
+        if ch_node is None:
+            return
+        ch_layer = _find_layer_by_uid(ch_node, _layer_uid(p_layer))
+        if ch_layer is not None:
+            ch_layer.fill_color = (float(rgb_val[0]), float(rgb_val[1]), float(rgb_val[2]), 1.0)
+
+    def _get_fill_ch_scalar(node, ch_id, default_val):
+        rgb = _get_fill_ch_rgb(node, ch_id, (default_val, default_val, default_val))
+        return float(rgb[0])
+
+    def _set_fill_ch_scalar(node, ch_id, val):
+        v = min(max(float(val), 0.0), 1.0)
+        _set_fill_ch_rgb(node, ch_id, (v, v, v))
+
+    def _get_fill_ch_signed(node, ch_id):
+        rgb = _get_fill_ch_rgb(node, ch_id, (0.5, 0.5, 0.5))
+        return float(min(max((rgb[0] - 0.5) * 2.0, -1.0), 1.0))
+
+    def _set_fill_ch_signed(node, ch_id, val):
+        h = min(max(float(val), -1.0), 1.0)
+        g = 0.5 + 0.5 * h
+        _set_fill_ch_rgb(node, ch_id, (g, g, g))
+
+    Node.tex_paint_fill_base_color = FloatVectorProperty(
+        name="Base Color",
+        description="Base Color (Albedo) of this Fill Layer",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.8, 0.8, 0.8),
+        get=lambda self: _get_fill_ch_rgb(self, 'BASE_COLOR', (0.8, 0.8, 0.8)),
+        set=lambda self, val: _set_fill_ch_rgb(self, 'BASE_COLOR', val),
+    )
+
+    Node.tex_paint_fill_roughness = FloatProperty(
+        name="Roughness",
+        description="Roughness value of this Fill Layer (0.0 = Mirror Glossy, 1.0 = Matte Rough)",
+        min=0.0,
+        max=1.0,
+        default=0.35,
+        subtype='FACTOR',
+        get=lambda self: _get_fill_ch_scalar(self, 'ROUGHNESS', 0.35),
+        set=lambda self, val: _set_fill_ch_scalar(self, 'ROUGHNESS', val),
+    )
+
+    Node.tex_paint_fill_metallic = FloatProperty(
+        name="Metallic",
+        description="Metallic value of this Fill Layer (0.0 = Dielectric, 1.0 = Pure Metal)",
+        min=0.0,
+        max=1.0,
+        default=1.0,
+        subtype='FACTOR',
+        get=lambda self: _get_fill_ch_scalar(self, 'METALLIC', 1.0),
+        set=lambda self, val: _set_fill_ch_scalar(self, 'METALLIC', val),
+    )
+
+    Node.tex_paint_fill_height = FloatProperty(
+        name="Height",
+        description="Height / Bump offset of this Fill Layer (-1.0 = Carved Groove, 0.0 = Flat Neutral, +1.0 = Raised Emboss)",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        subtype='FACTOR',
+        get=lambda self: _get_fill_ch_signed(self, 'BUMP'),
+        set=lambda self, val: _set_fill_ch_signed(self, 'BUMP', val),
+    )
+
+    Node.tex_paint_fill_emission = FloatVectorProperty(
+        name="Emission",
+        description="Emission glow color of this Fill Layer",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 0.45, 0.1),
+        get=lambda self: _get_fill_ch_rgb(self, 'EMISSION', (1.0, 0.45, 0.1)),
+        set=lambda self, val: _set_fill_ch_rgb(self, 'EMISSION', val),
+    )
+
+    Node.tex_paint_fill_normal = FloatVectorProperty(
+        name="Normal",
+        description="Tangent-space normal color of this Fill Layer",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.5, 0.5, 1.0),
+        get=lambda self: _get_fill_ch_rgb(self, 'NORMAL', (0.5, 0.5, 1.0)),
+        set=lambda self, val: _set_fill_ch_rgb(self, 'NORMAL', val),
+    )
+
+    Node.tex_paint_fill_specular = FloatProperty(
+        name="Specular",
+        description="Specular IOR Level of this Fill Layer",
+        min=0.0,
+        max=1.0,
+        default=0.5,
+        subtype='FACTOR',
+        get=lambda self: _get_fill_ch_scalar(self, 'SPECULAR', 0.5),
+        set=lambda self, val: _set_fill_ch_scalar(self, 'SPECULAR', val),
+    )
+
+    Node.tex_paint_fill_alpha = FloatProperty(
+        name="Alpha",
+        description="Opacity / Alpha cutout value of this Fill Layer",
+        min=0.0,
+        max=1.0,
+        default=1.0,
+        subtype='FACTOR',
+        get=lambda self: _get_fill_ch_scalar(self, 'ALPHA', 1.0),
+        set=lambda self, val: _set_fill_ch_scalar(self, 'ALPHA', val),
+    )
+
+    Node.tex_paint_fill_displacement = FloatProperty(
+        name="Displacement",
+        description="Displacement height offset of this Fill Layer (-1.0 to +1.0)",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        subtype='FACTOR',
+        get=lambda self: _get_fill_ch_signed(self, 'DISPLACEMENT'),
+        set=lambda self, val: _set_fill_ch_signed(self, 'DISPLACEMENT', val),
+    )
+
 
 def _unregister_node_grunge_props():
     Node = bpy.types.Node
@@ -8074,6 +8853,15 @@ def _unregister_node_grunge_props():
         "tex_paint_mask_eff_gen_noise_scale",
         "tex_paint_mask_eff_lvl_balance",
         "tex_paint_mask_eff_lvl_contrast",
+        "tex_paint_fill_base_color",
+        "tex_paint_fill_roughness",
+        "tex_paint_fill_metallic",
+        "tex_paint_fill_height",
+        "tex_paint_fill_emission",
+        "tex_paint_fill_normal",
+        "tex_paint_fill_specular",
+        "tex_paint_fill_alpha",
+        "tex_paint_fill_displacement",
     ):
         if hasattr(Node, prop_name):
             delattr(Node, prop_name)
@@ -8190,6 +8978,8 @@ classes = (
     NODE_OT_tex_paint_convert_slot_to_layers,
     NODE_OT_tex_paint_pbr_channel,
     TEXPAINT_MT_add_pbr_channel,
+    NODE_OT_tex_paint_fill_channel_toggle,
+    TEXPAINT_MT_fill_channels_and_presets,
     NODE_OT_tex_paint_layer_pixel_action,
     TEXPAINT_MT_layer_specials,
     NODE_OT_tex_paint_smart_mask_recipe,

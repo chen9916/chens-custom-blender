@@ -1595,6 +1595,52 @@ void BKE_tex_paint_stroke_update(bNode &node, const ImBuf *target, const rcti &r
           }
         }
       }
+
+      /* Propagate shared mask stroke dirty rectangles across companion PBR channel nodes in the
+       * same material node tree that share this layer's UID. */
+      if (node.runtime != nullptr && node.runtime->owner_tree != nullptr) {
+        bNodeTree *ntree = node.runtime->owner_tree;
+        for (bNode &other_node : ntree->nodes) {
+          if (&other_node == &node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
+              other_node.storage == nullptr || !BKE_tex_paint_is_initialized(other_node))
+          {
+            continue;
+          }
+          NodeTexPaint &other_data = *static_cast<NodeTexPaint *>(other_node.storage);
+          TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, layer->uid);
+          if (other_layer == nullptr) {
+            continue;
+          }
+          other_layer->flag = (other_layer->flag &
+                               ~(TEXPAINT_LAYER_USE_MASK | TEXPAINT_LAYER_MASK_INVERT)) |
+                              (layer->flag &
+                               (TEXPAINT_LAYER_USE_MASK | TEXPAINT_LAYER_MASK_INVERT));
+          ImBuf *other_mask = BKE_tex_paint_layer_ensure_mask_ibuf(other_data, *other_layer);
+          if (other_mask == nullptr || other_mask->x != mask->x || other_mask->y != mask->y) {
+            continue;
+          }
+          if (const uint8_t *src_bytes = mask->byte_data()) {
+            if (uint8_t *dst_bytes = other_mask->byte_data_for_write()) {
+              const size_t row_bytes = size_t(clamped.xmax - clamped.xmin) * 4;
+              for (int y = clamped.ymin; y < clamped.ymax; y++) {
+                const size_t offset = (size_t(y) * size_t(mask->x) + size_t(clamped.xmin)) * 4;
+                memcpy(dst_bytes + offset, src_bytes + offset, row_bytes);
+              }
+            }
+          }
+          else if (const float *src_floats = mask->float_data()) {
+            if (float *dst_floats = other_mask->float_data_for_write()) {
+              const size_t row_bytes = size_t(clamped.xmax - clamped.xmin) * 4 * sizeof(float);
+              for (int y = clamped.ymin; y < clamped.ymax; y++) {
+                const size_t offset = (size_t(y) * size_t(mask->x) + size_t(clamped.xmin)) * 4;
+                memcpy(dst_floats + offset, src_floats + offset, row_bytes);
+              }
+            }
+          }
+          BKE_tex_paint_layer_pixels_changed(other_data, *other_layer, &rect);
+          BKE_tex_paint_composite_rect(other_node, &rect);
+        }
+      }
     }
   }
   BKE_tex_paint_layer_pixels_changed(data, *layer, &rect);

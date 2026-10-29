@@ -392,9 +392,49 @@ static wmOperatorStatus tex_paint_layer_add_exec(bContext *C, wmOperator *op)
                      type == TEXPAINT_LAYER_ADJUSTMENT ? DATA_("Adjustment") :
                                                          DATA_("Layer");
   NodeTexPaint &data = storage(*node);
-  BKE_tex_paint_layer_add(data, name, type);
+  const TexPaintLayer *prev_active = BKE_tex_paint_layer_active(data);
+  const int prev_uid = prev_active ? prev_active->uid : 0;
+  TexPaintLayer *new_layer = BKE_tex_paint_layer_add(data, name, type);
   data.paint_target = TEXPAINT_TARGET_COLOR;
   tex_paint_layers_changed(C, *node);
+
+  /* Keep companion PBR channel nodes in the same material tree synchronized with the layer stack. */
+  if (ntree != nullptr && new_layer != nullptr) {
+    const int new_count = BKE_tex_paint_layer_count(data);
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (BKE_tex_paint_layer_find_uid(other_data, new_layer->uid) != nullptr ||
+          BKE_tex_paint_layer_count(other_data) != new_count - 1)
+      {
+        continue;
+      }
+      if (prev_uid > 0) {
+        if (TexPaintLayer *other_prev = BKE_tex_paint_layer_find_uid(other_data, prev_uid)) {
+          BKE_tex_paint_layer_active_set(other_data,
+                                         BLI_findindex(&other_data.layers, other_prev));
+        }
+      }
+      TexPaintLayer *other_layer = BKE_tex_paint_layer_add(other_data, new_layer->name, type);
+      if (other_layer != nullptr) {
+        STRNCPY_UTF8(other_layer->name, new_layer->name);
+        other_layer->uid = new_layer->uid;
+        other_data.next_layer_uid = std::max(other_data.next_layer_uid, new_layer->uid + 1);
+        if (type == TEXPAINT_LAYER_FILL) {
+          /* Companion channels on a new Fill Layer start disabled (alpha = 0) until toggled ON. */
+          other_layer->fill_color[0] = 0.5f;
+          other_layer->fill_color[1] = 0.5f;
+          other_layer->fill_color[2] = 0.5f;
+          other_layer->fill_color[3] = 0.0f;
+        }
+        tex_paint_layers_changed(C, *other_node);
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -429,8 +469,27 @@ static wmOperatorStatus tex_paint_layer_remove_exec(bContext *C, wmOperator *op)
     BKE_report(op->reports, RPT_WARNING, "Cannot remove the last layer");
     return OPERATOR_CANCELLED;
   }
+  const int removed_uid = layer->uid;
   BKE_tex_paint_layer_remove(data, *layer);
   tex_paint_layers_changed(C, *node);
+
+  if (ntree != nullptr && removed_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (BKE_tex_paint_layer_count(other_data) <= 1) {
+        continue;
+      }
+      if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, removed_uid)) {
+        BKE_tex_paint_layer_remove(other_data, *other_layer);
+        tex_paint_layers_changed(C, *other_node);
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -458,8 +517,28 @@ static wmOperatorStatus tex_paint_layer_duplicate_exec(bContext *C, wmOperator *
   if (layer == nullptr) {
     return OPERATOR_CANCELLED;
   }
-  BKE_tex_paint_layer_duplicate(data, *layer);
+  const int src_uid = layer->uid;
+  TexPaintLayer *dup_layer = BKE_tex_paint_layer_duplicate(data, *layer);
   tex_paint_layers_changed(C, *node);
+
+  if (ntree != nullptr && dup_layer != nullptr && src_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (TexPaintLayer *other_src = BKE_tex_paint_layer_find_uid(other_data, src_uid)) {
+        if (TexPaintLayer *other_dup = BKE_tex_paint_layer_duplicate(other_data, *other_src)) {
+          STRNCPY_UTF8(other_dup->name, dup_layer->name);
+          other_dup->uid = dup_layer->uid;
+          other_data.next_layer_uid = std::max(other_data.next_layer_uid, dup_layer->uid + 1);
+          tex_paint_layers_changed(C, *other_node);
+        }
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -488,7 +567,24 @@ static wmOperatorStatus tex_paint_layer_move_exec(bContext *C, wmOperator *op)
   if (layer == nullptr || !BKE_tex_paint_layer_move(data, *layer, direction)) {
     return OPERATOR_CANCELLED;
   }
+  const int moved_uid = layer->uid;
   tex_paint_layers_changed(C, *node);
+
+  if (ntree != nullptr && moved_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, moved_uid)) {
+        if (BKE_tex_paint_layer_move(other_data, *other_layer, direction)) {
+          tex_paint_layers_changed(C, *other_node);
+        }
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -1131,6 +1227,7 @@ static wmOperatorStatus tex_paint_layer_mask_init_exec(bContext *C, wmOperator *
   }
 
   const int mode = RNA_enum_get(op->ptr, "mode");
+  const int target_uid = layer->uid;
   switch (mode) {
     case TEXPAINT_MASK_INIT_WHITE:
       BKE_tex_paint_layer_mask_fill(data, *layer, 1.0f);
@@ -1153,6 +1250,39 @@ static wmOperatorStatus tex_paint_layer_mask_init_exec(bContext *C, wmOperator *
   }
 
   tex_paint_layers_changed(C, *node);
+
+  if (ntree != nullptr && target_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, target_uid);
+      if (other_layer == nullptr) {
+        continue;
+      }
+      switch (mode) {
+        case TEXPAINT_MASK_INIT_WHITE:
+          BKE_tex_paint_layer_mask_fill(other_data, *other_layer, 1.0f);
+          break;
+        case TEXPAINT_MASK_INIT_BLACK:
+          BKE_tex_paint_layer_mask_fill(other_data, *other_layer, 0.0f);
+          break;
+        case TEXPAINT_MASK_INIT_INVERT:
+          other_layer->flag |= TEXPAINT_LAYER_USE_MASK;
+          BKE_tex_paint_layer_mask_invert_pixels(other_data, *other_layer);
+          break;
+        case TEXPAINT_MASK_INIT_REMOVE:
+          BKE_tex_paint_layer_mask_remove(other_data, *other_layer);
+          break;
+        default:
+          break;
+      }
+      tex_paint_layers_changed(C, *other_node);
+    }
+  }
   return OPERATOR_FINISHED;
 }
 

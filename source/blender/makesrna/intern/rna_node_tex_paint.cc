@@ -92,6 +92,26 @@ void rna_ShaderNodeTexPaint_active_layer_index_set(PointerRNA *ptr, int value)
     BKE_tex_paint_cache_invalidate(*data);
     BKE_tex_paint_composite_full(*node);
   }
+  /* Keep companion PBR channel nodes in the same tree positioned on the matching active layer
+   * so their below-active composite caches stay warm. */
+  bNodeTree *ntree = reinterpret_cast<bNodeTree *>(ptr->owner_id);
+  const TexPaintLayer *active = BKE_tex_paint_layer_active(*data);
+  if (ntree != nullptr && active != nullptr) {
+    for (bNode &other_node : ntree->nodes) {
+      if (&other_node == node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
+          other_node.storage == nullptr)
+      {
+        continue;
+      }
+      NodeTexPaint *other_data = static_cast<NodeTexPaint *>(other_node.storage);
+      if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(*other_data, active->uid)) {
+        const int other_idx = BLI_findindex(&other_data->layers, other_layer);
+        if (other_idx != -1 && other_data->active_layer_index != other_idx) {
+          BKE_tex_paint_layer_active_set(*other_data, other_idx);
+        }
+      }
+    }
+  }
 }
 
 PointerRNA rna_ShaderNodeTexPaint_active_layer_get(PointerRNA *ptr)
@@ -142,6 +162,19 @@ static void rna_TexPaintLayer_name_set(PointerRNA *ptr, const char *value)
   STRNCPY_UTF8(layer->name, value);
   if (bNode *node = rna_TexPaintLayer_node(ptr)) {
     BKE_tex_paint_layer_unique_name(*static_cast<NodeTexPaint *>(node->storage), *layer);
+    if (bNodeTree *ntree = reinterpret_cast<bNodeTree *>(ptr->owner_id)) {
+      for (bNode &other_node : ntree->nodes) {
+        if (&other_node == node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
+            other_node.storage == nullptr)
+        {
+          continue;
+        }
+        NodeTexPaint *other_data = static_cast<NodeTexPaint *>(other_node.storage);
+        if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(*other_data, layer->uid)) {
+          STRNCPY_UTF8(other_layer->name, layer->name);
+        }
+      }
+    }
   }
 }
 
@@ -153,12 +186,46 @@ static void rna_TexPaintLayer_update(Main * /*bmain*/, Scene * /*scene*/, Pointe
     return;
   }
   NodeTexPaint *data = static_cast<NodeTexPaint *>(node->storage);
+  TexPaintLayer *layer = ptr->data_as<TexPaintLayer>();
   const int index = BLI_findindex(&data->layers, ptr->data);
   if (index < data->active_layer_index) {
     BKE_tex_paint_cache_invalidate(*data);
   }
   BKE_tex_paint_composite_rect(*node, nullptr);
   tex_paint_tag_redraw(*node);
+
+  /* Propagate shared layer attributes (visibility, lock, clipping, mask invert, opacity)
+   * across companion PBR channel nodes in the same material tree when any of them changed. */
+  bNodeTree *ntree = reinterpret_cast<bNodeTree *>(ptr->owner_id);
+  if (ntree != nullptr && layer != nullptr) {
+    constexpr int shared_flags = TEXPAINT_LAYER_VISIBLE | TEXPAINT_LAYER_LOCKED |
+                                 TEXPAINT_LAYER_CLIPPING | TEXPAINT_LAYER_USE_MASK |
+                                 TEXPAINT_LAYER_MASK_INVERT;
+    for (bNode &other_node : ntree->nodes) {
+      if (&other_node == node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
+          other_node.storage == nullptr || !BKE_tex_paint_is_initialized(other_node))
+      {
+        continue;
+      }
+      NodeTexPaint *other_data = static_cast<NodeTexPaint *>(other_node.storage);
+      TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(*other_data, layer->uid);
+      if (other_layer == nullptr) {
+        continue;
+      }
+      if (other_layer->opacity != layer->opacity ||
+          (other_layer->flag & shared_flags) != (layer->flag & shared_flags))
+      {
+        other_layer->opacity = layer->opacity;
+        other_layer->flag = (other_layer->flag & ~shared_flags) | (layer->flag & shared_flags);
+        const int other_idx = BLI_findindex(&other_data->layers, other_layer);
+        if (other_idx < other_data->active_layer_index) {
+          BKE_tex_paint_cache_invalidate(*other_data);
+        }
+        BKE_tex_paint_composite_rect(other_node, nullptr);
+        tex_paint_tag_redraw(other_node);
+      }
+    }
+  }
 }
 
 static void rna_TexPaintLayer_redraw_update(Main * /*bmain*/, Scene * /*scene*/, PointerRNA *ptr)
@@ -257,6 +324,35 @@ static void rna_TexPaintLayer_use_mask_update(Main * /*bmain*/, Scene * /*scene*
   }
   BKE_tex_paint_composite_rect(*node, nullptr);
   tex_paint_tag_redraw(*node);
+
+  bNodeTree *ntree = reinterpret_cast<bNodeTree *>(ptr->owner_id);
+  if (ntree != nullptr && layer != nullptr) {
+    for (bNode &other_node : ntree->nodes) {
+      if (&other_node == node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
+          other_node.storage == nullptr || !BKE_tex_paint_is_initialized(other_node))
+      {
+        continue;
+      }
+      NodeTexPaint *other_data = static_cast<NodeTexPaint *>(other_node.storage);
+      TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(*other_data, layer->uid);
+      if (other_layer == nullptr) {
+        continue;
+      }
+      if ((other_layer->flag & TEXPAINT_LAYER_USE_MASK) != (layer->flag & TEXPAINT_LAYER_USE_MASK)) {
+        other_layer->flag = (other_layer->flag & ~TEXPAINT_LAYER_USE_MASK) |
+                            (layer->flag & TEXPAINT_LAYER_USE_MASK);
+        if (other_layer->flag & TEXPAINT_LAYER_USE_MASK) {
+          BKE_tex_paint_layer_ensure_mask_ibuf(*other_data, *other_layer);
+        }
+        const int other_idx = BLI_findindex(&other_data->layers, other_layer);
+        if (other_idx < other_data->active_layer_index) {
+          BKE_tex_paint_cache_invalidate(*other_data);
+        }
+        BKE_tex_paint_composite_rect(other_node, nullptr);
+        tex_paint_tag_redraw(other_node);
+      }
+    }
+  }
 }
 
 static void rna_TexPaintLayer_mask_gen_update(Main *bmain, Scene * /*scene*/, PointerRNA *ptr)
