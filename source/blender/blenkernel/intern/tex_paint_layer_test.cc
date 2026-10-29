@@ -209,4 +209,41 @@ TEST_F(TexPaintLayerTest, ClippingMaskLayerMaskAndMergeDown)
   EXPECT_NEAR(merged.w, 1.0f, 1e-4f);
 }
 
+TEST_F(TexPaintLayerTest, FillLayerGuardsDirectBrushStrokeUntilMaskSelected)
+{
+  const float clear_color[4] = {0.2f, 0.2f, 0.2f, 1.0f};
+  Image *master = BKE_tex_paint_canvas_init(
+      *bmain_, *node_, "GuardCanvas", 8, 8, true, clear_color);
+  ASSERT_NE(master, nullptr);
+
+  TexPaintLayer *fill = BKE_tex_paint_layer_add(storage(), "Fill", TEXPAINT_LAYER_FILL);
+  ASSERT_NE(fill, nullptr);
+  storage().paint_target = TEXPAINT_TARGET_COLOR;
+
+  ImBuf *master_ibuf = BKE_image_acquire_ibuf(master, &storage().image.iuser, nullptr);
+  ASSERT_NE(master_ibuf, nullptr);
+
+  /* Direct brush stroke on a Fill layer in Color mode must be blocked and must not create a mask. */
+  EXPECT_EQ(BKE_tex_paint_paint_target_ibuf(storage()), nullptr);
+  EXPECT_EQ(BKE_tex_paint_stroke_begin(*node_, master_ibuf), nullptr);
+  EXPECT_NE(BKE_tex_paint_stroke_block_reason(*node_), nullptr);
+  EXPECT_EQ(storage().paint_target, TEXPAINT_TARGET_COLOR);
+  EXPECT_EQ(fill->flag & TEXPAINT_LAYER_USE_MASK, 0);
+
+  /* Enabling a mask and targeting TEXPAINT_TARGET_MASK allows painting into the Fill layer's mask. */
+  BKE_tex_paint_layer_mask_fill(storage(), *fill, 1.0f);
+  storage().paint_target = TEXPAINT_TARGET_MASK;
+  EXPECT_EQ(BKE_tex_paint_stroke_block_reason(*node_), nullptr);
+  ImBuf *mask_target = BKE_tex_paint_stroke_begin(*node_, master_ibuf);
+  EXPECT_NE(mask_target, nullptr);
+  EXPECT_EQ(mask_target, fill->mask_ibuf);
+
+  /* Hidden or locked layers are also guarded against brush strokes. */
+  fill->flag &= ~TEXPAINT_LAYER_VISIBLE;
+  EXPECT_EQ(BKE_tex_paint_stroke_begin(*node_, master_ibuf), nullptr);
+  EXPECT_NE(BKE_tex_paint_stroke_block_reason(*node_), nullptr);
+
+  BKE_image_release_ibuf(master, master_ibuf, nullptr);
+}
+
 }  // namespace blender::bke::tests

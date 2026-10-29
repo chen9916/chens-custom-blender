@@ -449,6 +449,7 @@ struct ProjPaintState {
   bool is_shared_user;
   /** The active layer of a layered Texture Paint node cannot be painted. */
   bool tex_paint_blocked = false;
+  const char *tex_paint_block_reason = nullptr;
 
   ProjPaintImage *projImages;
   /** cavity amount for vertices. */
@@ -5149,6 +5150,7 @@ static void project_paint_build_proj_ima(ProjPaintState *ps,
       projIma->layer_alpha_lock = BKE_tex_paint_stroke_locks_alpha(*projIma->tex_paint_node);
       projIma->ibuf = BKE_tex_paint_stroke_begin(*projIma->tex_paint_node, projIma->ibuf);
       if (projIma->ibuf == nullptr) {
+        ps->tex_paint_block_reason = BKE_tex_paint_stroke_block_reason(*projIma->tex_paint_node);
         projIma->ibuf = projIma->acquired_ibuf;
         projIma->tex_paint_node = nullptr;
         projIma->layer_alpha_lock = false;
@@ -7320,7 +7322,8 @@ void *paint_proj_new_stroke(bContext *C,
                             Object *ob,
                             const float mouse[2],
                             const BrushStrokeMode mode,
-                            const BrushSwitchMode brush_switch_mode)
+                            const BrushSwitchMode brush_switch_mode,
+                            ReportList *reports)
 {
   ProjStrokeHandle *ps_handle;
   Scene *scene = CTX_data_scene(C);
@@ -7411,6 +7414,9 @@ void *paint_proj_new_stroke(bContext *C,
       goto fail;
     }
     if (ps->tex_paint_blocked) {
+      if (reports && ps->tex_paint_block_reason) {
+        BKE_report(reports, RPT_WARNING, ps->tex_paint_block_reason);
+      }
       project_paint_end(ps);
       goto fail;
     }

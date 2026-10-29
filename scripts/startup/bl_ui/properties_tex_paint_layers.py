@@ -7047,6 +7047,21 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     # TAB A: LAYER CHANNELS INSPECTOR
     # =======================================================================
     if paint_target == 'COLOR':
+        if layer.type in {'FILL', 'ADJUSTMENT'}:
+            insp_col.separator(factor=0.3)
+            guard_row = insp_col.row(align=True)
+            guard_lbl = "Fill Layer — Direct Brush Guarded" if layer.type == 'FILL' else "Adjustment — Direct Brush Guarded"
+            guard_row.label(text=guard_lbl, icon='LOCKED')
+            op_add_p = guard_row.operator("node.tex_paint_layer_add", text="Paint Layer", icon='ADD')
+            op_add_p.type = 'PAINT'
+            if layer.use_mask:
+                op_pm = guard_row.operator("node.tex_paint_layer_target_select", text="Paint Mask", icon='MOD_MASK')
+                op_pm.layer_index = node.active_layer_index
+                op_pm.target = 'MASK'
+            else:
+                op_pm = guard_row.operator("node.tex_paint_mask_stack_init", text="Add Mask", icon='MOD_MASK')
+                op_pm.mode = 'WHITE'
+
         if layer.type in {'FILL', 'PAINT'} and not is_2d_only:
             insp_col.separator(factor=0.35)
 

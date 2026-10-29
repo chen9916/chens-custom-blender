@@ -466,7 +466,8 @@ void *paint_proj_new_stroke(bContext *C,
                             Object *ob,
                             const float mouse[2],
                             BrushStrokeMode mode,
-                            BrushSwitchMode brush_switch_mode);
+                            BrushSwitchMode brush_switch_mode,
+                            ReportList *reports = nullptr);
 void paint_proj_stroke(const bContext *C,
                        void *ps_handle_p,
                        const float prev_pos[2],

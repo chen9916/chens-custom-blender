@@ -867,22 +867,53 @@ void BKE_tex_paint_ensure_all_ibufs(NodeTexPaint &data)
 ImBuf *BKE_tex_paint_paint_target_ibuf(NodeTexPaint &data)
 {
   TexPaintLayer *layer = BKE_tex_paint_layer_active(data);
-  if (layer == nullptr || (layer->flag & TEXPAINT_LAYER_LOCKED)) {
+  if (layer == nullptr || (layer->flag & TEXPAINT_LAYER_LOCKED) != 0 ||
+      (layer->flag & TEXPAINT_LAYER_VISIBLE) == 0)
+  {
     return nullptr;
   }
-  if (data.paint_target == TEXPAINT_TARGET_MASK ||
-      (layer->type != TEXPAINT_LAYER_PAINT && (layer->flag & TEXPAINT_LAYER_USE_MASK)))
-  {
-    layer->flag |= TEXPAINT_LAYER_USE_MASK;
+  if (data.paint_target == TEXPAINT_TARGET_MASK) {
+    if ((layer->flag & TEXPAINT_LAYER_USE_MASK) == 0) {
+      return nullptr;
+    }
     return BKE_tex_paint_layer_ensure_mask_ibuf(data, *layer);
   }
   if (layer->type != TEXPAINT_LAYER_PAINT) {
-    /* Fill/Adjustment layers have no color pixel buffer; painting on them masks them. */
-    layer->flag |= TEXPAINT_LAYER_USE_MASK;
-    data.paint_target = TEXPAINT_TARGET_MASK;
-    return BKE_tex_paint_layer_ensure_mask_ibuf(data, *layer);
+    /* Fill/Adjustment layers cannot be directly brush-painted in Color mode. */
+    return nullptr;
   }
   return BKE_tex_paint_layer_ensure_ibuf(data, *layer);
+}
+
+const char *BKE_tex_paint_stroke_block_reason(const bNode &node)
+{
+  if (!BKE_tex_paint_is_initialized(node)) {
+    return nullptr;
+  }
+  const NodeTexPaint &data = *static_cast<const NodeTexPaint *>(node.storage);
+  const TexPaintLayer *layer = BKE_tex_paint_layer_active(const_cast<NodeTexPaint &>(data));
+  if (layer == nullptr) {
+    return "No active paint layer";
+  }
+  if ((layer->flag & TEXPAINT_LAYER_VISIBLE) == 0) {
+    return "Cannot paint on a hidden layer";
+  }
+  if (layer->flag & TEXPAINT_LAYER_LOCKED) {
+    return "Cannot paint on a locked layer";
+  }
+  if (data.paint_target == TEXPAINT_TARGET_MASK) {
+    if ((layer->flag & TEXPAINT_LAYER_USE_MASK) == 0) {
+      return "Layer has no mask — initialize a Black or White Mask first";
+    }
+    return nullptr;
+  }
+  if (layer->type == TEXPAINT_LAYER_FILL) {
+    return "Cannot paint directly on a Fill Layer — add a Paint Layer, or select its Mask to paint";
+  }
+  if (layer->type == TEXPAINT_LAYER_ADJUSTMENT) {
+    return "Cannot paint directly on an Adjustment Layer — select its Mask to paint";
+  }
+  return nullptr;
 }
 
 /** \} */

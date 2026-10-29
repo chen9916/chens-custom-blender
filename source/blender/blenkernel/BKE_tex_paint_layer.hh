@@ -247,6 +247,13 @@ bNode *BKE_tex_paint_node_find_in_main(Main &bmain, const Image *image);
  */
 ImBuf *BKE_tex_paint_stroke_begin(bNode &node, const ImBuf *master);
 
+/**
+ * Human-readable warning message explaining why a brush stroke is blocked on `node`
+ * (e.g. Fill or Adjustment layer in Color mode, locked layer, or hidden layer),
+ * or null when painting is permitted.
+ */
+const char *BKE_tex_paint_stroke_block_reason(const bNode &node);
+
 /** True when the active paint target of `node` locks the alpha channel. */
 bool BKE_tex_paint_stroke_locks_alpha(const bNode &node);
 

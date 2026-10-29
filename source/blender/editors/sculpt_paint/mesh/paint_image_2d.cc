@@ -1782,6 +1782,9 @@ void *paint_2d_new_stroke(bContext *C, wmOperator *op, const BrushStrokeMode mod
     s->layer_alpha_lock = BKE_tex_paint_stroke_locks_alpha(*s->tex_paint_node);
     ibuf = BKE_tex_paint_stroke_begin(*s->tex_paint_node, ibuf);
     if (ibuf == nullptr) {
+      if (const char *reason = BKE_tex_paint_stroke_block_reason(*s->tex_paint_node)) {
+        BKE_report(op->reports, RPT_WARNING, reason);
+      }
       BKE_image_release_ibuf(s->image, s->tiles[0].acquired_canvas, nullptr);
       MEM_delete(s->tiles);
       MEM_delete(s);
