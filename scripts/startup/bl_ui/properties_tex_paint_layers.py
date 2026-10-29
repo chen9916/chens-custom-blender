@@ -6462,7 +6462,7 @@ class NODE_OT_tex_paint_quick_uv(Operator):
 # ---------------------------------------------------------------------------
 
 class TEXPAINT_UL_layers(UIList):
-    """Layer list, drawn from top to bottom with clickable Color/Mask target icons, blend badges, and Solo."""
+    """Layer list, drawn from top to bottom with inline Blend Mode dropdown and Opacity slider."""
 
     def draw_item(self, _context, layout, data, item, _icon, _active_data, _active_propname, index):
         layer = item
@@ -6497,75 +6497,55 @@ class TEXPAINT_UL_layers(UIList):
         op_col.layer_index = index
         op_col.target = 'COLOR'
 
-        # Clickable Mask Slot (Side-by-side Substance Painter style on EVERY layer row!)
-        if layer.use_mask:
-            st = _get_layer_grunge_state(node, layer)
-            effects = st.get("effects", [])
-            if len(effects) > 1:
-                mask_icon = 'RENDERLAYERS'
-            elif len(effects) == 1:
-                et = effects[0].get("type", "GRUNGE")
-                mask_icon = {'GENERATOR': 'MODIFIER', 'PAINT': 'BRUSH_DATA', 'GRUNGE': 'TEXTURE', 'LEVELS': 'SEQ_LUMA_WAVEFORM'}.get(et, 'MOD_MASK')
+        # Clickable Mask Slot (shown when layer has a mask or when Mask tab is active on this layer)
+        if layer.use_mask or (is_active and paint_target == 'MASK'):
+            if layer.use_mask:
+                st = _get_layer_grunge_state(node, layer)
+                effects = st.get("effects", [])
+                if len(effects) > 1:
+                    mask_icon = 'RENDERLAYERS'
+                elif len(effects) == 1:
+                    et = effects[0].get("type", "GRUNGE")
+                    mask_icon = {
+                        'GENERATOR': 'MODIFIER',
+                        'PAINT': 'BRUSH_DATA',
+                        'GRUNGE': 'TEXTURE',
+                        'LEVELS': 'SEQ_LUMA_WAVEFORM',
+                    }.get(et, 'MOD_MASK')
+                else:
+                    mask_icon = 'MOD_MASK'
             else:
                 mask_icon = 'MOD_MASK'
-        else:
-            mask_icon = 'MOD_MASK' if (is_active and paint_target == 'MASK') else 'MESH_CIRCLE'
 
-        op_msk = row.operator(
-            "node.tex_paint_layer_target_select",
-            text="",
-            icon=mask_icon,
-            emboss=(is_active and paint_target == 'MASK') or layer.use_mask,
-            depress=(is_active and paint_target == 'MASK'),
-        )
-        op_msk.layer_index = index
-        op_msk.target = 'MASK'
+            op_msk = row.operator(
+                "node.tex_paint_layer_target_select",
+                text="",
+                icon=mask_icon,
+                emboss=(is_active and paint_target == 'MASK') or layer.use_mask,
+                depress=(is_active and paint_target == 'MASK'),
+            )
+            op_msk.layer_index = index
+            op_msk.target = 'MASK'
 
         mat_ul = _get_material_for_node(node)
-        ch_badge = _get_enabled_fill_channel_badges(mat_ul, node, layer)
         if layer.type == 'FILL' and _is_fill_channel_enabled(mat_ul, node, layer, 'BASE_COLOR'):
             swatch = row.row(align=True)
-            swatch.scale_x = 0.38
+            swatch.scale_x = 0.35
             swatch.prop(layer, "fill_color", text="")
 
         row.prop(layer, "name", text="", emboss=False)
 
-        if ch_badge and (layer.type == 'FILL' or ch_badge != "C"):
-            ch_sub = row.row(align=True)
-            ch_sub.ui_units_x = max(1.1, 0.40 * len(ch_badge))
-            ch_sub.enabled = False
-            ch_sub.label(text=ch_badge)
+        # Inline Blend Mode Dropdown & Opacity Slider on each layer row
+        blend_sub = row.row(align=True)
+        blend_sub.ui_units_x = 3.1
+        blend_sub.prop(layer, "blend_mode", text="")
 
-        # Compact Blend Mode + Opacity badge when non-default
-        b_short = _LAYER_BLEND_SHORT_LABELS.get(getattr(layer, "blend_mode", "MIX"), "")
-        op_pct = int(round(float(getattr(layer, "opacity", 1.0)) * 100.0))
-        if b_short or op_pct < 100:
-            badge_txt = f"{b_short} {op_pct}%".strip() if op_pct < 100 else b_short
-            badge_sub = row.row(align=True)
-            badge_sub.ui_units_x = 2.5 if (b_short and op_pct < 100) else 1.5
-            badge_sub.enabled = False
-            badge_sub.label(text=badge_txt)
+        op_sub = row.row(align=True)
+        op_sub.ui_units_x = 2.9
+        op_sub.prop(layer, "opacity", text="", slider=True)
 
-        if (
-            (layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in {'DECAL', 'TRIPLANAR', 'WARP'}) or
-            _is_layer_grunge_gizmo_eligible(node, layer)
-        ):
-            row.prop(layer, "show_projection_widget", text="", emboss=False, icon='GIZMO')
-
-        if layer.type == 'PAINT' and layer.lock_alpha:
-            row.prop(layer, "lock_alpha", text="", emboss=False, icon='IMAGE_ALPHA')
-
-        is_solo = _is_layer_soloed(node, layer)
-        op_solo = row.operator(
-            "node.tex_paint_layer_solo",
-            text="",
-            icon='SOLO_ON' if is_solo else 'SOLO_OFF',
-            emboss=False,
-            depress=is_solo,
-        )
-        op_solo.layer_index = index
-
-        row.prop(layer, "lock", text="", emboss=False)
+        if layer.lock:
+            row.prop(layer, "lock", text="", emboss=False)
         row.prop(layer, "hide", text="", emboss=False)
 
     def filter_items(self, _context, data, propname):
@@ -7013,144 +6993,114 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
         if layer.lock:
             warn_row.prop(layer, "lock", text="Layer Locked — Click to Unlock", toggle=True, icon='UNLOCKED')
 
-    # Determine Mask status label (matching Design Concept diagram: None / Hand-painted / Procedural / Grunge)
+    # Determine Mask tab label
     paint_target = getattr(node, "paint_target", 'COLOR')
     if not layer.use_mask:
-        mask_status_lbl = "Mask: None (Full)"
+        mask_tab_lbl = "Mask"
     else:
         st_m = _get_layer_grunge_state(node, layer)
         effs_m = st_m.get("effects", [])
-        if not effs_m:
-            mask_status_lbl = "Mask: Hand-Painted"
-        elif len(effs_m) == 1:
-            et0 = effs_m[0].get("type", "GRUNGE")
-            if et0 == 'GENERATOR':
-                g_name = _MASK_GEN_LABELS.get(effs_m[0].get("gen_type", "EDGE_WEAR"), "Edge Wear")
-                mask_status_lbl = f"Mask: {g_name}"
-            elif et0 == 'PAINT':
-                mask_status_lbl = "Mask: Hand-Painted"
-            else:
-                mask_status_lbl = f"Mask: {effs_m[0].get('name', 'Grunge')[:14]}"
-        else:
-            mask_status_lbl = f"Mask Stack ({len(effs_m)})"
+        mask_tab_lbl = f"Mask ({len(effs_m)})" if len(effs_m) > 1 else "Mask"
 
-    # 2. Substance Painter 2-Tab Inspector Switcher: [ 🎨 Layer Channels ] | [ 🎭 Mask ]
+    # 2. Clean Single-Bar Inspector Header: [ Channels | Mask ] + Quick Layer Flags (Clip, Alpha, Solo, Lock, Presets)
     insp_box = layout.box()
     insp_col = insp_box.column(align=True)
 
-    tab_row = insp_col.row(align=True)
-    ch_badge_active = _get_enabled_fill_channel_badges(mat, node, layer)
-    ch_tab_lbl = f"Channels ({ch_badge_active})" if ch_badge_active else "Layer Channels"
-    op_tab_col = tab_row.operator(
+    hdr_bar = insp_col.row(align=True)
+    tabs_sub = hdr_bar.row(align=True)
+    op_tab_col = tabs_sub.operator(
         "node.tex_paint_layer_target_select",
-        text=ch_tab_lbl,
+        text="Channels",
         icon='COLOR' if layer.type == 'FILL' else ('MODIFIER' if layer.type == 'ADJUSTMENT' else 'BRUSH_DATA'),
         depress=(paint_target == 'COLOR'),
     )
     op_tab_col.layer_index = node.active_layer_index
     op_tab_col.target = 'COLOR'
 
-    op_tab_msk = tab_row.operator(
+    op_tab_msk = tabs_sub.operator(
         "node.tex_paint_layer_target_select",
-        text=mask_status_lbl,
+        text=mask_tab_lbl,
         icon='MOD_MASK',
         depress=(paint_target == 'MASK'),
     )
     op_tab_msk.layer_index = node.active_layer_index
     op_tab_msk.target = 'MASK'
 
-    if layer.type in {'FILL', 'PAINT'} and not is_2d_only:
-        tab_row.menu("TEXPAINT_MT_fill_channels_and_presets", text="", icon='PRESET')
-
-    insp_col.separator(factor=0.25)
-
-    # Row: Blend Mode + Opacity + Quick Flags (Alpha, Clip, Solo, Lock)
-    bo_row = insp_col.row(align=True)
-    bo_split = bo_row.split(factor=0.45, align=True)
-    bo_split.prop(layer, "blend_mode", text="")
-    bo_split.prop(layer, "opacity", text="Opacity", slider=True)
+    hdr_bar.separator(factor=0.5)
+    flags_sub = hdr_bar.row(align=True)
     if layer.type == 'PAINT':
-        bo_row.prop(layer, "lock_alpha", text="", toggle=True, icon='IMAGE_ALPHA')
-    bo_row.prop(layer, "use_clipping", text="", toggle=True, icon='TRIA_DOWN_BAR')
+        flags_sub.prop(layer, "lock_alpha", text="", toggle=True, icon='IMAGE_ALPHA')
+    flags_sub.prop(layer, "use_clipping", text="", toggle=True, icon='TRIA_DOWN_BAR')
     is_solo = _is_layer_soloed(node, layer)
-    op_solo_btn = bo_row.operator(
+    op_solo_btn = flags_sub.operator(
         "node.tex_paint_layer_solo",
         text="",
         icon='SOLO_ON' if is_solo else 'SOLO_OFF',
         depress=is_solo,
     )
     op_solo_btn.layer_index = node.active_layer_index
-    bo_row.prop(layer, "lock", text="", toggle=True, icon='LOCKED' if layer.lock else 'UNLOCKED')
+    flags_sub.prop(layer, "lock", text="", toggle=True, icon='LOCKED' if layer.lock else 'UNLOCKED')
+    if layer.type in {'FILL', 'PAINT'} and not is_2d_only:
+        flags_sub.menu("TEXPAINT_MT_fill_channels_and_presets", text="", icon='PRESET')
 
     # =======================================================================
-    # TAB A: LAYER CHANNELS INSPECTOR (Multilayer Texture System Design Concept)
+    # TAB A: LAYER CHANNELS INSPECTOR
     # =======================================================================
     if paint_target == 'COLOR':
         if layer.type in {'FILL', 'PAINT'} and not is_2d_only:
             insp_col.separator(factor=0.35)
 
-            # Visual 5-Channel ON/OFF Strip matching the Design Concept diagram:
-            # [ Base Color: ON/OFF | Roughness: ON/OFF | Metallic: ON/OFF | Height: ON/OFF | Normal: ON/OFF | Emit ]
+            # Compact, Non-Truncating Channel Pill Strip: [ Color | Rough | Metal | Height | Normal | Emit ]
             strip_row = insp_col.row(align=True)
             diagram_channels = (
-                ('BASE_COLOR', "Base Color"),
-                ('ROUGHNESS', "Roughness"),
-                ('METALLIC', "Metallic"),
+                ('BASE_COLOR', "Color"),
+                ('ROUGHNESS', "Rough"),
+                ('METALLIC', "Metal"),
                 ('BUMP', "Height"),
                 ('NORMAL', "Normal"),
+                ('EMISSION', "Emit"),
             )
             for cid, clbl in diagram_channels:
                 is_on = _is_fill_channel_enabled(mat, node, layer, cid)
                 op_c = strip_row.operator(
                     "node.tex_paint_fill_channel_toggle",
-                    text=f"{clbl}: {'ON' if is_on else 'OFF'}" if not compact else clbl,
+                    text=clbl,
                     depress=is_on,
                 )
                 op_c.channel = cid
                 op_c.action = 'TOGGLE'
 
-            em_on = _is_fill_channel_enabled(mat, node, layer, 'EMISSION')
-            op_em = strip_row.operator(
-                "node.tex_paint_fill_channel_toggle",
-                text="Emit",
-                icon='LIGHT_SUN',
-                depress=em_on,
-            )
-            op_em.channel = 'EMISSION'
-            op_em.action = 'TOGGLE'
+            insp_col.separator(factor=0.35)
 
-            insp_col.separator(factor=0.3)
-
-            # Per-Channel Value / Texture Cards for each ON channel (OFF channels pass through from below)
+            # Clean Two-Column Property Sheet for Enabled Channels
             ch_val_col = insp_col.column(align=True)
+            ch_val_col.use_property_split = True
+            ch_val_col.use_property_decorate = False
             any_ch_on = False
             non_color_ch_on = False
 
             if _is_fill_channel_enabled(mat, node, layer, 'BASE_COLOR'):
                 any_ch_on = True
-                c_row = ch_val_col.row(align=True)
                 if layer.type == 'FILL':
-                    c_split = c_row.split(factor=0.34, align=True)
-                    c_split.label(text="Base Color", icon='COLOR')
+                    c_split = ch_val_col.split(factor=0.4, align=True)
+                    c_lbl = c_split.row(align=True)
+                    c_lbl.alignment = 'RIGHT'
+                    c_lbl.label(text="Base Color")
                     r_sub = c_split.row(align=True)
                     r_sub.prop(layer, "fill_color", text="")
                     has_tex = getattr(layer, "proj_mode", 'NONE') != 'NONE'
-                    op_sol = r_sub.operator(
+                    op_tex = r_sub.operator(
                         "node.tex_paint_fill_layer_texture",
-                        text="Solid",
-                        depress=not has_tex,
-                    )
-                    op_sol.action = 'SOLID'
-                    op_grn = r_sub.operator(
-                        "node.tex_paint_fill_layer_texture",
-                        text="Grunge / Tex",
+                        text="",
                         icon='TEXTURE',
                         depress=has_tex,
                     )
-                    op_grn.action = 'GRUNGE'
+                    op_tex.action = 'SOLID' if has_tex else 'GRUNGE'
                 else:
-                    c_split = c_row.split(factor=0.45, align=True)
-                    c_split.label(text="Base Color (Hand-Painted)", icon='BRUSH_DATA')
+                    c_split = ch_val_col.split(factor=0.4, align=True)
+                    c_lbl = c_split.row(align=True)
+                    c_lbl.alignment = 'RIGHT'
+                    c_lbl.label(text="Base Color")
                     act_sub = c_split.row(align=True)
                     act_sub.operator("node.tex_paint_layer_pixel_action", text="Fill", icon='COLOR').action = 'FILL_BRUSH'
                     act_sub.operator("node.tex_paint_layer_pixel_action", text="Clear", icon='TRASH').action = 'CLEAR'
@@ -7168,28 +7118,27 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             if _is_fill_channel_enabled(mat, node, layer, 'BUMP'):
                 any_ch_on = True
                 non_color_ch_on = True
-                h_row = ch_val_col.row(align=True)
-                h_row.prop(layer, "fill_height", text="Height (Add)", slider=True)
+                ch_val_col.prop(layer, "fill_height", text="Height", slider=True)
                 if hasattr(node, "bump_strength"):
-                    h_row.prop(node, "bump_strength", text="Bump", slider=True)
+                    ch_val_col.prop(node, "bump_strength", text="Bump Strength", slider=True)
 
             if _is_fill_channel_enabled(mat, node, layer, 'NORMAL'):
                 any_ch_on = True
                 non_color_ch_on = True
-                n_row = ch_val_col.row(align=True)
+                n_split = ch_val_col.split(factor=0.4, align=True)
+                n_lbl = n_split.row(align=True)
+                n_lbl.alignment = 'RIGHT'
+                n_lbl.label(text="Normal")
                 has_h = _is_fill_channel_enabled(mat, node, layer, 'BUMP')
-                n_row.label(
-                    text="Normal: Replace Height Bump" if has_h else "Normal: Flat (Replaces Bump Below)",
+                n_split.label(
+                    text="Replace Height Bump" if has_h else "Flat (Replaces Below)",
                     icon='NORMALS_VERTEX_FACE',
                 )
 
             if _is_fill_channel_enabled(mat, node, layer, 'EMISSION'):
                 any_ch_on = True
                 non_color_ch_on = True
-                e_row = ch_val_col.row(align=True)
-                e_split = e_row.split(factor=0.34, align=True)
-                e_split.label(text="Emission", icon='LIGHT_SUN')
-                e_split.prop(layer, "fill_emission", text="")
+                ch_val_col.prop(layer, "fill_emission", text="Emission")
 
             if _is_fill_channel_enabled(mat, node, layer, 'SPECULAR'):
                 any_ch_on = True
@@ -7197,14 +7146,15 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
                 ch_val_col.prop(layer, "fill_specular", text="Specular", slider=True)
 
             if not any_ch_on:
-                off_row = ch_val_col.row(align=True)
+                off_row = insp_col.row(align=True)
                 off_row.enabled = False
-                off_row.label(text="All channels OFF — passes through from layers below", icon='INFO')
+                off_row.label(text="All channels OFF — passes through from below", icon='INFO')
             elif non_color_ch_on and is_view3d and getattr(space, "shading", None) and space.shading.type == 'SOLID':
+                insp_col.separator(factor=0.25)
                 sh_hint = insp_col.row(align=True)
                 sh_hint.operator(
                     "node.tex_paint_viewport_shading",
-                    text="Switch to PBR Viewport to See Roughness / Metallic / Height",
+                    text="Switch to PBR Viewport to Preview Channels",
                     icon='SHADING_RENDERED',
                 ).mode = 'MATERIAL'
 
@@ -7214,22 +7164,22 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
 
         elif layer.type == 'ADJUSTMENT':
             insp_col.separator(factor=0.25)
-            hsv_row = insp_col.row(align=True)
-            hsv_row.prop(layer, "adjust_hsv", index=0, text="Hue", slider=True)
-            hsv_row.prop(layer, "adjust_hsv", index=1, text="Sat", slider=True)
-            hsv_row.prop(layer, "adjust_hsv", index=2, text="Val", slider=True)
-            bc_row = insp_col.row(align=True)
-            bc_row.prop(layer, "adjust_bright_contrast", index=0, text="Brightness", slider=True)
-            bc_row.prop(layer, "adjust_bright_contrast", index=1, text="Contrast", slider=True)
+            adj_col = insp_col.column(align=True)
+            adj_col.use_property_split = True
+            adj_col.use_property_decorate = False
+            adj_col.prop(layer, "adjust_hsv", index=0, text="Hue", slider=True)
+            adj_col.prop(layer, "adjust_hsv", index=1, text="Saturation", slider=True)
+            adj_col.prop(layer, "adjust_hsv", index=2, text="Value", slider=True)
+            adj_col.prop(layer, "adjust_bright_contrast", index=0, text="Brightness", slider=True)
+            adj_col.prop(layer, "adjust_bright_contrast", index=1, text="Contrast", slider=True)
 
-        # 3D / UV Texture & Grunge Projection Controls (Works on both Fill Layers and Paint Layers!)
+        # Compact Texture / Grunge Projection Sub-Box (shown only when Texture is enabled on the layer)
         has_color_proj = (layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') != 'NONE')
         if has_color_proj:
             insp_col.separator(factor=0.35)
             proj_box = insp_col.box()
             proj_col = proj_box.column(align=True)
 
-            # Grunge / Image Picker Row for Textured Fill & Projected Paint Layers
             tex_row = proj_col.row(align=True)
             op_prv = tex_row.operator("node.tex_paint_fill_layer_texture", text="", icon='TRIA_LEFT')
             op_prv.action = 'PREV'
@@ -7250,32 +7200,25 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             hdr.prop(
                 layer,
                 "show_projection_widget",
-                text="2D UV Gizmo" if is_uv_color_proj else "3D Gizmo",
+                text="Gizmo",
                 toggle=True,
                 icon='GIZMO',
             )
-            if is_uv_color_proj:
-                hdr.operator("image.tex_paint_focus_uv_gizmo", text="UVs", icon='UV')
             if layer.type == 'PAINT':
                 hdr.operator("node.tex_paint_layer_bake_projection", text="Bake", icon='BRUSH_DATA')
 
-            if is_uv_color_proj:
-                uv_xf = proj_col.column(align=True)
-                sc_row = uv_xf.row(align=True)
-                sc_row.prop(layer, "proj_scale", index=0, text="Scale X", slider=True)
-                sc_row.prop(layer, "proj_scale", index=1, text="Scale Y", slider=True)
-                of_row = uv_xf.row(align=True)
-                of_row.prop(layer, "proj_location", index=0, text="Offset X", slider=True)
-                of_row.prop(layer, "proj_location", index=1, text="Offset Y", slider=True)
-                rt_row = uv_xf.row(align=True)
-                rt_row.prop(layer, "proj_rotation", index=2, text="Rotation", slider=True)
-            else:
-                sc3_row = proj_col.row(align=True)
-                sc3_row.prop(layer, "proj_scale", index=0, text="Scale X", slider=True)
-                sc3_row.prop(layer, "proj_scale", index=1, text="Y", slider=True)
-                sc3_row.prop(layer, "proj_scale", index=2, text="Z", slider=True)
+            sc_row = proj_col.row(align=True)
+            sc_row.prop(layer, "proj_scale", index=0, text="Scale X", slider=True)
+            sc_row.prop(layer, "proj_scale", index=1, text="Y", slider=True)
+            if not is_uv_color_proj:
+                sc_row.prop(layer, "proj_scale", index=2, text="Z", slider=True)
 
             if getattr(layer, "show_projection_widget", False):
+                if is_uv_color_proj:
+                    of_row = proj_col.row(align=True)
+                    of_row.prop(layer, "proj_location", index=0, text="Offset X", slider=True)
+                    of_row.prop(layer, "proj_location", index=1, text="Y", slider=True)
+                    of_row.prop(layer, "proj_rotation", index=2, text="Rot", slider=True)
                 act_row = proj_col.row(align=True)
                 if wm and hasattr(wm, "tex_paint_gizmo_mode"):
                     act_row.prop(wm, "tex_paint_gizmo_mode", expand=True)
@@ -7286,29 +7229,30 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
                 act_row.operator("node.tex_paint_gizmo_mode", text="", icon='LOOP_BACK').mode = 'RESET_LOC'
 
     # =======================================================================
-    # TAB B: LAYER MASK STACK INSPECTOR (Available on Paint, Fill & Adjustment!)
+    # TAB B: LAYER MASK STACK INSPECTOR
     # =======================================================================
     else:
-        insp_col.separator(factor=0.3)
+        insp_col.separator(factor=0.35)
         if not layer.use_mask:
-            info_row = insp_col.row(align=True)
-            info_row.label(text="Mask: None (Full Layer — affects entire surface)", icon='MOD_MASK')
-            init_row = insp_col.row(align=True)
-            op_bm2 = init_row.operator("node.tex_paint_mask_stack_init", text="Black Mask (Hide)", icon='SHADING_SOLID')
+            init_r1 = insp_col.row(align=True)
+            op_bm2 = init_r1.operator("node.tex_paint_mask_stack_init", text="Black Mask (Hide)", icon='SHADING_SOLID')
             op_bm2.mode = 'BLACK'
-            op_wm2 = init_row.operator("node.tex_paint_mask_stack_init", text="White Mask (Reveal)", icon='LIGHT_SUN')
+            op_wm2 = init_r1.operator("node.tex_paint_mask_stack_init", text="White Mask (Reveal)", icon='LIGHT_SUN')
             op_wm2.mode = 'WHITE'
+
+            insp_col.separator(factor=0.2)
+            init_r2 = insp_col.row(align=True)
+            init_r2.menu("TEXPAINT_MT_add_mask_effect", text="Add Mask Effect", icon='ADD')
             if not is_2d_only:
-                init_row.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Masks", icon='PRESET')
-            init_row.menu("TEXPAINT_MT_add_mask_effect", text="Add Effect", icon='ADD')
+                init_r2.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Masks", icon='PRESET')
         else:
             hdr_row = insp_col.row(align=True)
-            hdr_row.label(text=mask_status_lbl, icon='MOD_MASK')
+            hdr_row.menu("TEXPAINT_MT_add_mask_effect", text="Add Effect", icon='ADD')
             if not is_2d_only:
                 hdr_row.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Masks", icon='PRESET')
             act_sub = hdr_row.row(align=True)
             if hasattr(layer, "preview_mask"):
-                act_sub.prop(layer, "preview_mask", text="Inspect", toggle=True, icon='HIDE_OFF')
+                act_sub.prop(layer, "preview_mask", text="", toggle=True, icon='HIDE_OFF')
             act_sub.prop(layer, "invert_mask", text="", toggle=True, icon='ARROW_LEFTRIGHT')
             op_rem = act_sub.operator("node.tex_paint_mask_stack_init", text="", icon='X')
             op_rem.mode = 'REMOVE'
