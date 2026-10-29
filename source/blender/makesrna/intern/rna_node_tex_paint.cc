@@ -79,7 +79,19 @@ void rna_ShaderNodeTexPaint_active_layer_index_range(
 void rna_ShaderNodeTexPaint_active_layer_index_set(PointerRNA *ptr, int value)
 {
   bNode *node = ptr->data_as<bNode>();
-  BKE_tex_paint_layer_active_set(*static_cast<NodeTexPaint *>(node->storage), value);
+  NodeTexPaint *data = static_cast<NodeTexPaint *>(node->storage);
+  bool had_preview_mask = false;
+  if (TexPaintLayer *prev = BKE_tex_paint_layer_active(*data)) {
+    if (prev->flag & TEXPAINT_LAYER_PREVIEW_MASK) {
+      prev->flag &= ~TEXPAINT_LAYER_PREVIEW_MASK;
+      had_preview_mask = true;
+    }
+  }
+  BKE_tex_paint_layer_active_set(*data, value);
+  if (had_preview_mask) {
+    BKE_tex_paint_cache_invalidate(*data);
+    BKE_tex_paint_composite_full(*node);
+  }
 }
 
 PointerRNA rna_ShaderNodeTexPaint_active_layer_get(PointerRNA *ptr)
@@ -154,6 +166,20 @@ static void rna_TexPaintLayer_redraw_update(Main * /*bmain*/, Scene * /*scene*/,
   if (bNode *node = rna_TexPaintLayer_node(ptr)) {
     tex_paint_tag_redraw(*node);
   }
+}
+
+static void rna_TexPaintLayer_preview_mask_update(Main * /*bmain*/,
+                                                  Scene * /*scene*/,
+                                                  PointerRNA *ptr)
+{
+  bNode *node = rna_TexPaintLayer_node(ptr);
+  if (node == nullptr) {
+    return;
+  }
+  NodeTexPaint *data = static_cast<NodeTexPaint *>(node->storage);
+  BKE_tex_paint_cache_invalidate(*data);
+  BKE_tex_paint_composite_full(*node);
+  tex_paint_tag_redraw(*node);
 }
 
 static const Mesh *find_mesh_for_ntree(Main *bmain, const bNodeTree *ntree)
@@ -275,19 +301,34 @@ static const EnumPropertyItem tex_paint_layer_type_items[] = {
 };
 
 static const EnumPropertyItem tex_paint_layer_proj_mode_items[] = {
-    {0, "NONE", ICON_BRUSH_DATA, "Hand Painted", "Standard hand-painted layer"},
-    {1, "FIT", ICON_IMAGE_PLANE, "UV Fit / Stamp", "2D UV fit or stamp"},
-    {2, "UV_REPEAT", ICON_TEXTURE, "UV Tile Repeat", "2D UV tile repeat"},
+    {0, "NONE", ICON_BRUSH_DATA, "None (Baked)", "Standard baked paint layer without live projection"},
+    {1, "FIT", ICON_IMAGE_PLANE, "UV Projection (Clamp)", "2D UV single stamp / fit"},
+    {2, "UV_REPEAT", ICON_TEXTURE, "UV Projection (Tile)", "2D UV tile repeat"},
     {3,
      "TRIPLANAR",
      ICON_MESH_CUBE,
-     "3D Triplanar Box",
+     "Triplanar Projection",
      "3D triplanar box projection with interactive 3D viewport widget"},
     {4,
      "DECAL",
      ICON_MOD_UVPROJECT,
-     "3D Planar Decal",
-     "3D surface decal projection with interactive 3D viewport widget"},
+     "Planar / Decal Projection",
+     "3D directional planar decal projection with interactive 3D viewport widget"},
+    {5,
+     "WARP",
+     ICON_MOD_WARP,
+     "Warp Projection",
+     "Substance-Painter-style 3D surface-curving warp projection"},
+    {6,
+     "SPHERICAL",
+     ICON_MESH_UVSPHERE,
+     "Spherical Projection",
+     "3D spherical projection around the widget center"},
+    {7,
+     "CYLINDRICAL",
+     ICON_MESH_CYLINDER,
+     "Cylindrical Projection",
+     "3D cylindrical projection around the widget Z axis"},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -513,6 +554,16 @@ static void rna_def_tex_paint_layer(BlenderRNA *brna)
   RNA_def_property_ui_text(prop, "Invert Mask", "Invert the layer mask");
   RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
   RNA_def_property_update(prop, 0, "rna_TexPaintLayer_update");
+
+  prop = RNA_def_property(srna, "preview_mask", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "flag", TEXPAINT_LAYER_PREVIEW_MASK);
+  RNA_def_property_ui_icon(prop, ICON_HIDE_OFF, 0);
+  RNA_def_property_ui_text(
+      prop,
+      "Inspect Mask on Surface",
+      "Temporarily display this layer's grayscale mask directly on the 3D surface and 2D canvas");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_TexPaintLayer_preview_mask_update");
 
   prop = RNA_def_property(srna, "fill_color", PROP_FLOAT, PROP_COLOR);
   RNA_def_property_array(prop, 4);

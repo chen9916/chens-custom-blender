@@ -45,6 +45,8 @@ enum eTexPaintLayerFlag {
   TEXPAINT_LAYER_MASK_INVERT = (1 << 5),
   /** Show the interactive 3D projection widget in the 3D Viewport when this layer is active. */
   TEXPAINT_LAYER_SHOW_WIDGET = (1 << 6),
+  /** Temporarily preview this layer's grayscale mask directly on the composited master image. */
+  TEXPAINT_LAYER_PREVIEW_MASK = (1 << 7),
 };
 
 /** #NodeTexPaint::paint_target */

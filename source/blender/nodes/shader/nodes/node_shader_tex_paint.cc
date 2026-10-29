@@ -24,6 +24,8 @@
 
 #include "BLO_read_write.hh"
 
+#include "RNA_access.hh"
+
 #include "UI_interface_layout.hh"
 #include "UI_resources.hh"
 
@@ -107,7 +109,16 @@ static void node_draw_buttons(ui::Layout &layout, bContext * /*C*/, PointerRNA *
   if (const TexPaintLayer *active = BKE_tex_paint_layer_active(data)) {
     const bool paint_mask = data.paint_target == TEXPAINT_TARGET_MASK;
     col.label(active->name, paint_mask ? ICON_MOD_MASK : ICON_BRUSH_DATA);
+    if (active->flag & TEXPAINT_LAYER_USE_MASK) {
+      ui::Layout &tgt_row = col.row(true);
+      tgt_row.prop(ptr, "paint_target", ui::ITEM_R_EXPAND, "", ICON_NONE);
+    }
   }
+  ui::Layout &act_row = col.row(true);
+  PointerRNA op_paint = act_row.op("NODE_OT_tex_paint_layer_add", IFACE_("+ Paint"), ICON_BRUSH_DATA);
+  RNA_enum_set(&op_paint, "type", TEXPAINT_LAYER_PAINT);
+  PointerRNA op_fill = act_row.op("NODE_OT_tex_paint_layer_add", IFACE_("+ Fill"), ICON_COLOR);
+  RNA_enum_set(&op_fill, "type", TEXPAINT_LAYER_FILL);
 
   layout.prop(ptr, "interpolation", UI_ITEM_NONE, "", ICON_NONE);
   layout.prop(ptr, "projection", UI_ITEM_NONE, "", ICON_NONE);

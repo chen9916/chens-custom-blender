@@ -39,6 +39,9 @@ enum eTexPaintProjectionMode {
   TEXPAINT_PROJ_UV_REPEAT = 2,
   TEXPAINT_PROJ_TRIPLANAR = 3,
   TEXPAINT_PROJ_VIEW_DECAL = 4,
+  TEXPAINT_PROJ_WARP = 5,
+  TEXPAINT_PROJ_SPHERICAL = 6,
+  TEXPAINT_PROJ_CYLINDRICAL = 7,
 };
 
 struct TexPaintProjectionParams {
@@ -49,6 +52,7 @@ struct TexPaintProjectionParams {
   float blend_falloff = 0.5f;
   bool clear_layer = true;
   bool use_layer_widget = false;
+  bool repeat_uv = true;
 
   const Mesh *mesh = nullptr;
   float ob_to_world[4][4] = {};

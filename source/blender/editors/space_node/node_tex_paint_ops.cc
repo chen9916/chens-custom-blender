@@ -120,7 +120,10 @@ static bNode *tex_paint_node_from_context(bContext *C, bNodeTree **r_ntree)
     }
   }
 
-  if (SpaceImage *sima = CTX_wm_space_image(C); sima && sima->image) {
+  if (SpaceImage *sima = CTX_wm_space_image(C)) {
+    if (sima->image == nullptr) {
+      return nullptr;
+    }
     if (Object *ob = CTX_data_active_object(C)) {
       if (Material *ma = BKE_object_material_get(ob, ob->actcol); ma && ma->nodetree) {
         if (bNode *node = BKE_tex_paint_node_find_by_image(*ma->nodetree, sima->image)) {
@@ -138,7 +141,14 @@ static bNode *tex_paint_node_from_context(bContext *C, bNodeTree **r_ntree)
           }
         }
       }
+      for (bNodeTree &ntree : bmain->nodetrees) {
+        if (bNode *node = BKE_tex_paint_node_find_by_image(ntree, sima->image)) {
+          *r_ntree = &ntree;
+          return node;
+        }
+      }
     }
+    return nullptr;
   }
 
   Object *ob = CTX_data_active_object(C);
@@ -515,23 +525,38 @@ static const EnumPropertyItem projection_mode_items[] = {
     {TEXPAINT_PROJ_UV_FIT,
      "FIT",
      ICON_IMAGE_DATA,
-     "Fit to Canvas (UV)",
+     "UV Projection (Clamp)",
      "Fit or position the image in 2D UV space"},
     {TEXPAINT_PROJ_UV_REPEAT,
      "UV_REPEAT",
      ICON_TEXTURE,
-     "Repeat on UV (2D Tile)",
+     "UV Projection (Tile)",
      "Tile and repeat the image across the UV map"},
     {TEXPAINT_PROJ_TRIPLANAR,
      "TRIPLANAR",
      ICON_MESH_CUBE,
-     "Repeat on Model (3D Box)",
+     "Triplanar Projection (3D Box)",
      "Repeat the image seamlessly across the entire 3D model using triplanar box projection"},
     {TEXPAINT_PROJ_VIEW_DECAL,
      "DECAL",
      ICON_MOD_UVPROJECT,
-     "Decal on Surface (3D View)",
+     "Planar / Decal Projection (3D)",
      "Project the image as a surface decal from the current 3D Viewport angle"},
+    {TEXPAINT_PROJ_WARP,
+     "WARP",
+     ICON_MOD_WARP,
+     "Warp Projection (3D Surface)",
+     "Substance-Painter-style 3D projection that warps and curves around mesh geometry"},
+    {TEXPAINT_PROJ_SPHERICAL,
+     "SPHERICAL",
+     ICON_MESH_UVSPHERE,
+     "Spherical Projection (3D)",
+     "Wrap the image spherically around the 3D model"},
+    {TEXPAINT_PROJ_CYLINDRICAL,
+     "CYLINDRICAL",
+     ICON_MESH_CYLINDER,
+     "Cylindrical Projection (3D)",
+     "Wrap the image cylindrically around the 3D model"},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -622,7 +647,11 @@ static void init_layer_projection_widget(bContext *C,
   const float max_extent = std::max({bbox_size.x, bbox_size.y, bbox_size.z, 1e-3f});
   const float img_aspect = float(src_ibuf.x) / float(std::max(src_ibuf.y, 1));
 
-  if (params.mode == TEXPAINT_PROJ_TRIPLANAR) {
+  if (ELEM(params.mode,
+           TEXPAINT_PROJ_TRIPLANAR,
+           TEXPAINT_PROJ_SPHERICAL,
+           TEXPAINT_PROJ_CYLINDRICAL))
+  {
     const float sx = max_extent * 0.5f / std::max(params.scale[0], 0.01f);
     const float sy = max_extent * 0.5f / std::max(params.scale[1], 0.01f);
     layer.proj_location[0] = bbox_center.x + params.offset[0] * max_extent;
@@ -633,10 +662,11 @@ static void init_layer_projection_widget(bContext *C,
     layer.proj_rotation[2] = params.rotation;
     layer.proj_scale[0] = sx;
     layer.proj_scale[1] = sy;
-    layer.proj_scale[2] = sx;
+    layer.proj_scale[2] = (params.mode == TEXPAINT_PROJ_TRIPLANAR) ? sx : -sx;
     params.use_layer_widget = true;
+    params.repeat_uv = true;
   }
-  else if (params.mode == TEXPAINT_PROJ_VIEW_DECAL) {
+  else if (ELEM(params.mode, TEXPAINT_PROJ_VIEW_DECAL, TEXPAINT_PROJ_WARP)) {
     float3 col0(1.0f, 0.0f, 0.0f);
     float3 col1(0.0f, 1.0f, 0.0f);
     float3 col2(0.0f, 0.0f, 1.0f);

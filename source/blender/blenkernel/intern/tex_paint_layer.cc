@@ -1053,9 +1053,41 @@ struct LayerEval {
 
 }  // namespace
 
+static bool is_active_layer_previewing_mask(NodeTexPaint &data)
+{
+  const TexPaintLayer *active = BKE_tex_paint_layer_active(data);
+  return active != nullptr && (active->flag & TEXPAINT_LAYER_PREVIEW_MASK) != 0 &&
+         (active->flag & TEXPAINT_LAYER_USE_MASK) != 0 &&
+         buffer_matches_canvas(data, active->mask_ibuf);
+}
+
 static Vector<LayerEval> build_layer_evals(NodeTexPaint &data)
 {
   BKE_tex_paint_ensure_all_ibufs(data);
+
+  if (is_active_layer_previewing_mask(data)) {
+    const TexPaintLayer *active = BKE_tex_paint_layer_active(data);
+    Vector<LayerEval> mask_evals;
+    LayerEval black_base;
+    black_base.type = TEXPAINT_LAYER_FILL;
+    black_base.blend_mode = 0;
+    black_base.visible = true;
+    black_base.opacity = 1.0f;
+    black_base.fill = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    mask_evals.append(black_base);
+
+    LayerEval white_masked;
+    white_masked.type = TEXPAINT_LAYER_FILL;
+    white_masked.blend_mode = 0;
+    white_masked.visible = true;
+    white_masked.opacity = 1.0f;
+    white_masked.fill = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    white_masked.use_mask = true;
+    white_masked.mask = PixelSource(active->mask_ibuf);
+    white_masked.mask_invert = (active->flag & TEXPAINT_LAYER_MASK_INVERT) != 0;
+    mask_evals.append(white_masked);
+    return mask_evals;
+  }
 
   Vector<LayerEval> evals;
   for (TexPaintLayer &layer : data.layers) {
@@ -1177,7 +1209,7 @@ static void composite_full_with_cache(NodeTexPaint &data, ImBuf &master)
 {
   TexPaintRuntime &runtime = runtime_ensure(data);
   const Vector<LayerEval> layers = build_layer_evals(data);
-  const int active = data.active_layer_index;
+  const int active = is_active_layer_previewing_mask(data) ? 1 : data.active_layer_index;
 
   PixelTarget cache_target;
   if (active > 0 && active < layers.size()) {
@@ -1288,10 +1320,11 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
   }
 
   TexPaintRuntime &runtime = runtime_ensure(data);
-  const bool needs_cache = data.active_layer_index > 0;
+  const int eff_active_idx = is_active_layer_previewing_mask(data) ? 1 : data.active_layer_index;
+  const bool needs_cache = eff_active_idx > 0;
   const bool cache_usable = !needs_cache ||
                             (runtime.cache_valid &&
-                             runtime.cache_active_index == data.active_layer_index &&
+                             runtime.cache_active_index == eff_active_idx &&
                              buffer_matches_canvas(data, runtime.cache_below));
 
   if (!cache_usable || !runtime_is_composited(data, *master)) {
@@ -1302,7 +1335,7 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
   }
   else {
     const Vector<LayerEval> layers = build_layer_evals(data);
-    const int start = needs_cache ? data.active_layer_index : 0;
+    const int start = needs_cache ? eff_active_idx : 0;
     const PixelSource backdrop = needs_cache ? PixelSource(runtime.cache_below) : PixelSource();
     composite_region(
         layers, region, data.width, backdrop, start, PixelTarget(), -1, PixelTarget(master));
@@ -2211,14 +2244,21 @@ bool BKE_tex_paint_layer_project_imbuf(NodeTexPaint &data,
 
   int mode = params.mode;
   VArraySpan<float2> uv_map;
-  if (ELEM(mode, TEXPAINT_PROJ_TRIPLANAR, TEXPAINT_PROJ_VIEW_DECAL)) {
+  if (ELEM(mode,
+           TEXPAINT_PROJ_TRIPLANAR,
+           TEXPAINT_PROJ_VIEW_DECAL,
+           TEXPAINT_PROJ_WARP,
+           TEXPAINT_PROJ_SPHERICAL,
+           TEXPAINT_PROJ_CYLINDRICAL))
+  {
     if (params.mesh != nullptr) {
       const bke::AttributeAccessor attributes = params.mesh->attributes();
       const StringRef uv_name = params.mesh->active_uv_map_name();
       uv_map = *attributes.lookup<float2>(uv_name, bke::AttrDomain::Corner);
     }
     if (uv_map.is_empty()) {
-      mode = (mode == TEXPAINT_PROJ_TRIPLANAR) ? TEXPAINT_PROJ_UV_REPEAT : TEXPAINT_PROJ_UV_FIT;
+      mode = (mode == TEXPAINT_PROJ_TRIPLANAR || params.repeat_uv) ? TEXPAINT_PROJ_UV_REPEAT :
+                                                                     TEXPAINT_PROJ_UV_FIT;
     }
     else if (mode == TEXPAINT_PROJ_VIEW_DECAL && !params.has_view && !params.use_layer_widget) {
       mode = TEXPAINT_PROJ_UV_FIT;
@@ -2333,8 +2373,8 @@ bool BKE_tex_paint_layer_project_imbuf(NodeTexPaint &data,
         continue;
       }
 
-      /* Fast 3D Tile AABB culling for Decal mode with 3D widget. */
-      if (mode == TEXPAINT_PROJ_VIEW_DECAL && params.use_layer_widget) {
+      /* Fast 3D Tile AABB culling for non-repeating Decal mode with 3D widget. */
+      if (mode == TEXPAINT_PROJ_VIEW_DECAL && params.use_layer_widget && !params.repeat_uv) {
         const float3 tc = (tile.bbox_min + tile.bbox_max) * 0.5f - w_loc;
         const float3 th = (tile.bbox_max - tile.bbox_min) * 0.5f;
         const float r0 = th.x * std::abs(w_col0.x) + th.y * std::abs(w_col0.y) +
@@ -2394,23 +2434,116 @@ bool BKE_tex_paint_layer_project_imbuf(NodeTexPaint &data,
           weights /= weight_sum;
 
           if (weights.x > 1e-3f) {
-            sampled += sample_source_bilinear(
-                           src, src_is_float, dst_is_float, src_w, src_h, uv_yz, true) *
+            sampled += sample_source_bilinear(src,
+                                              src_is_float,
+                                              dst_is_float,
+                                              src_w,
+                                              src_h,
+                                              uv_yz,
+                                              params.repeat_uv) *
                        weights.x;
           }
           if (weights.y > 1e-3f) {
-            sampled += sample_source_bilinear(
-                           src, src_is_float, dst_is_float, src_w, src_h, uv_xz, true) *
+            sampled += sample_source_bilinear(src,
+                                              src_is_float,
+                                              dst_is_float,
+                                              src_w,
+                                              src_h,
+                                              uv_xz,
+                                              params.repeat_uv) *
                        weights.y;
           }
           if (weights.z > 1e-3f) {
-            sampled += sample_source_bilinear(
-                           src, src_is_float, dst_is_float, src_w, src_h, uv_xy, true) *
+            sampled += sample_source_bilinear(src,
+                                              src_is_float,
+                                              dst_is_float,
+                                              src_w,
+                                              src_h,
+                                              uv_xy,
+                                              params.repeat_uv) *
                        weights.z;
           }
         }
+        else if (mode == TEXPAINT_PROJ_WARP) {
+          /* Substance-Painter-style 3D Surface Warp Projection: unfolds radial arc-length across
+           * surface depth and bends projection coordinates along local surface normal curvature. */
+          const float3 n_loc = to_widget_dir(N);
+          const float facing = n_loc.z;
+          if (facing <= -0.45f) {
+            if (params.clear_layer && had_prev) {
+              dst.write(texel.pixel_idx, float4(0.0f));
+            }
+            continue;
+          }
+          const float3 p_rel = to_widget_dir(P - w_loc);
+          const float z_norm = p_rel.z * inv_w_scale.z;
+          if (std::abs(z_norm) > 1.5f) {
+            if (params.clear_layer && had_prev) {
+              dst.write(texel.pixel_idx, float4(0.0f));
+            }
+            continue;
+          }
+          const float warp_fac = std::clamp(params.blend_falloff * 1.6f, 0.0f, 1.6f);
+          const float r_xy = std::hypot(p_rel.x, p_rel.y);
+          const float z_warp = p_rel.z * warp_fac;
+          const float arc_mul = (r_xy > 1e-5f) ?
+                                    (std::hypot(r_xy, z_warp) / r_xy) :
+                                    1.0f;
+          const float curv_bend = warp_fac * 0.42f *
+                                  (1.0f - std::clamp(facing, -0.25f, 1.0f));
+          const float2 warp_xy(
+              p_rel.x * arc_mul * inv_w_scale.x + n_loc.x * curv_bend,
+              p_rel.y * arc_mul * inv_w_scale.y + n_loc.y * curv_bend);
+          if (!params.repeat_uv &&
+              (std::abs(warp_xy.x) > 1.0f || std::abs(warp_xy.y) > 1.0f))
+          {
+            if (params.clear_layer && had_prev) {
+              dst.write(texel.pixel_idx, float4(0.0f));
+            }
+            continue;
+          }
+          const float depth_fade = std::clamp((1.5f - std::abs(z_norm)) * 2.5f, 0.0f, 1.0f);
+          const float angle_fade = std::clamp((facing + 0.45f) * (1.0f / 0.65f), 0.0f, 1.0f);
+          const float2 warp_uv = warp_xy * 0.5f + 0.5f;
+          sampled = sample_source_bilinear(
+              src, src_is_float, dst_is_float, src_w, src_h, warp_uv, params.repeat_uv);
+          sampled.w *= depth_fade * angle_fade;
+          if (sampled.w <= 0.0f) {
+            if (params.clear_layer && had_prev) {
+              dst.write(texel.pixel_idx, float4(0.0f));
+            }
+            continue;
+          }
+        }
+        else if (ELEM(mode, TEXPAINT_PROJ_SPHERICAL, TEXPAINT_PROJ_CYLINDRICAL)) {
+          const float3 p_rel = to_widget_dir(P - w_loc);
+          const float u_ang = std::atan2(p_rel.y, p_rel.x) * (1.0f / (2.0f * float(M_PI)));
+          float v_coord = 0.0f;
+          if (mode == TEXPAINT_PROJ_SPHERICAL) {
+            const float r_len = std::max(math::length(p_rel), 1e-6f);
+            v_coord = 0.5f - std::acos(std::clamp(p_rel.z / r_len, -1.0f, 1.0f)) *
+                                 (1.0f / float(M_PI));
+          }
+          else {
+            v_coord = p_rel.z * inv_w_scale.y * 0.5f;
+          }
+          const float ref_ext = std::max(max_extent * 0.5f, 1e-3f);
+          const float su = ref_ext * inv_w_scale.x;
+          const float sv = (mode == TEXPAINT_PROJ_SPHERICAL) ? (ref_ext * inv_w_scale.y) : 1.0f;
+          const float2 raw_uv(u_ang * su + 0.5f, v_coord * sv + 0.5f);
+          if (!params.repeat_uv &&
+              (raw_uv.x < 0.0f || raw_uv.x > 1.0f || raw_uv.y < 0.0f || raw_uv.y > 1.0f))
+          {
+            if (params.clear_layer && had_prev) {
+              dst.write(texel.pixel_idx, float4(0.0f));
+            }
+            continue;
+          }
+          sampled = sample_source_bilinear(
+              src, src_is_float, dst_is_float, src_w, src_h, raw_uv, params.repeat_uv);
+        }
         else {
-          /* TEXPAINT_PROJ_VIEW_DECAL */
+          /* TEXPAINT_PROJ_VIEW_DECAL (Planar 3D Projection) */
           if (params.use_layer_widget) {
             const float facing = math::dot(N, w_col2);
             if (facing <= 0.05f) {
@@ -2420,7 +2553,9 @@ bool BKE_tex_paint_layer_project_imbuf(NodeTexPaint &data,
               continue;
             }
             const float3 p_loc = to_widget_pt(P);
-            if (std::abs(p_loc.x) > 1.0f || std::abs(p_loc.y) > 1.0f || std::abs(p_loc.z) > 1.0f) {
+            if (std::abs(p_loc.z) > 1.0f ||
+                (!params.repeat_uv && (std::abs(p_loc.x) > 1.0f || std::abs(p_loc.y) > 1.0f)))
+            {
               if (params.clear_layer && had_prev) {
                 dst.write(texel.pixel_idx, float4(0.0f));
               }
@@ -2432,7 +2567,7 @@ bool BKE_tex_paint_layer_project_imbuf(NodeTexPaint &data,
 
             const float2 decal_uv = float2(p_loc.x, p_loc.y) * 0.5f + 0.5f;
             sampled = sample_source_bilinear(
-                src, src_is_float, dst_is_float, src_w, src_h, decal_uv, false);
+                src, src_is_float, dst_is_float, src_w, src_h, decal_uv, params.repeat_uv);
             sampled.w *= facing_alpha;
             if (sampled.w <= 0.0f) {
               if (params.clear_layer && had_prev) {
@@ -2563,6 +2698,8 @@ bool BKE_tex_paint_layer_reproject(Main &bmain,
   params.offset[0] = layer.proj_location[0];
   params.offset[1] = layer.proj_location[1];
   params.rotation = layer.proj_rotation[2];
+  params.repeat_uv = (layer.proj_mode == TEXPAINT_PROJ_TRIPLANAR) ? (layer.proj_scale[2] >= 0.0f) :
+                                                                     (layer.proj_scale[2] < 0.0f);
   params.mesh = mesh;
 
   const bool ok = BKE_tex_paint_layer_project_imbuf(data, layer, *src_ibuf, params, r_dirty_rect);
