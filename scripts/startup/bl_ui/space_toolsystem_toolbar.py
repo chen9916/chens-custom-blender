@@ -2705,6 +2705,86 @@ class _defs_image_generic:
         )
 
 
+class _defs_image_paint_edit:
+    @staticmethod
+    def _selection_settings(context, layout, tool, operator, wand=False):
+        props = tool.operator_properties(operator)
+        layout.prop(props, "mode", text="", expand=True, icon_only=True)
+        if wand:
+            layout.prop(props, "tolerance")
+            layout.prop(props, "contiguous")
+            layout.prop(props, "sample_merged")
+        from bl_ui.properties_tex_paint_layers import tex_paint_node_from_context
+        if tex_paint_node_from_context(context) is None:
+            layout.operator("image.tex_paint_2d_layer_mode", text="Enable Layers").action = 'ENABLE_LAYERS'
+
+    @ToolDef.from_fn
+    def wand():
+        return dict(
+            idname="builtin.image_select_wand", label="Magic Wand",
+            icon="ops.paint.eyedropper_add", widget=None,
+            keymap="Image Editor Tool: Paint, Magic Wand",
+            draw_settings=lambda c, l, t: _defs_image_paint_edit._selection_settings(
+                c, l, t, "image.paint_select_wand", True),
+        )
+
+    @ToolDef.from_fn
+    def lasso():
+        return dict(
+            idname="builtin.image_select_lasso", label="Lasso Select",
+            icon="ops.generic.select_lasso", widget=None,
+            keymap="Image Editor Tool: Paint, Lasso Select",
+            draw_settings=lambda c, l, t: _defs_image_paint_edit._selection_settings(
+                c, l, t, "image.paint_select_lasso"),
+        )
+
+    @ToolDef.from_fn
+    def box():
+        return dict(
+            idname="builtin.image_select_box", label="Box Select",
+            icon="ops.generic.select_box", widget=None,
+            keymap="Image Editor Tool: Paint, Box Select",
+            draw_settings=lambda c, l, t: _defs_image_paint_edit._selection_settings(
+                c, l, t, "image.paint_select_box"),
+        )
+
+    @ToolDef.from_fn
+    def transform():
+        return dict(
+            idname="builtin.image_transform", label="Transform Pixels",
+            icon="ops.transform.translate", widget=None,
+            keymap="Image Editor Tool: Paint, Transform Pixels",
+            draw_settings=lambda _c, l, t: l.prop(
+                t.operator_properties("image.paint_transform"), "mode", text="", expand=True),
+        )
+
+    @ToolDef.from_fn
+    def projection():
+        return dict(
+            idname="builtin.image_projection", label="Transform Projection",
+            icon="ops.transform.transform", widget=None,
+            keymap="Image Editor Tool: Paint, Transform Projection",
+            draw_settings=lambda _c, l, _t: l.label(text="Projection mapping"),
+        )
+
+    @staticmethod
+    def _gradient_settings(_context, layout, tool):
+        props = tool.operator_properties("image.tex_paint_2d_gradient")
+        layout.prop(props, "gradient_type", text="")
+        layout.prop(props, "blend_target", text="")
+        layout.prop(props, "opacity")
+        layout.prop(props, "reverse", text="Reverse")
+
+    @ToolDef.from_fn
+    def gradient():
+        return dict(
+            idname="builtin.image_gradient", label="Gradient",
+            icon="ops.paint.weight_gradient", widget=None,
+            keymap="Image Editor Tool: Paint, Gradient",
+            draw_settings=lambda c, l, t: _defs_image_paint_edit._gradient_settings(c, l, t),
+        )
+
+
 class _defs_image_mask_transform:
 
     @ToolDef.from_fn
@@ -3702,11 +3782,17 @@ class IMAGE_PT_tools_active(ToolSelectPanelHelper, Panel):
             # *_tools_mask_primitive,
         ],
         'PAINT': [
+            _defs_image_paint_edit.wand,
+            _defs_image_paint_edit.lasso,
+            _defs_image_paint_edit.box,
+            (_defs_image_paint_edit.transform, _defs_image_paint_edit.projection),
+            None,
             _brush_tool,
             _defs_texture_paint.blur,
             _defs_texture_paint.smear,
             _defs_texture_paint.clone,
             _defs_texture_paint.fill,
+            _defs_image_paint_edit.gradient,
             _defs_texture_paint.mask,
             None,
             *_tools_annotate,

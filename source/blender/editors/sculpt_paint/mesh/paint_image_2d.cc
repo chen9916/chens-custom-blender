@@ -12,6 +12,7 @@
 #include "MEM_guardedalloc.h"
 
 #include "DNA_brush_types.h"
+#include "DNA_node_tex_paint_types.h"
 #include "DNA_scene_types.h"
 #include "DNA_space_types.h"
 
@@ -1461,6 +1462,25 @@ static int paint_2d_op(void *state,
 
   /* blend into canvas */
   for (a = 0; a < tot; a++) {
+    ushort *original_tex_mask = tile->cache.tex_mask;
+    Array<ushort> selection_mask;
+    if (s->tex_paint_node &&
+        static_cast<NodeTexPaint *>(s->tex_paint_node->storage)->selection_active)
+    {
+      selection_mask.reinitialize(int64_t(frombuf->x) * frombuf->y);
+      for (int y = 0; y < frombuf->y; y++) {
+        for (int x = 0; x < frombuf->x; x++) {
+          const int i = y * frombuf->x + x;
+          const float coverage = BKE_tex_paint_selection_value(
+              *s->tex_paint_node,
+              region[a].destx + x - region[a].srcx,
+              region[a].desty + y - region[a].srcy);
+          selection_mask[i] = ushort((original_tex_mask ? original_tex_mask[i] : 65535) *
+                                     coverage);
+        }
+      }
+      tile->cache.tex_mask = selection_mask.data();
+    }
     ED_imapaint_dirty_region(s->image,
                              canvas,
                              &tile->iuser,
@@ -1539,6 +1559,7 @@ static int paint_2d_op(void *state,
                              IMB_BlendMode(blend),
                              false);
     }
+    tile->cache.tex_mask = original_tex_mask;
   }
 
   if (s->layer_alpha_lock) {
@@ -1964,6 +1985,39 @@ static ImageUser *paint_2d_get_tile_iuser(ImagePaintState *s, int tile_number)
   return iuser;
 }
 
+/* Fill tools operate on the complete buffer; apply the same document selection and alpha lock
+ * used by brush dabs before publishing their result. The snapshot is only needed when restricted.
+ */
+static Array<float4> paint_2d_fill_snapshot(bNode *node, const ImBuf &image)
+{
+  if (node && (!BKE_tex_paint_selection(*static_cast<NodeTexPaint *>(node->storage)).is_empty() ||
+               BKE_tex_paint_stroke_locks_alpha(*node)))
+  {
+    return BKE_tex_paint_pixels_read(image);
+  }
+  return {};
+}
+
+static void paint_2d_fill_restrict(bNode &node, ImBuf &image, const Span<float4> before)
+{
+  if (before.is_empty()) {
+    return;
+  }
+  Array<float4> after = BKE_tex_paint_pixels_read(image);
+  const bool lock_alpha = BKE_tex_paint_stroke_locks_alpha(node);
+  for (const int64_t i : after.index_range()) {
+    const float coverage = BKE_tex_paint_selection_value(node, i % image.x, i / image.x);
+    after[i] = before[i] + (after[i] - before[i]) * coverage;
+    if (lock_alpha) {
+      const float ratio = after[i].w > 0 ? before[i].w / after[i].w : 0;
+      after[i] = after[i].w > 0 ? after[i] * ratio : before[i];
+      after[i].w = before[i].w;
+    }
+  }
+  const rcti full = {0, image.x, 0, image.y};
+  BKE_tex_paint_pixels_write(image, after, full);
+}
+
 void paint_2d_bucket_fill(const bContext *C,
                           const float color[3],
                           Brush *br,
@@ -2023,6 +2077,7 @@ void paint_2d_bucket_fill(const bContext *C,
     }
   }
 
+  const Array<float4> layer_before = paint_2d_fill_snapshot(tex_paint_node, *ibuf);
   do_float = (ibuf->float_data() != nullptr);
   /* First check if our image is float. If it is we should correct the color to be in linear space.
    */
@@ -2077,7 +2132,7 @@ void paint_2d_bucket_fill(const bContext *C,
     x_px = image_init[0] * ibuf->x;
     y_px = image_init[1] * ibuf->y;
 
-    if (x_px >= ibuf->x || x_px < 0 || y_px > ibuf->y || y_px < 0) {
+    if (x_px >= ibuf->x || x_px < 0 || y_px >= ibuf->y || y_px < 0) {
       BKE_image_release_ibuf(ima, acquired_ibuf, nullptr);
       return;
     }
@@ -2170,6 +2225,7 @@ void paint_2d_bucket_fill(const bContext *C,
   }
 
   if (tex_paint_node) {
+    paint_2d_fill_restrict(*tex_paint_node, *ibuf, layer_before);
     BKE_tex_paint_stroke_update(*tex_paint_node, ibuf, get_imapaintpartial()->dirty_region);
   }
   else {
@@ -2204,6 +2260,7 @@ void paint_2d_gradient_fill(
     return;
   }
 
+  paint_2d_transform_mouse(s->v2d, mouse_init, image_init);
   float uv_origin[2];
   int tile_number = BKE_image_get_tile_from_pos(ima, image_init, image_init, uv_origin);
   ImageUser *iuser = paint_2d_get_tile_iuser(s, tile_number);
@@ -2242,6 +2299,7 @@ void paint_2d_gradient_fill(
   line_len_sq_inv = 1.0f / line_len;
   line_len = sqrtf(line_len);
 
+  const Array<float4> layer_before = paint_2d_fill_snapshot(tex_paint_node, *ibuf);
   do_float = (ibuf->float_data() != nullptr);
 
   /* this will be substituted by something else when selection is available */
@@ -2308,6 +2366,7 @@ void paint_2d_gradient_fill(
   }
 
   if (tex_paint_node) {
+    paint_2d_fill_restrict(*tex_paint_node, *ibuf, layer_before);
     BKE_tex_paint_stroke_update(*tex_paint_node, ibuf, get_imapaintpartial()->dirty_region);
   }
   else {

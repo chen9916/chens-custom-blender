@@ -12,8 +12,10 @@
  * happens in straight alpha with 32-bit floats and is written back in the buffer convention.
  */
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 #include <fmt/format.h>
 
@@ -54,6 +56,7 @@
 #include "BKE_node_runtime.hh"
 #include "BKE_packedFile.hh"
 #include "BKE_tex_paint_layer.hh"
+#include "BKE_tex_paint_mask.hh"
 
 #include "IMB_colormanagement.hh"
 #include "IMB_imbuf.hh"
@@ -94,8 +97,22 @@ struct UVTile {
   bool has_prev_pixels = false;
 };
 
+/** Derived pixels of a layer containing spatial effects; never used as a paint target. */
+struct LayerFilterCache {
+  int layer_uid = 0;
+  int width = 0, height = 0;
+  const ImBuf *source = nullptr;
+  uint64_t settings_hash = 0;
+  bool valid = false;
+  bool dirty = false;
+  rcti dirty_rect = {0, 0, 0, 0};
+  Array<float4, 0> pixels;
+};
+
 /** Runtime state owned by #NodeTexPaint::runtime. */
 struct TexPaintRuntime {
+  Vector<int2> selection_contours;
+  bool selection_contours_valid = false;
   /**
    * Flattened composite of layers `[0, cache_active_index)` in the canvas buffer format.
    * Only allocated when the active layer is not the bottom layer.
@@ -103,6 +120,9 @@ struct TexPaintRuntime {
   ImBuf *cache_below = nullptr;
   int cache_active_index = -1;
   bool cache_valid = false;
+  Vector<LayerFilterCache> filtered_layers;
+  bool effects_dirty = false;
+  rcti effects_dirty_rect = {0, 0, 0, 0};
 
   /**
    * Master image buffer that was last fully composited. Used to detect buffers re-created by the
@@ -163,6 +183,62 @@ static void runtime_free(NodeTexPaint &data)
 
 using namespace bke::tex_paint;
 
+void BKE_tex_paint_selection_tag_changed(NodeTexPaint &data)
+{
+  if (data.runtime) {
+    static_cast<TexPaintRuntime *>(data.runtime)->selection_contours_valid = false;
+  }
+}
+
+Span<int2> BKE_tex_paint_selection_contours(NodeTexPaint &data)
+{
+  const Span<float> selection = BKE_tex_paint_selection(data);
+  if (selection.is_empty()) {
+    return {};
+  }
+  TexPaintRuntime &runtime = runtime_ensure(data);
+  if (runtime.selection_contours_valid) {
+    return runtime.selection_contours;
+  }
+  Vector<int2> &lines = runtime.selection_contours;
+  lines.clear();
+  auto selected = [&](int x, int y) {
+    return x >= 0 && y >= 0 && x < data.width && y < data.height &&
+           selection[y * data.width + x] >= 0.5f;
+  };
+  /* Merge adjacent edges into runs. Zooming/panning only projects these cached endpoints. */
+  for (int y = 0; y <= data.height; y++) {
+    int start = -1;
+    for (int x = 0; x <= data.width; x++) {
+      const bool edge = x < data.width && selected(x, y - 1) != selected(x, y);
+      if (edge && start < 0) {
+        start = x;
+      }
+      else if (!edge && start >= 0) {
+        lines.append(int2(start, y));
+        lines.append(int2(x, y));
+        start = -1;
+      }
+    }
+  }
+  for (int x = 0; x <= data.width; x++) {
+    int start = -1;
+    for (int y = 0; y <= data.height; y++) {
+      const bool edge = y < data.height && selected(x - 1, y) != selected(x, y);
+      if (edge && start < 0) {
+        start = y;
+      }
+      else if (!edge && start >= 0) {
+        lines.append(int2(x, start));
+        lines.append(int2(x, y));
+        start = -1;
+      }
+    }
+  }
+  runtime.selection_contours_valid = true;
+  return lines;
+}
+
 void BKE_tex_paint_cache_invalidate(NodeTexPaint &data)
 {
   if (data.runtime == nullptr) {
@@ -171,6 +247,9 @@ void BKE_tex_paint_cache_invalidate(NodeTexPaint &data)
   TexPaintRuntime &runtime = *static_cast<TexPaintRuntime *>(data.runtime);
   runtime.cache_valid = false;
   runtime.cache_active_index = -1;
+  for (LayerFilterCache &cache : runtime.filtered_layers) {
+    cache.valid = false;
+  }
 }
 
 /** \} */
@@ -211,10 +290,31 @@ static void layer_free_packed(TexPaintLayer &layer)
   }
 }
 
+static void layer_filters_clear(TexPaintLayer &layer)
+{
+  for (TexPaintColorFilter &filter : layer.color_filters.items_mutable()) {
+    MEM_delete(&filter);
+  }
+  layer.color_filters.clear_no_delete();
+  layer.active_color_filter_index = 0;
+}
+
+static void layer_filters_copy(TexPaintLayer &dst, const TexPaintLayer &src)
+{
+  dst.color_filters.clear_no_delete();
+  for (const TexPaintColorFilter &filter : src.color_filters) {
+    TexPaintColorFilter *copy = MEM_new<TexPaintColorFilter>(__func__, dna::shallow_copy(filter));
+    copy->next = copy->prev = nullptr;
+    BLI_addtail(&dst.color_filters, copy);
+  }
+}
+
 static void layer_free(TexPaintLayer *layer)
 {
+  BKE_tex_paint_mask_effects_clear(*layer);
   layer_free_buffers(*layer);
   layer_free_packed(*layer);
+  layer_filters_clear(*layer);
   MEM_delete(layer);
 }
 
@@ -313,7 +413,10 @@ static ImBuf *unpack_buffer(const NodeTexPaint &data, const PackedFile *pf)
   if (pf == nullptr || pf->data == nullptr || pf->size <= 0) {
     return nullptr;
   }
-  const ImBufFlags flags = data.is_float ? ImBufFlags::FloatData : ImBufFlags::ByteData;
+  /* EXR stores our premultiplied floats, whereas PNG stores straight bytes.
+   * Detect the format's alpha convention so a reload does not multiply floats twice. */
+  const ImBufFlags flags = (data.is_float ? ImBufFlags::FloatData : ImBufFlags::ByteData) |
+                          ImBufFlags::AlphaDetect;
   ImBuf *ibuf = IMB_load_image_from_memory(
       static_cast<const uchar *>(pf->data), size_t(pf->size), flags, "tex_paint_layer");
   if (ibuf == nullptr) {
@@ -340,6 +443,7 @@ static ImBuf *unpack_buffer(const NodeTexPaint &data, const PackedFile *pf)
 
 void BKE_tex_paint_storage_free_contents(NodeTexPaint &data)
 {
+  BKE_tex_paint_selection_clear(data);
   for (TexPaintLayer &layer : data.layers.items_mutable()) {
     layer_free(&layer);
   }
@@ -353,6 +457,29 @@ void BKE_tex_paint_storage_copy_contents(NodeTexPaint &dst,
 {
   dst.layers.clear_no_delete();
   dst.runtime = nullptr;
+  dst.selection = nullptr;
+  dst.selection_size = 0;
+  dst.selection_active = 0;
+  dst.selection_transform_source = nullptr;
+  dst.selection_transform_mask = nullptr;
+  dst.selection_transform_size = 0;
+  dst.selection_transform_layer_uid = 0;
+  if (copy_pixels && !BKE_tex_paint_selection(src).is_empty()) {
+    BKE_tex_paint_selection_set(dst, BKE_tex_paint_selection(src));
+  }
+  if (copy_pixels && src.selection_transform_source && src.selection_transform_size > 0) {
+    BKE_tex_paint_selection_transform_store(
+        dst,
+        {reinterpret_cast<const float4 *>(src.selection_transform_source),
+         src.selection_transform_size},
+        src.selection_transform_mask ?
+            Span<float>(src.selection_transform_mask, src.selection_transform_size) :
+            Span<float>());
+    std::copy_n(&src.selection_transform[0][0], 9, &dst.selection_transform[0][0]);
+    dst.selection_transform_layer_uid = src.selection_transform_layer_uid;
+    dst.selection_transform_target = src.selection_transform_target;
+    dst.selection_transform_hash = src.selection_transform_hash;
+  }
   for (const TexPaintLayer &src_layer : src.layers) {
     TexPaintLayer *layer = MEM_new<TexPaintLayer>(__func__, dna::shallow_copy(src_layer));
     layer->next = layer->prev = nullptr;
@@ -363,6 +490,8 @@ void BKE_tex_paint_storage_copy_contents(NodeTexPaint &dst,
     layer->mask_ibuf = nullptr;
     layer->pbr_ibuf = nullptr;
     layer->runtime_dirty = 0;
+    layer_filters_copy(*layer, src_layer);
+    BKE_tex_paint_mask_effects_copy(*layer, src_layer, copy_pixels);
     if (copy_pixels) {
       /* Packed data is implicitly shared, so this is cheap. */
       layer->pf = src_layer.pf ? BKE_packedfile_duplicate(src_layer.pf) : nullptr;
@@ -412,12 +541,24 @@ static void layer_update_packed(const NodeTexPaint &data, TexPaintLayer &layer)
 
 void BKE_tex_paint_blend_write(BlendWriter &writer, const NodeTexPaint &data)
 {
+  if (data.selection_transform_source) {
+    writer.write_float_array(int64_t(data.selection_transform_size) * 4,
+                             data.selection_transform_source);
+    if (data.selection_transform_mask) {
+      writer.write_float_array(data.selection_transform_size, data.selection_transform_mask);
+    }
+  }
+  if (data.selection) {
+    writer.write_float_array(data.selection_size, data.selection);
+  }
   for (const TexPaintLayer &layer_const : data.layers) {
     /* Encoding only updates the persistent cache of the runtime pixels. */
     layer_update_packed(data, const_cast<TexPaintLayer &>(layer_const));
   }
   writer.write_struct_list(&data.layers);
   for (const TexPaintLayer &layer : data.layers) {
+    writer.write_struct_list(&layer.color_filters);
+    BKE_tex_paint_mask_effects_blend_write(writer, data, layer);
     if (layer.pf) {
       BKE_packedfile_blend_write(&writer, layer.pf);
     }
@@ -433,6 +574,30 @@ void BKE_tex_paint_blend_write(BlendWriter &writer, const NodeTexPaint &data)
 void BKE_tex_paint_blend_read_data(BlendDataReader &reader, NodeTexPaint &data)
 {
   data.runtime = nullptr;
+  /* Remap owned arrays before any cleanup; an unrestricted selection may still have a
+   * whole-layer transform source. */
+  const bool transform_source_read = BLO_read_array(
+      &reader, &data.selection_transform_source, int64_t(data.selection_transform_size) * 4);
+  const bool transform_mask_read = data.selection_transform_mask == nullptr ||
+                                   BLO_read_array(&reader,
+                                                  &data.selection_transform_mask,
+                                                  data.selection_transform_size);
+  if (!transform_source_read || !transform_mask_read || !data.selection_transform_source ||
+      int64_t(data.selection_transform_size) != int64_t(data.width) * data.height)
+  {
+    BKE_tex_paint_selection_transform_clear(data);
+  }
+  const bool selection_read = BLO_read_array(&reader, &data.selection, data.selection_size);
+  if (!selection_read || int64_t(data.selection_size) != int64_t(data.width) * data.height ||
+      !data.selection)
+  {
+    if (data.selection) {
+      MEM_delete(data.selection);
+      data.selection = nullptr;
+    }
+    data.selection_size = 0;
+    data.selection_active = 0;
+  }
   data.image.iuser.scene = nullptr;
   data.pbr_iuser.scene = nullptr;
   data.emission_iuser.scene = nullptr;
@@ -443,6 +608,10 @@ void BKE_tex_paint_blend_read_data(BlendDataReader &reader, NodeTexPaint &data)
   }
   BLO_read_struct_list(&reader, TexPaintLayer, &data.layers);
   for (TexPaintLayer &layer : data.layers) {
+    BLO_read_struct_list(&reader, TexPaintColorFilter, &layer.color_filters);
+    BKE_tex_paint_mask_effects_blend_read(reader, layer);
+    layer.active_color_filter_index = std::clamp(
+        layer.active_color_filter_index, 0, std::max(0, layer.color_filters.count() - 1));
     layer.ibuf = nullptr;
     layer.mask_ibuf = nullptr;
     layer.pbr_ibuf = nullptr;
@@ -471,6 +640,11 @@ void BKE_tex_paint_blend_read_data(BlendDataReader &reader, NodeTexPaint &data)
 /* -------------------------------------------------------------------- */
 /** \name Canvas and Layers
  * \{ */
+
+bool BKE_tex_paint_tree_shares_channel_layers(const bNodeTree *ntree)
+{
+  return ntree != nullptr && !STREQ(ntree->id.name + 2, ".TexPaint_2D_Layers");
+}
 
 bool BKE_tex_paint_is_initialized(const bNode &node)
 {
@@ -583,6 +757,8 @@ TexPaintLayer *BKE_tex_paint_layer_add(NodeTexPaint &data, const char *name, con
 TexPaintLayer *BKE_tex_paint_layer_duplicate(NodeTexPaint &data, const TexPaintLayer &src)
 {
   TexPaintLayer *layer = MEM_new<TexPaintLayer>(__func__, dna::shallow_copy(src));
+  layer_filters_copy(*layer, src);
+  BKE_tex_paint_mask_effects_copy(*layer, src, true);
   layer->next = layer->prev = nullptr;
   layer->uid = data.next_layer_uid++;
   layer->pf = src.pf ? BKE_packedfile_duplicate(src.pf) : nullptr;
@@ -601,6 +777,14 @@ void BKE_tex_paint_layer_remove(NodeTexPaint &data, TexPaintLayer &layer)
   const int index = BLI_findindex(&data.layers, &layer);
   if (index == -1) {
     return;
+  }
+  if (data.runtime) {
+    TexPaintRuntime &runtime = *static_cast<TexPaintRuntime *>(data.runtime);
+    for (int i = runtime.filtered_layers.size() - 1; i >= 0; i--) {
+      if (runtime.filtered_layers[i].layer_uid == layer.uid) {
+        runtime.filtered_layers.remove_and_reorder(i);
+      }
+    }
   }
   BLI_remlink(&data.layers, &layer);
   layer_free(&layer);
@@ -755,6 +939,7 @@ bool BKE_tex_paint_canvas_resize(NodeTexPaint &data, const int width, const int 
   if (width <= 0 || height <= 0) {
     return false;
   }
+  BKE_tex_paint_selection_clear(data);
   BKE_tex_paint_ensure_all_ibufs(data);
   for (TexPaintLayer &layer : data.layers) {
     if (layer.ibuf) {
@@ -763,6 +948,7 @@ bool BKE_tex_paint_canvas_resize(NodeTexPaint &data, const int width, const int 
     if (layer.mask_ibuf) {
       IMB_scale(layer.mask_ibuf, width, height, IMBScaleFilter::Bilinear);
     }
+    BKE_tex_paint_mask_effects_resize(layer, width, height);
     if (layer.pbr_ibuf) {
       IMB_scale(layer.pbr_ibuf, width, height, IMBScaleFilter::Bilinear);
     }
@@ -876,7 +1062,8 @@ ImBuf *BKE_tex_paint_paint_target_ibuf(NodeTexPaint &data)
     if ((layer->flag & TEXPAINT_LAYER_USE_MASK) == 0) {
       return nullptr;
     }
-    return BKE_tex_paint_layer_ensure_mask_ibuf(data, *layer);
+    return layer->mask_effects_active ? BKE_tex_paint_mask_paint_target(data, *layer) :
+                                        BKE_tex_paint_layer_ensure_mask_ibuf(data, *layer);
   }
   if (layer->type != TEXPAINT_LAYER_PAINT) {
     /* Fill/Adjustment layers cannot be directly brush-painted in Color mode. */
@@ -905,10 +1092,18 @@ const char *BKE_tex_paint_stroke_block_reason(const bNode &node)
     if ((layer->flag & TEXPAINT_LAYER_USE_MASK) == 0) {
       return "Layer has no mask — initialize a Black or White Mask first";
     }
+    if (layer->mask_effects_active) {
+      const TexPaintMaskEffect *effect = BKE_tex_paint_mask_effect_find(
+          *const_cast<TexPaintLayer *>(layer), layer->active_mask_effect_uid);
+      if (!effect || effect->type != TEXPAINT_MASK_EFFECT_PAINT || !effect->enabled) {
+        return "Select an enabled Paint effect in the mask stack before painting";
+      }
+    }
     return nullptr;
   }
   if (layer->type == TEXPAINT_LAYER_FILL) {
-    return "Cannot paint directly on a Fill Layer — add a Paint Layer, or select its Mask to paint";
+    return "Cannot paint directly on a Fill Layer — add a Paint Layer, or select its Mask to "
+           "paint";
   }
   if (layer->type == TEXPAINT_LAYER_ADJUSTMENT) {
     return "Cannot paint directly on an Adjustment Layer — select its Mask to paint";
@@ -1143,6 +1338,58 @@ struct PixelTarget {
   }
 };
 
+static float3 color_filter_apply(const TexPaintColorFilter &filter, const float3 color)
+{
+  float3 adjusted = color;
+  const float zero[3] = {0.0f, 0.0f, 0.0f};
+  switch (filter.type) {
+    case TEXPAINT_COLOR_FILTER_HSV:
+      adjusted = adjust_color(color, filter.hsv, zero);
+      break;
+    case TEXPAINT_COLOR_FILTER_BRIGHT_CONTRAST:
+      adjusted = adjust_color(color, zero, filter.bright_contrast);
+      break;
+    case TEXPAINT_COLOR_FILTER_LEVELS: {
+      const float range = std::max(filter.input_white - filter.input_black, 1e-6f);
+      const float exponent = 1.0f / std::max(filter.gamma, 0.01f);
+      for (int channel = 0; channel < 3; channel++) {
+        const float value = std::max((color[channel] - filter.input_black) / range, 0.0f);
+        adjusted[channel] = filter.output_black +
+                            std::pow(value, exponent) *
+                                (filter.output_white - filter.output_black);
+      }
+      break;
+    }
+    case TEXPAINT_COLOR_FILTER_INVERT:
+      adjusted = math::max(float3(1.0f) - color, float3(0.0f));
+      break;
+    case TEXPAINT_COLOR_FILTER_GRAYSCALE:
+      adjusted = float3(lum(color));
+      break;
+    case TEXPAINT_COLOR_FILTER_BLUR:
+      /* Spatial evaluation is prepared once before pixel composition. */
+      break;
+  }
+  return math::interpolate(color, adjusted, std::clamp(filter.strength, 0.0f, 1.0f));
+}
+
+static int color_filter_blur_radius(const TexPaintColorFilter &filter)
+{
+  return filter.enabled && filter.type == TEXPAINT_COLOR_FILTER_BLUR && filter.strength > 0.0f &&
+                 std::isfinite(filter.blur_radius) ?
+             std::clamp(int(std::ceil(filter.blur_radius)), 0, 128) :
+             0;
+}
+
+static int layer_filter_support(const TexPaintLayer &layer)
+{
+  int support = 0;
+  for (const TexPaintColorFilter &filter : layer.color_filters) {
+    support += color_filter_blur_radius(filter);
+  }
+  return support;
+}
+
 /** Pre-resolved evaluation data of one layer. */
 struct LayerEval {
   int type = TEXPAINT_LAYER_PAINT;
@@ -1164,6 +1411,21 @@ struct LayerEval {
   float3 fill_emission = float3(1.0f, 0.45f, 0.1f);
   float hsv[3] = {0.0f, 0.0f, 0.0f};
   float bright_contrast[2] = {0.0f, 0.0f};
+  const ListBaseT<TexPaintColorFilter> *color_filters = nullptr;
+
+  float3 filtered_color(float3 color) const
+  {
+    if (color_filters == nullptr) {
+      return color;
+    }
+    for (const TexPaintColorFilter &filter : *color_filters) {
+      if (!filter.enabled || filter.strength <= 0.0f) {
+        continue;
+      }
+      color = color_filter_apply(filter, color);
+    }
+    return color;
+  }
 
   float mask_value(const size_t i) const
   {
@@ -1201,12 +1463,14 @@ struct LayerEval {
           return;
         }
         const float4 src = color.read(i);
-        composite_over(dst, src.xyz(), src.w * opacity * mask_value(i) * clip, blend_mode);
+        composite_over(
+            dst, filtered_color(src.xyz()), src.w * opacity * mask_value(i) * clip, blend_mode);
         break;
       }
       case TEXPAINT_LAYER_FILL: {
         const float4 src = color.is_valid() ? (color.read(i) * fill) : fill;
-        composite_over(dst, src.xyz(), src.w * opacity * mask_value(i) * clip, blend_mode);
+        composite_over(
+            dst, filtered_color(src.xyz()), src.w * opacity * mask_value(i) * clip, blend_mode);
         break;
       }
       case TEXPAINT_LAYER_ADJUSTMENT: {
@@ -1323,11 +1587,328 @@ static bool is_active_layer_previewing_mask(NodeTexPaint &data)
          buffer_matches_canvas(data, active->mask_ibuf);
 }
 
-static Vector<LayerEval> build_layer_evals(NodeTexPaint &data)
+static rcti filter_rect_expanded(const NodeTexPaint &data, rcti rect, const int support)
+{
+  if (BLI_rcti_is_empty(&rect)) {
+    return rect;
+  }
+  rect.xmin = std::max(0, rect.xmin - support);
+  rect.ymin = std::max(0, rect.ymin - support);
+  rect.xmax = std::min(data.width, rect.xmax + support);
+  rect.ymax = std::min(data.height, rect.ymax + support);
+  return rect;
+}
+
+void BKE_tex_paint_layer_effects_expand_rect(const NodeTexPaint &data,
+                                             const TexPaintLayer &layer,
+                                             rcti &rect)
+{
+  rect = filter_rect_expanded(data, rect, layer_filter_support(layer));
+}
+
+static uint64_t filter_settings_hash(const TexPaintLayer &layer, const float4 &fill)
+{
+  uint64_t hash = 1469598103934665603ull;
+  const auto add = [&](const void *data, const size_t size) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    for (const size_t i : IndexRange(size)) {
+      hash = (hash ^ bytes[i]) * 1099511628211ull;
+    }
+  };
+  add(&layer.type, sizeof(layer.type));
+  add(&fill, sizeof(fill));
+  for (const TexPaintColorFilter &filter : layer.color_filters) {
+    /* Parameters contain no pointers, names or unused padding. */
+    add(&filter.type, sizeof(filter) - offsetof(TexPaintColorFilter, type));
+  }
+  return hash;
+}
+
+/** Box blur in premultiplied RGBA, retaining all contributions needed by `output_rect`. */
+static Array<float4> filter_blur_region(const Span<float4> input,
+                                        const rcti &input_rect,
+                                        const rcti &output_rect,
+                                        const int canvas_width,
+                                        const int canvas_height,
+                                        const int radius,
+                                        const float strength)
+{
+  const int in_width = BLI_rcti_size_x(&input_rect);
+  const int in_height = BLI_rcti_size_y(&input_rect);
+  const int out_width = BLI_rcti_size_x(&output_rect);
+  const int out_height = BLI_rcti_size_y(&output_rect);
+  const double normalization = 1.0 / double(2 * radius + 1);
+  Array<float4> horizontal(size_t(out_width) * in_height);
+  threading::parallel_for(IndexRange(in_height), 16, [&](const IndexRange rows) {
+    for (const int y : rows) {
+      const auto value = [&](const int x) {
+        return input[size_t(y) * in_width + std::clamp(x, 0, canvas_width - 1) - input_rect.xmin];
+      };
+      /* Keep zero coverage exact. Float running-sum cancellation otherwise
+       * leaves tile-dependent RGB noise when tiny alpha is unpremultiplied. */
+      double4 sum(0.0);
+      for (int dx = -radius; dx <= radius; dx++) {
+        sum += double4(value(output_rect.xmin + dx));
+      }
+      for (int x = 0; x < out_width; x++) {
+        horizontal[size_t(y) * out_width + x] = float4(sum * normalization);
+        if (x + 1 < out_width) {
+          sum += double4(value(output_rect.xmin + x + radius + 1));
+          sum -= double4(value(output_rect.xmin + x - radius));
+        }
+      }
+    }
+  });
+  Array<float4> output(size_t(out_width) * out_height);
+  threading::parallel_for(IndexRange(out_width), 16, [&](const IndexRange columns) {
+    for (const int x : columns) {
+      const auto value = [&](const int y) {
+        return horizontal[size_t(std::clamp(y, 0, canvas_height - 1) - input_rect.ymin) *
+                              out_width +
+                          x];
+      };
+      double4 sum(0.0);
+      for (int dy = -radius; dy <= radius; dy++) {
+        sum += double4(value(output_rect.ymin + dy));
+      }
+      for (int y = 0; y < out_height; y++) {
+        const size_t old_index = size_t(output_rect.ymin + y - input_rect.ymin) * in_width +
+                                 output_rect.xmin + x - input_rect.xmin;
+        output[size_t(y) * out_width + x] = math::interpolate(
+            input[old_index], float4(sum * normalization), strength);
+        if (y + 1 < out_height) {
+          sum += double4(value(output_rect.ymin + y + radius + 1));
+          sum -= double4(value(output_rect.ymin + y - radius));
+        }
+      }
+    }
+  });
+  return output;
+}
+
+static PixelSource filtered_layer_source(NodeTexPaint &data,
+                                         TexPaintLayer &layer,
+                                         const LayerEval &eval)
+{
+  TexPaintRuntime &runtime = runtime_ensure(data);
+  LayerFilterCache *cache = nullptr;
+  for (LayerFilterCache &candidate : runtime.filtered_layers) {
+    if (candidate.layer_uid == layer.uid) {
+      cache = &candidate;
+      break;
+    }
+  }
+  if (cache == nullptr) {
+    runtime.filtered_layers.append({});
+    cache = &runtime.filtered_layers.last();
+    cache->layer_uid = layer.uid;
+  }
+  const uint64_t settings_hash = filter_settings_hash(layer, eval.fill);
+  if (cache->width != data.width || cache->height != data.height ||
+      cache->source != layer.ibuf || cache->settings_hash != settings_hash)
+  {
+    cache->valid = false;
+    cache->width = data.width;
+    cache->height = data.height;
+    cache->source = layer.ibuf;
+    cache->settings_hash = settings_hash;
+  }
+  if (!cache->valid || cache->dirty) {
+    const int support = layer_filter_support(layer);
+    const rcti full = {0, data.width, 0, data.height};
+    const rcti output_rect = cache->valid ?
+                                  filter_rect_expanded(data, cache->dirty_rect, support) :
+                                  full;
+    rcti stage_rect = filter_rect_expanded(data, output_rect, support);
+    int stage_width = BLI_rcti_size_x(&stage_rect);
+    Array<float4> stage(size_t(stage_width) * BLI_rcti_size_y(&stage_rect));
+    threading::parallel_for(IndexRange(BLI_rcti_size_y(&stage_rect)), 16, [&](const IndexRange rows) {
+      for (const int y : rows) {
+        for (int x = 0; x < stage_width; x++) {
+          const size_t index = size_t(y + stage_rect.ymin) * data.width + stage_rect.xmin + x;
+          const float4 source = eval.color.read(index) *
+                                (layer.type == TEXPAINT_LAYER_FILL ? eval.fill : float4(1.0f));
+          straight_to_premul_v4_v4(stage[size_t(y) * stage_width + x], source);
+        }
+      }
+    });
+    int remaining_support = support;
+    for (const TexPaintColorFilter &filter : layer.color_filters) {
+      if (!filter.enabled || filter.strength <= 0.0f) {
+        continue;
+      }
+      const int radius = color_filter_blur_radius(filter);
+      if (radius > 0) {
+        remaining_support -= radius;
+        const rcti next_rect = filter_rect_expanded(data, output_rect, remaining_support);
+        stage = filter_blur_region(stage,
+                                   stage_rect,
+                                   next_rect,
+                                   data.width,
+                                   data.height,
+                                   radius,
+                                   std::clamp(filter.strength, 0.0f, 1.0f));
+        stage_rect = next_rect;
+        stage_width = BLI_rcti_size_x(&stage_rect);
+      }
+      else if (filter.type != TEXPAINT_COLOR_FILTER_BLUR) {
+        threading::parallel_for(stage.index_range(), 4096, [&](const IndexRange range) {
+          for (const int64_t i : range) {
+            float4 straight;
+            premul_to_straight_v4_v4(straight, stage[i]);
+            straight = float4(color_filter_apply(filter, straight.xyz()), straight.w);
+            straight_to_premul_v4_v4(stage[i], straight);
+          }
+        });
+      }
+    }
+    if (cache->pixels.size() != size_t(data.width) * data.height) {
+      cache->pixels.reinitialize(size_t(data.width) * data.height);
+    }
+    const int output_width = BLI_rcti_size_x(&output_rect);
+    for (int y = output_rect.ymin; y < output_rect.ymax; y++) {
+      const size_t source_index = size_t(y - stage_rect.ymin) * stage_width +
+                                  output_rect.xmin - stage_rect.xmin;
+      const size_t target_index = size_t(y) * data.width + output_rect.xmin;
+      cache->pixels.as_mutable_span().slice(target_index, output_width).copy_from(
+          stage.as_span().slice(source_index, output_width));
+    }
+    cache->valid = true;
+    cache->dirty = false;
+  }
+  PixelSource result;
+  result.floats = reinterpret_cast<const float *>(cache->pixels.data());
+  return result;
+}
+
+bool BKE_tex_paint_layer_rasterize(NodeTexPaint &data, TexPaintLayer &layer, const bool check_only)
+{
+  if (layer.type != TEXPAINT_LAYER_FILL || data.width <= 0 || data.height <= 0 ||
+      BLI_findindex(&data.layers, &layer) == -1)
+  {
+    return false;
+  }
+  using BufferOwner = std::unique_ptr<ImBuf, decltype(&IMB_freeImBuf)>;
+  BufferOwner decoded_color(nullptr, IMB_freeImBuf);
+  BufferOwner decoded_pbr(nullptr, IMB_freeImBuf);
+  const ImBuf *source = layer.ibuf;
+  const ImBuf *pbr_source = layer.pbr_ibuf;
+  if (!source && layer.pf) {
+    decoded_color.reset(unpack_buffer(data, layer.pf));
+    source = decoded_color.get();
+    if (!source) {
+      return false;
+    }
+  }
+  if (!pbr_source && layer.pbr_pf) {
+    decoded_pbr.reset(unpack_buffer(data, layer.pbr_pf));
+    pbr_source = decoded_pbr.get();
+    if (!pbr_source) {
+      return false;
+    }
+  }
+  if ((source && !buffer_matches_canvas(data, source)) ||
+      (pbr_source && !buffer_matches_canvas(data, pbr_source)) ||
+      (layer.proj_mode != TEXPAINT_PROJ_NONE && !source))
+  {
+    return false;
+  }
+  const float4 fill = canvas_color_from_scene_linear(data, layer.fill_color);
+  const bool spatial_filters = layer_filter_support(layer) > 0;
+  /* A projected Fill historically exposes texture alpha, without fill alpha, as its clipping
+   * base. Paint has a single RGBA coverage for both color and clipping. Do not silently change
+   * clipped layers when those two coverages cannot be represented by one paint buffer. */
+  if (source && !spatial_filters && fill.w != 1.0f &&
+      (layer.flag & TEXPAINT_LAYER_CLIPPING) == 0 && layer.next &&
+      (layer.next->flag & TEXPAINT_LAYER_CLIPPING))
+  {
+    return false;
+  }
+  const int channels = (layer.flag & TEXPAINT_LAYER_CHANNELS_INIT) ?
+                           layer.channel_flags :
+                           TEXPAINT_CHAN_COLOR | TEXPAINT_CHAN_ROUGHNESS | TEXPAINT_CHAN_METALLIC |
+                               TEXPAINT_CHAN_HEIGHT;
+  const bool bake_height = source && !pbr_source && (channels & TEXPAINT_CHAN_HEIGHT) &&
+                           layer.fill_height != 0.0f;
+  BufferOwner raster(canvas_buffer_alloc(data), IMB_freeImBuf);
+  BufferOwner raster_pbr(bake_height ? canvas_buffer_alloc(data) : nullptr, IMB_freeImBuf);
+  if (!raster || (bake_height && !raster_pbr)) {
+    return false;
+  }
+  const PixelSource raw(source);
+  const PixelTarget destination(raster.get());
+  const int64_t count = int64_t(data.width) * data.height;
+  threading::parallel_for(IndexRange(count), 4096, [&](const IndexRange range) {
+    for (const int64_t i : range) {
+      destination.write(i, source ? raw.read(i) * fill : fill);
+    }
+  });
+  if (source) {
+    layer_buffer_assign_colorspace(source, *raster);
+  }
+  if (bake_height) {
+    PixelSource height_source = raw;
+    if (spatial_filters) {
+      /* The normal Fill evaluator folds the entire color effect stack into its spatial cache.
+       * Preserve that currently evaluated height modulation without baking the editable effects
+       * a second time into the color source. Discard derived caches before/after this one-off
+       * read. */
+      runtime_free(data);
+      LayerEval old_eval;
+      old_eval.type = TEXPAINT_LAYER_FILL;
+      old_eval.color = raw;
+      old_eval.fill = fill;
+      height_source = filtered_layer_source(data, layer, old_eval);
+    }
+    const PixelTarget pbr_destination(raster_pbr.get());
+    const float roughness = std::clamp(layer.fill_roughness, 0.0f, 1.0f);
+    const float metallic = std::clamp(layer.fill_metallic, 0.0f, 1.0f);
+    const float height = std::clamp(layer.fill_height, -1.0f, 1.0f);
+    threading::parallel_for(IndexRange(count), 4096, [&](const IndexRange range) {
+      for (const int64_t i : range) {
+        const float4 texture = height_source.read(i);
+        const float modulation = lum(texture.xyz());
+        const float value = std::clamp(
+            0.5f + 0.5f * height * (modulation * 2.0f - 1.0f), 0.0f, 1.0f);
+        const float coverage = texture.w * (spatial_filters ? 1.0f : fill.w);
+        pbr_destination.write(i, float4(roughness, metallic, value, coverage));
+      }
+    });
+  }
+  if (check_only) {
+    runtime_free(data);
+    return true;
+  }
+  /* Commit after every source has been read and every replacement buffer allocated. Masks,
+   * native Paint coverage, filters, opacity, clipping and all channel parameters keep ownership.
+   */
+  if (layer.ibuf) {
+    IMB_freeImBuf(layer.ibuf);
+  }
+  layer.ibuf = raster.release();
+  if (layer.pf) {
+    BKE_packedfile_free(layer.pf);
+    layer.pf = nullptr;
+  }
+  if (raster_pbr) {
+    layer.pbr_ibuf = raster_pbr.release();
+  }
+  layer.type = TEXPAINT_LAYER_PAINT;
+  layer.flag |= TEXPAINT_LAYER_CHANNELS_INIT;
+  layer.flag &= ~TEXPAINT_LAYER_SHOW_WIDGET;
+  layer.channel_flags = channels;
+  layer.proj_mode = TEXPAINT_PROJ_NONE;
+  layer.proj_image_name[0] = '\0';
+  runtime_free(data);
+  BKE_tex_paint_layer_pixels_changed(data, layer, nullptr);
+  return true;
+}
+
+static Vector<LayerEval> build_layer_evals(NodeTexPaint &data, const bool use_mask_preview = true)
 {
   BKE_tex_paint_ensure_all_ibufs(data);
 
-  if (is_active_layer_previewing_mask(data)) {
+  if (use_mask_preview && is_active_layer_previewing_mask(data)) {
     const TexPaintLayer *active = BKE_tex_paint_layer_active(data);
     Vector<LayerEval> mask_evals;
     LayerEval black_base;
@@ -1393,6 +1974,12 @@ static Vector<LayerEval> build_layer_evals(NodeTexPaint &data)
     eval.fill_emission = canvas_color_from_scene_linear(data, em_rgba).xyz();
     copy_v3_v3(eval.hsv, layer.adjust_hsv);
     copy_v2_v2(eval.bright_contrast, layer.adjust_bright_contrast);
+    eval.color_filters = &layer.color_filters;
+    if (eval.visible && eval.color.is_valid() && layer_filter_support(layer) > 0) {
+      eval.color = filtered_layer_source(data, layer, eval);
+      eval.fill = float4(1.0f);
+      eval.color_filters = nullptr;
+    }
     evals.append(eval);
   }
   return evals;
@@ -1514,6 +2101,7 @@ static void composite_full_with_cache(NodeTexPaint &data, ImBuf &master)
 
   runtime.cache_valid = cache_target.is_valid();
   runtime.cache_active_index = runtime.cache_valid ? active : -1;
+  runtime.effects_dirty = false;
 }
 
 static void master_mark_updated(ImBuf &master, const rcti *rect)
@@ -1708,6 +2296,7 @@ bool BKE_tex_paint_composite_full(bNode &node)
     return false;
   }
   NodeTexPaint &data = *static_cast<NodeTexPaint *>(node.storage);
+  BKE_tex_paint_cache_invalidate(data);
   void *lock;
   ImBuf *master = master_acquire(node, data, &lock);
   if (master == nullptr) {
@@ -1729,6 +2318,10 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
   NodeTexPaint &data = *static_cast<NodeTexPaint *>(node.storage);
   rcti region;
   canvas_rect_clamp(data, rect, region);
+  TexPaintRuntime &runtime = runtime_ensure(data);
+  if (runtime.effects_dirty) {
+    BLI_rcti_union(&region, &runtime.effects_dirty_rect);
+  }
   if (BLI_rcti_is_empty(&region)) {
     return true;
   }
@@ -1739,7 +2332,6 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
     return false;
   }
 
-  TexPaintRuntime &runtime = runtime_ensure(data);
   const int eff_active_idx = is_active_layer_previewing_mask(data) ? 1 : data.active_layer_index;
   const bool needs_cache = eff_active_idx > 0;
   const bool cache_usable = !needs_cache ||
@@ -1764,6 +2356,7 @@ bool BKE_tex_paint_composite_rect(bNode &node, const rcti *rect)
     master_mark_updated(*master, &region);
     BKE_image_release_ibuf(reinterpret_cast<Image *>(node.id), master, lock);
     composite_aux_targets(data, layers, &region);
+    runtime.effects_dirty = false;
   }
 
   return true;
@@ -1796,6 +2389,31 @@ void BKE_tex_paint_layer_pixels_changed(NodeTexPaint &data,
 
   const int index = BLI_findindex(&data.layers, &layer);
   TexPaintRuntime *runtime = static_cast<TexPaintRuntime *>(data.runtime);
+  if (runtime) {
+    rcti changed;
+    canvas_rect_clamp(data, rect, changed);
+    for (LayerFilterCache &cache : runtime->filtered_layers) {
+      if (cache.layer_uid == layer.uid && cache.valid) {
+        if (cache.dirty) {
+          BLI_rcti_union(&cache.dirty_rect, &changed);
+        }
+        else {
+          cache.dirty_rect = changed;
+          cache.dirty = true;
+        }
+      }
+    }
+    if (layer_filter_support(layer) > 0) {
+      BKE_tex_paint_layer_effects_expand_rect(data, layer, changed);
+      if (runtime->effects_dirty) {
+        BLI_rcti_union(&runtime->effects_dirty_rect, &changed);
+      }
+      else {
+        runtime->effects_dirty_rect = changed;
+        runtime->effects_dirty = true;
+      }
+    }
+  }
   if (index == -1 || runtime == nullptr || !runtime->cache_valid ||
       index >= runtime->cache_active_index)
   {
@@ -1810,6 +2428,7 @@ void BKE_tex_paint_layer_pixels_changed(NodeTexPaint &data,
   /* Recomposite the cache inside the changed region. */
   rcti region;
   canvas_rect_clamp(data, rect, region);
+  BKE_tex_paint_layer_effects_expand_rect(data, layer, region);
   const Vector<LayerEval> layers = build_layer_evals(data);
   composite_region(layers.as_span().take_front(runtime->cache_active_index),
                    region,
@@ -1823,54 +2442,276 @@ void BKE_tex_paint_layer_pixels_changed(NodeTexPaint &data,
 
 bool BKE_tex_paint_layer_merge_down(NodeTexPaint &data)
 {
-  TexPaintLayer *top = BKE_tex_paint_layer_active(data);
-  TexPaintLayer *below = top ? top->prev : nullptr;
-  if (top == nullptr || below == nullptr || below->type != TEXPAINT_LAYER_PAINT ||
-      (below->flag & TEXPAINT_LAYER_LOCKED))
-  {
+  const char *error = nullptr;
+  std::unique_ptr<TexPaintFlattenResult> prepared = BKE_tex_paint_layer_merge_down_prepare(data,
+                                                                                           &error);
+  if (!prepared) {
     return false;
   }
-
-  /* Flatten `below` (including its mask) and `top` into the pixels of `below`. */
-  ImBuf *below_ibuf = BKE_tex_paint_layer_ensure_ibuf(data, *below);
-  if (below_ibuf == nullptr) {
-    return false;
-  }
-  BKE_tex_paint_ensure_all_ibufs(data);
-  Vector<LayerEval> layers = build_layer_evals(data);
-  const int below_index = data.active_layer_index - 1;
-  Array<LayerEval> pair = {layers[below_index], layers[below_index + 1]};
-  /* Hidden layers are not merged, but the lower layer keeps its pixels. */
-  pair[0].visible = true;
-  pair[0].clipping = false;
-  pair[0].opacity = below->opacity;
-
-  ImBuf *result = canvas_buffer_alloc(data);
-  if (result == nullptr) {
-    return false;
-  }
-  rcti rect;
-  canvas_rect_clamp(data, nullptr, rect);
-  composite_region(pair, rect, data.width, PixelSource(), 0, PixelTarget(), -1, PixelTarget(result));
-
-  layer_buffer_assign_colorspace(below_ibuf, *result);
-  IMB_freeImBuf(below->ibuf);
-  below->ibuf = result;
-  if (below->mask_ibuf) {
-    /* The mask and opacity are baked into the merged pixels. */
-    IMB_freeImBuf(below->mask_ibuf);
-    below->mask_ibuf = nullptr;
-  }
-  if (below->mask_pf) {
-    BKE_packedfile_free(below->mask_pf);
-    below->mask_pf = nullptr;
-  }
-  below->flag &= ~(TEXPAINT_LAYER_USE_MASK | TEXPAINT_LAYER_MASK_INVERT);
-  below->opacity = 1.0f;
-  below->runtime_dirty = 1;
-
-  BKE_tex_paint_layer_remove(data, *top);
+  const TexPaintLayer *below = BKE_tex_paint_layer_active(data)->prev;
+  const int result_uid = below->uid;
+  char name[sizeof(below->name)];
+  STRNCPY_UTF8(name, below->name);
+  BKE_tex_paint_layers_flatten_commit(data, *prepared, result_uid, name);
   return true;
+}
+
+TexPaintFlattenResult::~TexPaintFlattenResult()
+{
+  if (layer) {
+    layer_free(layer);
+  }
+}
+
+std::unique_ptr<TexPaintFlattenResult> BKE_tex_paint_layers_flatten_prepare(
+    NodeTexPaint &data, const Span<int> source_uids, const char **r_error)
+{
+  if (r_error) {
+    *r_error = nullptr;
+  }
+  const auto fail = [&](const char *message) -> std::unique_ptr<TexPaintFlattenResult> {
+    if (r_error) {
+      *r_error = message;
+    }
+    return nullptr;
+  };
+  if (source_uids.is_empty() || data.width <= 0 || data.height <= 0) {
+    return fail("There are no layers to flatten");
+  }
+  int selected_count = 0;
+  for (const TexPaintLayer &source : data.layers) {
+    const bool selected = source_uids.contains(source.uid);
+    selected_count += selected;
+    if (selected && (source.flag & TEXPAINT_LAYER_LOCKED)) {
+      return fail("Unlock the layers before flattening them");
+    }
+    if (!selected && (source.flag & TEXPAINT_LAYER_VISIBLE)) {
+      return fail("Every visible layer must be included in the flattened result");
+    }
+  }
+  if (selected_count != source_uids.size()) {
+    return fail("The source layer list changed before flattening");
+  }
+
+  const Vector<LayerEval> evaluations = build_layer_evals(data, false);
+  auto result = std::make_unique<TexPaintFlattenResult>();
+  result->source_uids = Array<int>(source_uids);
+  result->layer = MEM_new<TexPaintLayer>(__func__);
+  result->layer->flag |= TEXPAINT_LAYER_CHANNELS_INIT;
+  result->layer->channel_flags = TEXPAINT_CHAN_COLOR;
+  result->layer->ibuf = canvas_buffer_alloc(data);
+  if (!result->layer->ibuf) {
+    return fail("Unable to allocate the flattened color pixels");
+  }
+  rcti region;
+  canvas_rect_clamp(data, nullptr, region);
+  composite_region(evaluations,
+                   region,
+                   data.width,
+                   PixelSource(),
+                   0,
+                   PixelTarget(),
+                   -1,
+                   PixelTarget(result->layer->ibuf));
+
+  const int pbr_channels = TEXPAINT_CHAN_ROUGHNESS | TEXPAINT_CHAN_METALLIC |
+                           TEXPAINT_CHAN_HEIGHT | TEXPAINT_CHAN_NORMAL | TEXPAINT_CHAN_SPECULAR;
+  bool has_pbr = false;
+  bool has_emission = false;
+  for (const LayerEval &evaluation : evaluations) {
+    if (evaluation.visible && evaluation.opacity > 0.0f) {
+      has_pbr |= (evaluation.channel_flags & pbr_channels) != 0;
+      has_emission |= (evaluation.channel_flags & TEXPAINT_CHAN_EMISSION) != 0;
+    }
+  }
+  using BufferPtr = std::unique_ptr<ImBuf, decltype(&IMB_freeImBuf)>;
+  BufferPtr pbr(has_pbr ? canvas_buffer_alloc(data) : nullptr, IMB_freeImBuf);
+  BufferPtr emission(has_emission ? canvas_buffer_alloc(data) : nullptr, IMB_freeImBuf);
+  if ((has_pbr && !pbr) || (has_emission && !emission)) {
+    return fail("Unable to allocate the flattened material channels");
+  }
+  if (has_pbr || has_emission) {
+    composite_pbr_region(
+        data, evaluations, region, PixelTarget(pbr.get()), PixelTarget(emission.get()));
+  }
+  const int64_t pixels = int64_t(data.width) * data.height;
+  const PixelSource color_source(result->layer->ibuf);
+  const PixelSource pbr_source(pbr.get());
+  const PixelSource emission_source(emission.get());
+  const float specular = has_pbr ? pbr_source.read(0).w : data.base_specular;
+  for (const int64_t i : IndexRange(pixels)) {
+    const float4 color = color_source.read(i);
+    if (!std::isfinite(color.x) || !std::isfinite(color.y) || !std::isfinite(color.z) ||
+        !std::isfinite(color.w))
+    {
+      return fail("Flattening requires finite color values");
+    }
+    if (has_pbr) {
+      const float4 material = pbr_source.read(i);
+      if (!std::isfinite(material.x) || !std::isfinite(material.y) || !std::isfinite(material.z) ||
+          !std::isfinite(material.w))
+      {
+        return fail("Flattening requires finite material channel values");
+      }
+      if (material.w != specular) {
+        return fail(
+            "Flattening spatially varying Specular is not supported; export the texture set "
+            "instead");
+      }
+    }
+    if (has_emission) {
+      const float3 emitted = emission_source.read(i).xyz();
+      if (emitted != float3(0.0f)) {
+        return fail(
+            "Flattening nonzero Emission is not supported; export the texture set instead");
+      }
+    }
+  }
+  if (has_pbr) {
+    const PixelTarget target(pbr.get());
+    /* pbr_ibuf alpha means independent coverage, while the composited auxiliary alpha is
+     * Specular. Store full coverage and retain the verified uniform Specular parameter. */
+    for (const int64_t i : IndexRange(pixels)) {
+      const float4 material = pbr_source.read(i);
+      target.write(i, float4(material.xyz(), 1.0f));
+    }
+    result->layer->pbr_ibuf = pbr.release();
+    result->layer->channel_flags |= pbr_channels;
+    result->layer->fill_specular = specular;
+  }
+  result->layer->runtime_dirty = 1;
+  return result;
+}
+
+std::unique_ptr<TexPaintFlattenResult> BKE_tex_paint_layer_merge_down_prepare(NodeTexPaint &data,
+                                                                              const char **r_error)
+{
+  if (r_error) {
+    *r_error = nullptr;
+  }
+  const auto fail = [&](const char *message) -> std::unique_ptr<TexPaintFlattenResult> {
+    if (r_error) {
+      *r_error = message;
+    }
+    return nullptr;
+  };
+  const TexPaintLayer *top = BKE_tex_paint_layer_active(data);
+  const TexPaintLayer *below = top ? top->prev : nullptr;
+  if (!below || below->type != TEXPAINT_LAYER_PAINT) {
+    return fail("The layer below must be a Paint layer");
+  }
+  if ((top->flag | below->flag) & TEXPAINT_LAYER_LOCKED) {
+    return fail("Unlock both layers before merging them");
+  }
+  if (!(top->flag & TEXPAINT_LAYER_VISIBLE) || !(below->flag & TEXPAINT_LAYER_VISIBLE)) {
+    return fail("Show both layers before merging them");
+  }
+  const int source_uids[] = {below->uid, top->uid};
+  const bool other_visible = std::any_of(
+      data.layers.begin(), data.layers.end(), [&](const TexPaintLayer &layer) {
+        return &layer != top && &layer != below && (layer.flag & TEXPAINT_LAYER_VISIBLE);
+      });
+  if (!other_visible) {
+    return BKE_tex_paint_layers_flatten_prepare(data, Span<int>(source_uids, 2), r_error);
+  }
+  for (const TexPaintLayer *follower = top->next;
+       follower && (follower->flag & TEXPAINT_LAYER_CLIPPING);
+       follower = follower->next)
+  {
+    if ((follower->flag & TEXPAINT_LAYER_VISIBLE) && follower->opacity > 0.0f) {
+      return fail("Use Merge Visible to preserve the clipping coverage of layers above the merge");
+    }
+  }
+  const Vector<LayerEval> evaluations = build_layer_evals(data, false);
+  if ((top->flag | below->flag) & TEXPAINT_LAYER_CLIPPING || top->blend_mode != IMB_BLEND_MIX ||
+      below->blend_mode != IMB_BLEND_MIX || top->type == TEXPAINT_LAYER_ADJUSTMENT)
+  {
+    return fail(
+        "Use Merge Visible to preserve clipping, adjustment and blend interactions with other "
+        "layers");
+  }
+  if ((top->channel_flags | below->channel_flags) & ~TEXPAINT_CHAN_COLOR) {
+    return fail("Use Merge Visible to preserve material channel interactions with other layers");
+  }
+  const int below_index = data.active_layer_index - 1;
+  const Span<LayerEval> pair = evaluations.as_span().slice(below_index, 2);
+  auto result = std::make_unique<TexPaintFlattenResult>();
+  result->source_uids = Array<int>(Span<int>(source_uids, 2));
+  result->layer = MEM_new<TexPaintLayer>(__func__);
+  result->layer->flag |= TEXPAINT_LAYER_CHANNELS_INIT;
+  result->layer->ibuf = canvas_buffer_alloc(data);
+  if (!result->layer->ibuf) {
+    return fail("Unable to allocate the merged color pixels");
+  }
+  rcti region;
+  canvas_rect_clamp(data, nullptr, region);
+  composite_region(pair,
+                   region,
+                   data.width,
+                   PixelSource(),
+                   0,
+                   PixelTarget(),
+                   -1,
+                   PixelTarget(result->layer->ibuf));
+  result->layer->runtime_dirty = 1;
+  return result;
+}
+
+TexPaintLayer *BKE_tex_paint_layers_flatten_commit(NodeTexPaint &data,
+                                                   TexPaintFlattenResult &prepared,
+                                                   const int uid,
+                                                   const char *name)
+{
+  BLI_assert(prepared.layer && !prepared.source_uids.is_empty());
+  TexPaintLayer *first = nullptr;
+  for (TexPaintLayer &source : data.layers) {
+    if (prepared.source_uids.as_span().contains(source.uid)) {
+      first = &source;
+      break;
+    }
+  }
+  BLI_assert(first);
+  TexPaintLayer *result = BKE_tex_paint_layer_find_uid(data, uid);
+  if (result) {
+    /* Merge Down retains the lower layer's address as well as its UID. Existing native callers
+     * and RNA references can continue referring to that layer after its pixels are replaced. */
+    BLI_assert(result == first && prepared.source_uids.as_span().contains(uid));
+    TexPaintLayer *previous = result->prev;
+    TexPaintLayer *next = result->next;
+    layer_free_buffers(*result);
+    layer_free_packed(*result);
+    layer_filters_clear(*result);
+    BKE_tex_paint_mask_effects_clear(*result);
+    *result = dna::shallow_copy(*prepared.layer);
+    result->prev = previous;
+    result->next = next;
+    MEM_delete(prepared.layer);
+    prepared.layer = nullptr;
+    result->uid = uid;
+    BKE_tex_paint_selection_transform_clear(data);
+  }
+  else {
+    result = prepared.layer;
+    prepared.layer = nullptr;
+    /* New flattened layers remain outside the source UID namespace until removals finish. */
+    result->uid = 0;
+    BLI_insertlinkbefore(&data.layers, first, result);
+  }
+  STRNCPY_UTF8(result->name, name ? name : DATA_("Flattened"));
+  for (const int source_uid : prepared.source_uids) {
+    TexPaintLayer *source = BKE_tex_paint_layer_find_uid(data, source_uid);
+    BLI_assert(source);
+    if (source != result) {
+      BKE_tex_paint_layer_remove(data, *source);
+    }
+  }
+  result->uid = uid;
+  data.next_layer_uid = std::max(data.next_layer_uid, uid + 1);
+  data.active_layer_index = BLI_findindex(&data.layers, result);
+  data.paint_target = TEXPAINT_TARGET_COLOR;
+  BKE_tex_paint_layer_unique_name(data, *result);
+  BKE_tex_paint_cache_invalidate(data);
+  return result;
 }
 
 void BKE_tex_paint_composite_all(Main &bmain)
@@ -1902,6 +2743,12 @@ static void layer_buffers_tag(TexPaintLayer &layer)
   if (layer.mask_ibuf) {
     layer.mask_ibuf->filepath = fmt::format("{}{}:mask", LAYER_BUFFER_PREFIX, layer.uid);
   }
+  for (TexPaintMaskEffect &effect : layer.mask_effects) {
+    if (effect.pixels) {
+      effect.pixels->filepath = fmt::format(
+          "{}{}:paint:{}", LAYER_BUFFER_PREFIX, layer.uid, effect.uid);
+    }
+  }
 }
 
 bNode *BKE_tex_paint_node_find_in_main(Main &bmain, const Image *image)
@@ -1928,7 +2775,9 @@ bNode *BKE_tex_paint_node_find_in_main(Main &bmain, const Image *image)
 static TexPaintLayer *layer_find_by_buffer(NodeTexPaint &data, const ImBuf *ibuf)
 {
   for (TexPaintLayer &layer : data.layers) {
-    if (ibuf && (layer.ibuf == ibuf || layer.mask_ibuf == ibuf)) {
+    if (ibuf && (layer.ibuf == ibuf || layer.mask_ibuf == ibuf ||
+                 BKE_tex_paint_mask_effect_find_by_buffer(layer, ibuf)))
+    {
       return &layer;
     }
   }
@@ -1981,6 +2830,55 @@ void BKE_tex_paint_stroke_update(bNode &node, const ImBuf *target, const rcti &r
   if (layer == nullptr) {
     return;
   }
+  if (TexPaintMaskEffect *effect = BKE_tex_paint_mask_effect_find_by_buffer(*layer, target)) {
+    effect->runtime_dirty = 1;
+    effect->revision++;
+    rcti evaluated_rect;
+    if (BKE_tex_paint_mask_evaluate(data, *layer, &rect, evaluated_rect)) {
+      /* Publish only the fully evaluated mask. Erasing edits this effect's coverage,
+       * never the generated or painted effects beneath it. */
+      if (node.runtime && BKE_tex_paint_tree_shares_channel_layers(node.runtime->owner_tree)) {
+        for (bNode &other_node : node.runtime->owner_tree->nodes) {
+          if (&other_node == &node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
+              !other_node.storage || !BKE_tex_paint_is_initialized(other_node))
+          {
+            continue;
+          }
+          NodeTexPaint &other_data = *static_cast<NodeTexPaint *>(other_node.storage);
+          TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, layer->uid);
+          if (!other_layer || other_data.width != data.width || other_data.height != data.height) {
+            continue;
+          }
+          TexPaintMaskEffect *other_effect = BKE_tex_paint_mask_effect_find(*other_layer,
+                                                                            effect->uid);
+          if (other_effect && other_effect->type == TEXPAINT_MASK_EFFECT_PAINT) {
+            ImBuf *other_pixels = BKE_tex_paint_mask_effect_ensure_pixels(other_data,
+                                                                          *other_effect);
+            rcti clipped;
+            canvas_rect_clamp(data, &rect, clipped);
+            const uint8_t *src = target->byte_data();
+            uint8_t *dst = other_pixels ? other_pixels->byte_data_for_write() : nullptr;
+            if (src && dst) {
+              for (int y = clipped.ymin; y < clipped.ymax; y++) {
+                const size_t offset = (size_t(y) * data.width + clipped.xmin) * 4;
+                memcpy(dst + offset, src + offset, size_t(clipped.xmax - clipped.xmin) * 4);
+              }
+              other_effect->runtime_dirty = 1;
+              other_effect->revision++;
+              rcti other_rect;
+              if (BKE_tex_paint_mask_evaluate(other_data, *other_layer, &rect, other_rect)) {
+                BKE_tex_paint_layer_pixels_changed(other_data, *other_layer, &other_rect);
+                BKE_tex_paint_composite_rect(other_node, &other_rect);
+              }
+            }
+          }
+        }
+      }
+      BKE_tex_paint_layer_pixels_changed(data, *layer, &evaluated_rect);
+      BKE_tex_paint_composite_rect(node, &evaluated_rect);
+    }
+    return;
+  }
   if (target == layer->mask_ibuf && layer->mask_ibuf != nullptr) {
     rcti clamped;
     canvas_rect_clamp(data, &rect, clamped);
@@ -2021,7 +2919,7 @@ void BKE_tex_paint_stroke_update(bNode &node, const ImBuf *target, const rcti &r
 
       /* Propagate shared mask stroke dirty rectangles across companion PBR channel nodes in the
        * same material node tree that share this layer's UID. */
-      if (node.runtime != nullptr && node.runtime->owner_tree != nullptr) {
+      if (node.runtime != nullptr && BKE_tex_paint_tree_shares_channel_layers(node.runtime->owner_tree)) {
         bNodeTree *ntree = node.runtime->owner_tree;
         for (bNode &other_node : ntree->nodes) {
           if (&other_node == &node || other_node.type_legacy != SH_NODE_TEX_PAINT ||
@@ -2098,8 +2996,18 @@ ImBuf *BKE_tex_paint_undo_buffer_find(Main &bmain,
   if (layer == nullptr) {
     return nullptr;
   }
-  ImBuf *ibuf = STREQ(kind, "mask") ? BKE_tex_paint_layer_ensure_mask_ibuf(data, *layer) :
-                                      BKE_tex_paint_layer_ensure_ibuf(data, *layer);
+  ImBuf *ibuf = nullptr;
+  int effect_uid = 0;
+  if (sscanf(filepath + LAYER_BUFFER_PREFIX.size(), "%d:paint:%d", &uid, &effect_uid) == 2) {
+    TexPaintMaskEffect *effect = BKE_tex_paint_mask_effect_find(*layer, effect_uid);
+    ibuf = effect ? BKE_tex_paint_mask_effect_ensure_pixels(data, *effect) : nullptr;
+  }
+  else if (STREQ(kind, "mask")) {
+    ibuf = BKE_tex_paint_layer_ensure_mask_ibuf(data, *layer);
+  }
+  else if (STREQ(kind, "color")) {
+    ibuf = BKE_tex_paint_layer_ensure_ibuf(data, *layer);
+  }
   layer_buffers_tag(*layer);
   *r_node = node;
   return ibuf;
@@ -3195,7 +4103,9 @@ bool BKE_tex_paint_layer_reproject(Main &bmain,
 
 void BKE_tex_paint_layer_mask_fill(NodeTexPaint &data, TexPaintLayer &layer, const float value)
 {
+  BKE_tex_paint_mask_effects_clear(layer);
   const float v = std::clamp(value, 0.0f, 1.0f);
+  layer.mask_base_value = int(v * 255.0f + 0.5f);
   layer.flag |= TEXPAINT_LAYER_USE_MASK;
   layer.flag &= ~TEXPAINT_LAYER_MASK_INVERT;
   layer.mask_gen_type = TEXPAINT_MASK_GEN_NONE;
@@ -3208,6 +4118,11 @@ void BKE_tex_paint_layer_mask_fill(NodeTexPaint &data, TexPaintLayer &layer, con
 
 void BKE_tex_paint_layer_mask_invert_pixels(NodeTexPaint &data, TexPaintLayer &layer)
 {
+  if (layer.mask_effects_active) {
+    layer.flag ^= TEXPAINT_LAYER_MASK_INVERT;
+    BKE_tex_paint_cache_invalidate(data);
+    return;
+  }
   ImBuf *mask_ibuf = BKE_tex_paint_layer_ensure_mask_ibuf(data, layer);
   if (mask_ibuf == nullptr) {
     return;
@@ -3230,6 +4145,7 @@ void BKE_tex_paint_layer_mask_invert_pixels(NodeTexPaint &data, TexPaintLayer &l
 
 void BKE_tex_paint_layer_mask_remove(NodeTexPaint &data, TexPaintLayer &layer)
 {
+  BKE_tex_paint_mask_effects_clear(layer);
   layer.flag &= ~(TEXPAINT_LAYER_USE_MASK | TEXPAINT_LAYER_MASK_INVERT);
   layer.mask_gen_type = TEXPAINT_MASK_GEN_NONE;
   if (layer.mask_ibuf) {

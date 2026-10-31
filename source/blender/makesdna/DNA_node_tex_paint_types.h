@@ -89,6 +89,87 @@ enum eTexPaintMaskGenBlend {
   TEXPAINT_MASK_BLEND_SUBTRACT = 3,
 };
 
+enum eTexPaintColorFilterType {
+  TEXPAINT_COLOR_FILTER_HSV = 0,
+  TEXPAINT_COLOR_FILTER_BRIGHT_CONTRAST = 1,
+  TEXPAINT_COLOR_FILTER_LEVELS = 2,
+  TEXPAINT_COLOR_FILTER_INVERT = 3,
+  TEXPAINT_COLOR_FILTER_GRAYSCALE = 4,
+  TEXPAINT_COLOR_FILTER_BLUR = 5,
+};
+
+/** Ordered, non-destructive color operations evaluated before a layer is blended. */
+struct TexPaintColorFilter {
+  DNA_DEFINE_CXX_METHODS(TexPaintColorFilter)
+
+  TexPaintColorFilter *next = nullptr, *prev = nullptr;
+  char name[64] = "Filter";
+  int type = TEXPAINT_COLOR_FILTER_HSV;
+  int enabled = 1;
+  float strength = 1.0f;
+  float hsv[3] = {0.0f, 0.0f, 0.0f};
+  float bright_contrast[2] = {0.0f, 0.0f};
+  float input_black = 0.0f;
+  float input_white = 1.0f;
+  float gamma = 1.0f;
+  float output_black = 0.0f;
+  float output_white = 1.0f;
+  /** Spatial blur support in canvas pixels; occupies previously unused padding. */
+  float blur_radius = 4.0f;
+};
+
+enum eTexPaintMaskEffectType {
+  TEXPAINT_MASK_EFFECT_SOURCE = 0,
+  TEXPAINT_MASK_EFFECT_PAINT = 1,
+  TEXPAINT_MASK_EFFECT_LEVELS = 2,
+  TEXPAINT_MASK_EFFECT_FILTER = 3,
+};
+
+enum eTexPaintMaskEffectBlend {
+  TEXPAINT_MASK_EFFECT_REPLACE = 0,
+  TEXPAINT_MASK_EFFECT_ADD = 1,
+  TEXPAINT_MASK_EFFECT_SUBTRACT = 2,
+  TEXPAINT_MASK_EFFECT_MULTIPLY = 3,
+  TEXPAINT_MASK_EFFECT_SCREEN = 4,
+  TEXPAINT_MASK_EFFECT_OVERLAY = 5,
+  TEXPAINT_MASK_EFFECT_MAX = 6,
+  TEXPAINT_MASK_EFFECT_MIN = 7,
+};
+
+enum eTexPaintMaskFilterType {
+  TEXPAINT_MASK_FILTER_BLUR = 0,
+  TEXPAINT_MASK_FILTER_BLUR_SLOPE = 1,
+  TEXPAINT_MASK_FILTER_SHARPEN = 2,
+  TEXPAINT_MASK_FILTER_DILATE_ERODE = 3,
+  TEXPAINT_MASK_FILTER_BEVEL = 4,
+  TEXPAINT_MASK_FILTER_THRESHOLD = 5,
+  TEXPAINT_MASK_FILTER_POSTERIZE = 6,
+  TEXPAINT_MASK_FILTER_HIGHPASS = 7,
+};
+
+/** Prepared native mask operation. Paint owns its independent RGBA coverage buffer. */
+struct TexPaintMaskEffect {
+  DNA_DEFINE_CXX_METHODS(TexPaintMaskEffect)
+
+  TexPaintMaskEffect *next = nullptr, *prev = nullptr;
+  int uid = 0;
+  int type = TEXPAINT_MASK_EFFECT_SOURCE;
+  int enabled = 1;
+  int blend_mode = TEXPAINT_MASK_EFFECT_REPLACE;
+  float opacity = 1.0f;
+  int invert = 0;
+  /** Prepared source/levels tone curve. Initialized to identity by effect creation. */
+  float curve[256] = {};
+  int filter_type = TEXPAINT_MASK_FILTER_BLUR;
+  float filter_radius = 6.0f;
+  float filter_strength = 1.0f;
+  float filter_scale = 8.0f;
+  PackedFile *pixels_packed = nullptr;
+  ImBuf *pixels = nullptr;
+  int runtime_dirty = 0;
+  int revision = 1;
+};
+
 struct TexPaintLayer {
   DNA_DEFINE_CXX_METHODS(TexPaintLayer)
 
@@ -167,6 +248,18 @@ struct TexPaintLayer {
   /** Optional packed PBR pixel buffer (R=Roughness, G=Metallic, B=Height, A=Coverage). */
   PackedFile *pbr_pf = nullptr;
   ImBuf *pbr_ibuf = nullptr;
+
+  /** Applied first to last; never written into the source color or mask buffers. */
+  ListBaseT<TexPaintColorFilter> color_filters = {nullptr, nullptr};
+  int active_color_filter_index = 0;
+  char _pad_filters[4] = {};
+
+  /** Owned native mask stack, prepared from the mask authoring UI. */
+  ListBaseT<TexPaintMaskEffect> mask_effects = {nullptr, nullptr};
+  int active_mask_effect_uid = 0;
+  int mask_base_value = 255;
+  int mask_effects_active = 0;
+  char _pad_mask_effects[4] = {};
 };
 
 struct NodeTexPaint {
@@ -203,6 +296,25 @@ struct NodeTexPaint {
   float base_metallic = 0.0f;
   float base_specular = 0.5f;
   float bump_strength = 1.0f;
+
+  /** Canvas-space selection coverage, shared by 2D editing and material paint layers.
+   * An active, all-zero selection is distinct from an unrestricted canvas. Stored in undo and
+   * blend files; evaluated node copies do not need the selection. */
+  float *selection = nullptr;
+  int selection_size = 0;
+  int selection_active = 0;
+
+  /** Immutable source of consecutive pixel transforms. The layer buffer contains the current
+   * composite; these owned arrays keep destination pixels out of the lifted selection. */
+  float *selection_transform_source = nullptr;
+  float *selection_transform_mask = nullptr;
+  int selection_transform_size = 0;
+  int selection_transform_layer_uid = 0;
+  int selection_transform_target = TEXPAINT_TARGET_COLOR;
+  char _pad_selection_transform[4] = {};
+  float selection_transform[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+  char _pad_selection_matrix[4] = {};
+  uint64_t selection_transform_hash = 0;
 };
 
 }  // namespace blender

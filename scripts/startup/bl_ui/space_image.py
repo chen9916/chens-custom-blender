@@ -199,13 +199,17 @@ class IMAGE_MT_image(Menu):
 
     def draw(self, context):
         import sys
+        from bl_ui.properties_tex_paint_layers import tex_paint_node_from_context
 
         layout = self.layout
 
         sima = context.space_data
         ima = sima.image
         show_render = sima.show_render
+        is_layered = tex_paint_node_from_context(context) is not None
 
+        if sima.mode == 'PAINT':
+            layout.menu("TEXPAINT_MT_2d_canvas_new", text="New Canvas")
         layout.operator("image.new", text="New...", text_ctxt=i18n_contexts.id_image, icon='FILE_NEW')
         layout.operator("image.open", text="Open...", icon='FILE_FOLDER')
 
@@ -214,11 +218,12 @@ class IMAGE_MT_image(Menu):
         if ima:
             layout.separator()
 
-            if not show_render:
+            if not show_render and not is_layered:
                 layout.operator("image.replace", text="Replace...")
                 layout.operator("image.reload", text="Reload")
 
-            layout.operator("image.external_edit", text="Edit Externally")
+            if not is_layered:
+                layout.operator("image.external_edit", text="Edit Externally")
 
         layout.separator()
 
@@ -249,9 +254,12 @@ class IMAGE_MT_image(Menu):
         if ima:
             layout.separator()
 
-            layout.menu("IMAGE_MT_image_invert")
-            layout.operator("image.resize", text="Resize")
-            layout.menu("IMAGE_MT_image_transform")
+            # Flat-image commands edit the display image, which is derived from the layer stack.
+            # Layered documents use the active-target commands in Edit, Layer and Filter instead.
+            if not is_layered:
+                layout.menu("IMAGE_MT_image_invert")
+                layout.operator("image.resize", text="Resize")
+                layout.menu("IMAGE_MT_image_transform")
 
             if ima.packed_file:
                 if ima.filepath:
@@ -911,9 +919,10 @@ class IMAGE_HT_header(Header):
             tp_row = layout.row(align=True)
             if tp_node is not None and tp_node.image is not None:
                 tp_layer = tp_node.active_layer
+                target = "Mask" if tp_node.paint_target == 'MASK' else "Pixels"
                 tp_row.popover(
                     panel="VIEW3D_PT_tex_paint_layers_popover",
-                    text=tp_layer.name if tp_layer else "Layers",
+                    text=f"{tp_layer.name} · {target}" if tp_layer else "Layers",
                     icon='RENDERLAYERS',
                 )
                 if tp_layer is not None and tp_layer.use_mask:
@@ -940,11 +949,6 @@ class IMAGE_HT_header(Header):
                     text="2D Layers",
                     icon='RENDERLAYERS',
                 ).action = 'ENABLE_LAYERS'
-            tp_row.popover(
-                panel="IMAGE_PT_2d_canvas_studio_popover",
-                text="2D Studio",
-                icon='SHADERFX',
-            )
 
         if show_maskedit:
             layout.template_ID(sima, "mask", new="mask.new")
@@ -1005,6 +1009,79 @@ class IMAGE_HT_header(Header):
             row.prop(sima, "display_channels", icon_only=True)
 
 
+class IMAGE_MT_paint_select(Menu):
+    bl_label = "Select"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator("image.paint_select_all", text="All").action = 'SELECT'
+        layout.operator("image.paint_select_all", text="Deselect").action = 'DESELECT'
+        layout.operator("image.paint_select_all", text="Invert").action = 'INVERT'
+        layout.separator()
+        layout.operator("wm.tool_set_by_id", text="Magic Wand").name = 'builtin.image_select_wand'
+        layout.operator("wm.tool_set_by_id", text="Lasso").name = 'builtin.image_select_lasso'
+        layout.operator("wm.tool_set_by_id", text="Box").name = 'builtin.image_select_box'
+        layout.separator()
+        for action, label in (('GROW', "Grow"), ('SHRINK', "Shrink"), ('FEATHER', "Feather"), ('BORDER', "Border")):
+            layout.operator("image.tex_paint_2d_select_action", text=label).action = action
+        layout.separator()
+        layout.operator("image.tex_paint_2d_select_action", text="Selection to Mask").action = 'SEL_TO_MASK'
+        layout.operator("image.tex_paint_2d_select_action", text="Selection to Layer").action = 'EXTRACT_LAYER'
+
+
+class IMAGE_MT_paint_edit(Menu):
+    bl_label = "Edit"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator("ed.undo")
+        layout.operator("ed.redo")
+        layout.separator()
+        for mode, label in (('TRANSLATE', "Move Pixels"), ('ROTATE', "Rotate Pixels"), ('SCALE', "Scale Pixels")):
+            layout.operator("image.paint_transform", text=label).mode = mode
+        layout.separator()
+        layout.operator("image.tex_paint_2d_select_action", text="Fill Selection").action = 'FILL_SEL'
+        layout.operator("image.tex_paint_2d_select_action", text="Clear Selection").action = 'DELETE_PIXELS'
+        layout.menu("TEXPAINT_MT_2d_transform", text="Canvas Transforms")
+
+
+class IMAGE_MT_paint_layer(Menu):
+    bl_label = "Layer"
+
+    def draw(self, context):
+        layout = self.layout
+        sima = getattr(context, "space_data", None)
+        ima = getattr(sima, "image", None) if sima else None
+        if ima is not None:
+            from bl_ui.properties_tex_paint_layers import _find_tex_paint_node_for_image
+            if _find_tex_paint_node_for_image(ima, context) is None:
+                layout.operator(
+                    "image.tex_paint_2d_layer_mode",
+                    text="Enable Layers",
+                    icon='RENDERLAYERS',
+                ).action = 'ENABLE_LAYERS'
+                layout.separator()
+        layout.menu("TEXPAINT_MT_add_layer", text="New Layer")
+        layout.operator("node.tex_paint_layer_duplicate", text="Duplicate Layer")
+        layout.operator("node.tex_paint_layer_merge_down", text="Merge Down")
+        layout.operator("node.tex_paint_layer_remove", text="Delete Layer")
+        layout.separator()
+        layout.menu("TEXPAINT_MT_add_mask_effect", text="Mask Effects")
+
+
+class IMAGE_MT_paint_filter(Menu):
+    bl_label = "Filter"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.menu("TEXPAINT_MT_add_color_filter", text="Add Layer Filter", icon='MODIFIER')
+        layout.separator()
+        layout.label(text="Apply to Pixels")
+        layout.operator("image.tex_paint_2d_color_adjust", text="Color Adjustments")
+        layout.menu("TEXPAINT_MT_2d_fx", text="Image Filters")
+        layout.menu("TEXPAINT_MT_2d_shapes", text="Shapes and Patterns")
+
+
 class IMAGE_MT_editor_menus(Menu):
     bl_idname = "IMAGE_MT_editor_menus"
     bl_label = ""
@@ -1018,6 +1095,11 @@ class IMAGE_MT_editor_menus(Menu):
         show_maskedit = sima.show_maskedit
 
         layout.menu("IMAGE_MT_view")
+        if sima.mode == 'PAINT' and ima:
+            layout.menu("IMAGE_MT_paint_edit")
+            layout.menu("IMAGE_MT_paint_select")
+            layout.menu("IMAGE_MT_paint_layer")
+            layout.menu("IMAGE_MT_paint_filter")
 
         if show_uvedit:
             layout.menu("IMAGE_MT_select")
@@ -1904,6 +1986,10 @@ classes = (
     IMAGE_MT_view_pie,
     IMAGE_HT_tool_header,
     IMAGE_HT_header,
+    IMAGE_MT_paint_select,
+    IMAGE_MT_paint_edit,
+    IMAGE_MT_paint_layer,
+    IMAGE_MT_paint_filter,
     IMAGE_MT_editor_menus,
     IMAGE_PT_active_tool,
     IMAGE_PT_mask,

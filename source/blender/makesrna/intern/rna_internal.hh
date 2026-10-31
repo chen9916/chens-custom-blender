@@ -440,6 +440,15 @@ bool rna_Image_no_renderresult_or_viewer_poll(PointerRNA *ptr, const PointerRNA 
 
 /* Layered Texture Paint node, see `rna_node_tex_paint.cc`. */
 void rna_def_sh_tex_paint(BlenderRNA *brna, StructRNA *srna);
+int rna_paint_selection_length(const PointerRNA *ptr, int *length);
+void rna_paint_selection_get(PointerRNA *ptr, float *values);
+void rna_paint_selection_set(PointerRNA *ptr, const float *values);
+void rna_paint_pixels_update(Main *bmain, Scene *scene, PointerRNA *ptr);
+void rna_paint_selection_update(Main *bmain, Scene *scene, PointerRNA *ptr);
+int rna_paint_pixels_length(const PointerRNA *ptr, int *length);
+void rna_paint_pixels_get(PointerRNA *ptr, float *values);
+void rna_paint_pixels_set(PointerRNA *ptr, const float *values);
+bool rna_ShaderNodeTexPaint_make_images_single_user(PointerRNA ptr, Main *bmain);
 void rna_ShaderNodeTexPaint_active_layer_index_range(
     PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax);
 void rna_ShaderNodeTexPaint_active_layer_index_set(PointerRNA *ptr, int value);

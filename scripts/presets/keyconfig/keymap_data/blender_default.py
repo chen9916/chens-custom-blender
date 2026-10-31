@@ -2189,6 +2189,12 @@ def km_image(params):
     )
 
     items.extend([
+        ("image.paint_transform", {"type": 'G', "value": 'PRESS'}, {"properties": [("mode", 'TRANSLATE')]}),
+        ("image.paint_transform", {"type": 'R', "value": 'PRESS'}, {"properties": [("mode", 'ROTATE')]}),
+        ("image.paint_transform", {"type": 'S', "value": 'PRESS'}, {"properties": [("mode", 'SCALE')]}),
+        ("image.paint_select_all", {"type": 'A', "value": 'PRESS', "ctrl": True}, {"properties": [("action", 'SELECT')]}),
+        ("image.paint_select_all", {"type": 'D', "value": 'PRESS', "ctrl": True}, {"properties": [("action", 'DESELECT')]}),
+        ("image.paint_select_all", {"type": 'I', "value": 'PRESS', "ctrl": True}, {"properties": [("action", 'INVERT')]}),
         ("image.view_all", {"type": 'HOME', "value": 'PRESS'}, None),
         ("image.view_all", {"type": 'HOME', "value": 'PRESS', "shift": True},
          {"properties": [("fit_view", True)]}),
@@ -5138,6 +5144,13 @@ def km_image_paint(params):
         ("wm.context_menu_enum", {"type": 'E', "value": 'PRESS', "alt": True},
          {"properties": [("data_path", "tool_settings.image_paint.brush.stroke_method")]}),
         *_template_items_context_panel("VIEW3D_PT_paint_texture_context_menu", params.context_menu_event),
+        # Native canvas transforms take precedence in the Image Editor; their poll rejects 3D views.
+        ("image.paint_transform", {"type": 'G', "value": 'PRESS'},
+         {"properties": [("mode", 'TRANSLATE')]}),
+        ("image.paint_transform", {"type": 'R', "value": 'PRESS'},
+         {"properties": [("mode", 'ROTATE')]}),
+        ("image.paint_transform", {"type": 'S', "value": 'PRESS'},
+         {"properties": [("mode", 'SCALE')]}),
         ("node.tex_paint_gizmo_mode", {"type": 'G', "value": 'PRESS'},
          {"properties": [("mode", 'TRANSLATE')]}),
         ("node.tex_paint_gizmo_mode", {"type": 'R', "value": 'PRESS'},
@@ -7129,6 +7142,35 @@ def km_image_editor_tool_generic_sample(params):
         {"space_type": 'IMAGE_EDITOR', "region_type": 'WINDOW'},
         {"items": [
             ("image.sample", {"type": params.tool_mouse, "value": 'PRESS'}, None),
+        ]},
+    )
+
+
+# ------------------------------------------------------------------------------
+# Tool System (Image Paint)
+
+def km_image_editor_tool_paint_select(params, label, operator, *, drag=False):
+    event = params.tool_tweak_event if drag else {"type": params.tool_mouse, "value": 'PRESS'}
+    return (
+        "Image Editor Tool: Paint, " + label,
+        {"space_type": 'IMAGE_EDITOR', "region_type": 'WINDOW'},
+        {"items": [
+            (operator, event, None),
+            (operator, dict(event, shift=True), {"properties": [("mode", 'ADD')]}),
+            (operator, dict(event, ctrl=True), {"properties": [("mode", 'SUB')]}),
+        ]},
+    )
+
+
+def km_image_editor_tool_paint_action(params, label, operator, *, projection=False):
+    return (
+        "Image Editor Tool: Paint, " + label,
+        {"space_type": 'IMAGE_EDITOR', "region_type": 'WINDOW'},
+        {"items": [
+            (operator, {"type": params.tool_mouse, "value": 'PRESS'}, None),
+            *([(operator, {"type": key, "value": 'PRESS'}, {"properties": [("mode", mode)]})
+               for key, mode in (('G', 'TRANSLATE'), ('R', 'ROTATE'), ('S', 'SCALE'))]
+              if projection else []),
         ]},
     )
 
@@ -9210,6 +9252,13 @@ def generate_keymaps(params=None):
         km_generic_tool_annotate_eraser(params),
 
         km_image_editor_tool_generic_sample(params),
+        km_image_editor_tool_paint_select(params, "Magic Wand", "image.paint_select_wand"),
+        km_image_editor_tool_paint_select(params, "Lasso Select", "image.paint_select_lasso", drag=True),
+        km_image_editor_tool_paint_select(params, "Box Select", "image.paint_select_box", drag=True),
+        km_image_editor_tool_paint_action(params, "Transform Pixels", "image.paint_transform"),
+        km_image_editor_tool_paint_action(
+            params, "Transform Projection", "image.tex_paint_uv_gizmo_transform", projection=True),
+        km_image_editor_tool_paint_action(params, "Gradient", "image.tex_paint_2d_gradient"),
         km_image_editor_tool_uv_cursor(params),
         *(km_image_editor_tool_uv_select(params, fallback=fallback) for fallback in (False, True)),
         *(km_image_editor_tool_uv_select_box(params, fallback=fallback) for fallback in (False, True)),

@@ -18,6 +18,12 @@
  *   recompilation: changes are pushed to the GPU through image partial updates.
  */
 
+#include <memory>
+
+#include "BLI_array.hh"
+#include "BLI_math_matrix_types.hh"
+#include "BLI_math_vector_types.hh"
+#include "BLI_span.hh"
 #include "DNA_vec_types.h"
 
 namespace blender {
@@ -93,6 +99,13 @@ void BKE_tex_paint_blend_read_data(BlendDataReader &reader, NodeTexPaint &data);
 bool BKE_tex_paint_is_initialized(const bNode &node);
 
 /**
+ * True when `ntree` is a material node tree whose `SH_NODE_TEX_PAINT` nodes represent
+ * companion PBR channels sharing a layer stack (false for the `.TexPaint_2D_Layers`
+ * container tree that holds independent 2D Image Editor documents).
+ */
+bool BKE_tex_paint_tree_shares_channel_layers(const bNodeTree *ntree);
+
+/**
  * Create the master image and a single "Base" paint layer filled with `color`
  * (scene linear, straight alpha). Replaces existing layers.
  */
@@ -120,11 +133,59 @@ void BKE_tex_paint_layer_unique_name(NodeTexPaint &data, TexPaintLayer &layer);
  */
 TexPaintLayer *BKE_tex_paint_layer_add(NodeTexPaint &data, const char *name, int type);
 TexPaintLayer *BKE_tex_paint_layer_duplicate(NodeTexPaint &data, const TexPaintLayer &src);
+/**
+ * Rasterize an owned Fill layer in-place, preserving its UID, masks, effects and channel settings.
+ * The color texture and fill multiplier are baked into canvas-format source pixels; filters remain
+ * editable. Texture-driven height is baked into PBR pixels when needed. Byte canvases retain their
+ * normal 8-bit quantization. Returns false without replacing source data for unsupported clipping
+ * coverage, a projection with no evaluated texture, or unreadable/incompatible buffers.
+ * With check_only, validate and prepare allocations without replacing any source data.
+ * The caller composites the owning node and records undo.
+ */
+bool BKE_tex_paint_layer_rasterize(NodeTexPaint &data,
+                                   TexPaintLayer &layer,
+                                   bool check_only = false);
 void BKE_tex_paint_layer_remove(NodeTexPaint &data, TexPaintLayer &layer);
 /** Move a layer up (positive) or down (negative) the stack. The active layer follows. */
 bool BKE_tex_paint_layer_move(NodeTexPaint &data, TexPaintLayer &layer, int direction);
 /** Merge the active layer into the layer below it. */
 bool BKE_tex_paint_layer_merge_down(NodeTexPaint &data);
+
+/**
+ * Owned, unlinked flattened layer prepared before any source layer is removed. Destroying an
+ * uncommitted result releases its private pixels. A committed result transfers that ownership.
+ */
+struct TexPaintFlattenResult {
+  TexPaintLayer *layer = nullptr;
+  Array<int> source_uids;
+
+  TexPaintFlattenResult() = default;
+  ~TexPaintFlattenResult();
+  TexPaintFlattenResult(const TexPaintFlattenResult &) = delete;
+  TexPaintFlattenResult &operator=(const TexPaintFlattenResult &) = delete;
+};
+
+/** Prepare a safe merge of the active layer and its immediate lower Paint layer. */
+std::unique_ptr<TexPaintFlattenResult> BKE_tex_paint_layer_merge_down_prepare(
+    NodeTexPaint &data, const char **r_error);
+
+/**
+ * Composite the visible stack into independent pixels with mask preview disabled. Every visible
+ * layer must be included in `source_uids`; selected hidden layers are discarded without becoming
+ * visible. Locked selected layers, spatial specular and nonzero emission are rejected.
+ */
+std::unique_ptr<TexPaintFlattenResult> BKE_tex_paint_layers_flatten_prepare(NodeTexPaint &data,
+                                                                            Span<int> source_uids,
+                                                                            const char **r_error);
+/**
+ * Insert the prepared layer at the bottommost removed layer, preserving remaining layer order.
+ * Source layer membership must not change between prepare and commit. `uid` is shared by matching
+ * companion channels. This stage only transfers ownership and removes the preflighted layers.
+ */
+TexPaintLayer *BKE_tex_paint_layers_flatten_commit(NodeTexPaint &data,
+                                                   TexPaintFlattenResult &prepared,
+                                                   int uid,
+                                                   const char *name);
 void BKE_tex_paint_layer_active_set(NodeTexPaint &data, int index);
 
 /** Resample every layer to a new canvas size. The caller resizes the master image. */
@@ -196,6 +257,10 @@ ImBuf *BKE_tex_paint_paint_target_ibuf(NodeTexPaint &data);
 void BKE_tex_paint_layer_pixels_changed(NodeTexPaint &data,
                                         const TexPaintLayer &layer,
                                         const rcti *rect);
+/** Expand/clamp a source dirty rectangle to include the layer's spatial effect halo. */
+void BKE_tex_paint_layer_effects_expand_rect(const NodeTexPaint &data,
+                                             const TexPaintLayer &layer,
+                                             rcti &rect);
 
 /** \} */
 
@@ -274,6 +339,52 @@ ImBuf *BKE_tex_paint_undo_buffer_find(Main &bmain,
 
 /** Undo restored layer pixels inside `rect`: re-pack and composite. */
 void BKE_tex_paint_undo_buffer_restored(bNode &node, const ImBuf *target, const rcti &rect);
+
+/** Native, document-owned pixel selections. Empty coverage still restricts editing. */
+void BKE_tex_paint_selection_set(NodeTexPaint &data,
+                                Span<float> coverage,
+                                bool preserve_transform = false);
+void BKE_tex_paint_selection_clear(NodeTexPaint &data);
+void BKE_tex_paint_selection_transform_clear(NodeTexPaint &data);
+void BKE_tex_paint_selection_transform_store(NodeTexPaint &data,
+                                            Span<float4> source,
+                                            Span<float> selection);
+/** Invalidate derived selection outlines without touching compositing caches. */
+void BKE_tex_paint_selection_tag_changed(NodeTexPaint &data);
+/** Pairs of pixel-space endpoints, cached until coverage changes. */
+Span<int2> BKE_tex_paint_selection_contours(NodeTexPaint &data);
+Span<float> BKE_tex_paint_selection(const NodeTexPaint &data);
+float BKE_tex_paint_selection_value(const bNode &node, int x, int y);
+Array<float> BKE_tex_paint_select_wand(const ImBuf &image,
+                                       int2 seed,
+                                       float tolerance,
+                                       bool contiguous);
+Array<float> BKE_tex_paint_select_polygon(int width, int height, Span<float2> polygon);
+/** Pixels are premultiplied in the buffer's color space; float HDR values are preserved. */
+Array<float4> BKE_tex_paint_pixels_read(const ImBuf &image);
+uint64_t BKE_tex_paint_pixels_hash(const ImBuf &image);
+void BKE_tex_paint_pixels_write(ImBuf &image, Span<float4> pixels, const rcti &rect);
+/** Transform selected coverage and pixels from an immutable source. Pixel-space coordinates. */
+void BKE_tex_paint_pixels_transform(Span<float4> source,
+                                    Span<float> selection,
+                                    int width,
+                                    int height,
+                                    float2 pivot,
+                                    float2 translation,
+                                    float angle,
+                                    float2 scale,
+                                    MutableSpan<float4> output,
+                                    MutableSpan<float> output_selection,
+                                    const rcti &rect);
+/** General affine transform, including accumulated non-uniform scales and rotations. */
+void BKE_tex_paint_pixels_transform_affine(Span<float4> source,
+                                         Span<float> selection,
+                                         int width,
+                                         int height,
+                                         const float3x3 &transform,
+                                         MutableSpan<float4> output,
+                                         MutableSpan<float> output_selection,
+                                         const rcti &rect);
 
 /** \} */
 

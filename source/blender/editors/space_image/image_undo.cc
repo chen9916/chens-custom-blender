@@ -52,6 +52,7 @@
 #include "BKE_global.hh"
 #include "BKE_image.hh"
 #include "BKE_image_gpu.hh"
+#include "BKE_lib_id.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_types.hh"
 #include "BKE_tex_paint_layer.hh"
@@ -603,6 +604,21 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
   for (UndoImageHandle &uh : *undo_handles) {
     /* Tiles only added to second set of tiles. */
     Image *image = uh.image_ref.ptr;
+    if (uh.image_ref.name[0] != '\0') {
+      /* A decode can replay neighboring image steps after a MemFile reload. Only the entry
+       * step's references were resolved by the undo system; neighboring pointers may still
+       * be null, or refer to the previous Main. Resolve every restored handle from its saved
+       * name and library. An unencoded handle has no saved name yet and uses its live pointer. */
+      image = reinterpret_cast<Image *>(BKE_libblock_find_name_and_library_filepath(
+          G_MAIN,
+          ID_IM,
+          uh.image_ref.name + 2,
+          uh.image_ref.library_filepath_abs[0] ? uh.image_ref.library_filepath_abs : nullptr));
+    }
+    if (image == nullptr) [[unlikely]] {
+      CLOG_WARN(&LOG, "Unable to restore missing image '%s'", uh.image_ref.name + 2);
+      continue;
+    }
 
     bool changed = false;
     for (UndoImageBuf &ubuf_iter : uh.buffers) {

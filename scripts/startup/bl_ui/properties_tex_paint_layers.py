@@ -94,7 +94,11 @@ class _C_ImBuf(ctypes.Structure):
 # Substance Grunge Library Discovery & Preview Collection
 # ---------------------------------------------------------------------------
 
-_GRUNGE_LIBRARY_ROOT = r"E:\dev\blender\blender\substance_starter_blender_assets\textures\Grunges_and_Procedurals"
+_GRUNGE_LIBRARY_ROOT = (
+    r"E:\dev\blender\blender\assets\substance_starter_blender_assets\textures\Grunges_and_Procedurals"
+    if os.path.isdir(r"E:\dev\blender\blender\assets\substance_starter_blender_assets\textures\Grunges_and_Procedurals")
+    else r"E:\dev\blender\blender\substance_starter_blender_assets\textures\Grunges_and_Procedurals"
+)
 
 _GRUNGE_CATEGORIES = (
     ('ALL', "All Library Maps (275)", "Browse or search across all 275 Substance Painter grunge, noise, pattern, and fabric maps", 'VIEWZOOM', 0),
@@ -555,10 +559,7 @@ def _sync_layer_mask_to_companion_channels(node, layer=None):
     target_uid = _layer_uid(layer)
     if target_uid <= 0:
         return
-    c_src = _C_TexPaintLayer.from_address(layer.as_pointer())
     use_m = bool(getattr(layer, "use_mask", False))
-    inv_m = bool(getattr(layer, "invert_mask", False))
-
     for other_node in ntree.nodes:
         if other_node == node or other_node.bl_idname != "ShaderNodeTexPaint" or other_node.image is None:
             continue
@@ -566,29 +567,21 @@ def _sync_layer_mask_to_companion_channels(node, layer=None):
         if other_layer is None:
             continue
         if not use_m:
-            if getattr(other_layer, "use_mask", False):
+            if other_layer.use_mask:
                 other_layer.use_mask = False
             continue
-        if not getattr(other_layer, "use_mask", False):
-            other_layer.use_mask = True
-        if getattr(other_layer, "invert_mask", False) != inv_m:
-            other_layer.invert_mask = inv_m
-        c_dst = _C_TexPaintLayer.from_address(other_layer.as_pointer())
-        if not c_dst.mask_ibuf:
-            other_layer.opacity = other_layer.opacity
-            c_dst = _C_TexPaintLayer.from_address(other_layer.as_pointer())
-        if c_src.mask_ibuf and c_dst.mask_ibuf:
-            imb_s = _C_ImBuf.from_address(c_src.mask_ibuf)
-            imb_d = _C_ImBuf.from_address(c_dst.mask_ibuf)
-            w, h = int(imb_s.x), int(imb_s.y)
-            if int(imb_d.x) == w and int(imb_d.y) == h and w > 0 and h > 0:
-                if imb_s.byte_data and imb_d.byte_data:
-                    ctypes.memmove(imb_d.byte_data, imb_s.byte_data, w * h * 4)
-                    c_dst.runtime_dirty = 1
-                elif imb_s.float_data and imb_d.float_data:
-                    ctypes.memmove(imb_d.float_data, imb_s.float_data, w * h * 16)
-                    c_dst.runtime_dirty = 1
-                other_layer.opacity = other_layer.opacity
+        # Native ownership detaches shared storage and preserves float mask precision.
+        if not other_layer.mask_stack_copy_from(layer):
+            continue
+        if not layer.mask_effects_active:
+            source_key = (node.as_pointer(), target_uid)
+            other_key = (other_node.as_pointer(), target_uid)
+            snapshot = _LAST_COMPOSITED_MASK.get(source_key)
+            count = int(node.canvas_width) * int(node.canvas_height)
+            if snapshot is not None and len(snapshot) == count:
+                _LAST_COMPOSITED_MASK[other_key] = snapshot.copy()
+                _LAST_MASK_SAMPLE[other_key] = snapshot[::max(1, count // 1024)].copy()
+                _PENDING_STROKE_SNAPSHOT.pop(other_key, None)
 
 
 def _get_layer_grunge_state(node, layer=None):
@@ -611,6 +604,9 @@ def _get_layer_grunge_state(node, layer=None):
             _RUNTIME_LAYER_STATES.pop(k, None)
         for k in [k for k in _PAINT_EFFECT_BUFFERS if k[0] == node_ptr]:
             _PAINT_EFFECT_BUFFERS.pop(k, None)
+        for cache in (_NATIVE_MASK_SOURCES, _EFFECT_RAW_CACHE):
+            for k in [k for k in cache if k[0] == node_ptr]:
+                cache.pop(k, None)
 
     key = (node_ptr, uid)
     st = _RUNTIME_LAYER_STATES.get(key)
@@ -639,6 +635,31 @@ def _get_layer_grunge_state(node, layer=None):
     return st
 
 
+def _mask_authoring_json(node, all_data):
+    """Keep settings persistent without duplicating native paint pixels in JSON."""
+    saved = {}
+    for uid, state in all_data.items():
+        try:
+            layer = _find_layer_by_uid(node, int(uid))
+        except (TypeError, ValueError):
+            layer = None
+        if (layer is None or not layer.mask_effects_active or not isinstance(state, dict) or
+                not isinstance(state.get("effects", []), list)):
+            saved[uid] = state
+            continue
+        native_paint = {str(effect.uid) for effect in layer.mask_effects if effect.type == 1}
+        saved_state = dict(state)
+        saved_state["effects"] = [
+            {key: value for key, value in effect.items()
+             if key not in {'paint_z64', 'paint_w', 'paint_h'}}
+            if isinstance(effect, dict) and effect.get("type") == 'PAINT' and
+            str(effect.get("uid")) in native_paint
+            else effect for effect in state.get("effects", [])
+        ]
+        saved[uid] = saved_state
+    return json.dumps(saved)
+
+
 def _flush_dirty_node_json(node=None):
     """Write pending Mask Stack state dicts into node['_grunge_layers_json']."""
     if node is not None:
@@ -647,7 +668,7 @@ def _flush_dirty_node_json(node=None):
         all_data = _NODE_JSON_CACHE.get(node_ptr)
         if all_data is not None:
             try:
-                dumped = json.dumps(all_data)
+                dumped = _mask_authoring_json(owner_node, all_data)
                 owner_node["_grunge_layers_json"] = dumped
                 _NODE_LAST_JSON_STR[node_ptr] = dumped
             except Exception:
@@ -659,7 +680,7 @@ def _flush_dirty_node_json(node=None):
         all_data = _NODE_JSON_CACHE.get(node_ptr)
         if all_data is not None and n_ref is not None:
             try:
-                dumped = json.dumps(all_data)
+                dumped = _mask_authoring_json(n_ref, all_data)
                 n_ref["_grunge_layers_json"] = dumped
                 _NODE_LAST_JSON_STR[node_ptr] = dumped
             except Exception:
@@ -668,7 +689,7 @@ def _flush_dirty_node_json(node=None):
 
 
 def _save_layer_grunge_state(node, layer, updates=None, flush_json=True):
-    """Persist Mask Stack state updates for (node, layer) into runtime cache and (optionally debounced) IDProperty."""
+    """Persist authoring settings before native duplicate/undo can observe them."""
     if node is None:
         return None
     if layer is None:
@@ -697,10 +718,11 @@ def _save_layer_grunge_state(node, layer, updates=None, flush_json=True):
         _NODE_JSON_CACHE[node_ptr] = all_data
 
     all_data[str(uid)] = st
-    if flush_json or bpy.app.background:
-        _flush_dirty_node_json(owner_node)
-    else:
-        _DIRTY_JSON_NODES[node_ptr] = owner_node
+    # Native storage owns the large paint arrays, so this is small settings JSON.
+    # Deferring it until an idle timer loses edits when a native operator copies
+    # or records the node before that timer runs. Keep the legacy argument for
+    # existing callers, but publish authoring settings synchronously.
+    _flush_dirty_node_json(owner_node)
     return None
 
 
@@ -758,11 +780,43 @@ def _update_active_mask_effect(node, layer, updates, ensure_type=None, flush_jso
     return eff
 
 
+_NATIVE_MASK_SOURCES = {}
+
+
+def _native_mask_layer(node_ptr, layer_uid):
+    # Layer storage can be replaced while its node ID survives (canvas reset,
+    # undo, or removal). Never cache an RNA wrapper to that freed native memory.
+    trees = [m.node_tree for m in bpy.data.materials if m.node_tree] + list(bpy.data.node_groups)
+    for tree in trees:
+        for node in tree.nodes:
+            if node.as_pointer() == node_ptr:
+                return _find_layer_by_uid(node, layer_uid)
+    return None
+
+
+def _native_mask_effect(layer, uid):
+    return next((effect for effect in layer.mask_effects if effect.uid == uid), None) if layer else None
+
+
 def _ensure_paint_effect_buffer(node_ptr, layer_uid, eff, w, h):
     """Ensure the runtime (val_u8, alpha_u8) arrays exist for a PAINT mask effect."""
     import numpy as np
     pkey = (node_ptr, layer_uid, int(eff["uid"]))
     buf = _PAINT_EFFECT_BUFFERS.get(pkey)
+    layer = _native_mask_layer(node_ptr, layer_uid)
+    native = _native_mask_effect(layer, int(eff["uid"]))
+    if native is not None and not (buf and buf.get("native_dirty", False)):
+        if (buf is None or buf["w"] != w or buf["h"] != h or
+                buf.get("native_pointer") != native.as_pointer() or
+                buf.get("native_revision") != native.revision):
+            rgba = np.empty(w * h * 4, dtype=np.float32)
+            native.pixels.foreach_get(rgba)
+            rgba = (np.clip(rgba.reshape(-1, 4), 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            buf = {"w": w, "h": h, "val_u8": rgba[:, 0].copy(),
+                   "alpha_u8": rgba[:, 3].copy(), "rev": native.revision,
+                   "native_revision": native.revision, "native_pointer": native.as_pointer(),
+                   "native_dirty": False}
+            _PAINT_EFFECT_BUFFERS[pkey] = buf
     if buf is not None and buf["w"] == w and buf["h"] == h:
         return buf
 
@@ -792,11 +846,13 @@ def _ensure_paint_effect_buffer(node_ptr, layer_uid, eff, w, h):
     return buf
 
 
-def _sync_paint_effect_z64(eff, pbuf):
+def _sync_paint_effect_z64(eff, pbuf, *, publish=True):
     """Compress the PAINT sub-layer (val_u8, alpha_u8) buffers into eff['paint_z64'] for Undo/Redo and .blend persistence."""
     import numpy as np
     if eff is None or pbuf is None:
         return
+    if publish:
+        pbuf["native_dirty"] = True
     val_u8 = pbuf.get("val_u8")
     alpha_u8 = pbuf.get("alpha_u8")
     if val_u8 is None or alpha_u8 is None:
@@ -821,12 +877,35 @@ def _absorb_pending_brush_strokes(node, layer=None):
     if layer is None or not getattr(layer, "use_mask", False):
         return False
 
+    if layer.mask_effects_active:
+        # Native paint buffers are authoritative. Never infer strokes from the
+        # evaluated mask: doing so loses coverage under Multiply and filters.
+        st = _get_layer_grunge_state(node, layer)
+        w, h = int(node.image.size[0]), int(node.image.size[1])
+        changed = False
+        for eff in st.get("effects", []):
+            if eff.get("type") != 'PAINT':
+                continue
+            native = _native_mask_effect(layer, int(eff["uid"]))
+            if native is None:
+                continue
+            key = (node.as_pointer(), _layer_uid(layer), int(eff["uid"]))
+            cached = _PAINT_EFFECT_BUFFERS.get(key)
+            if cached is not None and cached.get("native_revision") == native.revision:
+                continue
+            pbuf = _ensure_paint_effect_buffer(node.as_pointer(), _layer_uid(layer), eff, w, h)
+            _sync_paint_effect_z64(eff, pbuf, publish=False)
+            changed = True
+        if changed:
+            _save_layer_grunge_state(node, layer, st, flush_json=True)
+        return changed
+
     c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
     if not c_layer.mask_ibuf:
         return False
     c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
     w, h = int(c_imb.x), int(c_imb.y)
-    if w <= 0 or h <= 0 or not c_imb.byte_data:
+    if w <= 0 or h <= 0 or not (c_imb.byte_data or c_imb.float_data):
         return False
 
     node_ptr = node.as_pointer()
@@ -834,16 +913,11 @@ def _absorb_pending_brush_strokes(node, layer=None):
     key = (node_ptr, layer_uid)
 
     import numpy as np
-    buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-    cur_u8 = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)[:, 0]
+    cur_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
 
-    # Ultra-fast 1024-point strided sample check (~0.008 ms) before scanning 4.2M pixels
+    # A sparse sample cannot establish equality: small strokes often fall entirely
+    # between sampled rows/columns. Check every pixel before replacing the mask.
     step = max(1, (w * h) // 1024)
-    sample_prev = _LAST_MASK_SAMPLE.get(key)
-    if sample_prev is not None and len(sample_prev) == len(cur_u8[::step]):
-        if np.array_equal(cur_u8[::step], sample_prev):
-            return False
-
     last_u8 = _LAST_COMPOSITED_MASK.get(key)
     if last_u8 is None or len(last_u8) != w * h:
         _LAST_COMPOSITED_MASK[key] = cur_u8.copy()
@@ -1111,6 +1185,9 @@ _DEFAULT_MESH_MAPS_STATE = {
     "cage_dist": 0.08,
     "ao_dist": 0.65,
     "bake_res": "MATCH",            # 'MATCH' | '512' | '1024' | '2048' | '4096'
+    "bake_samples": 64,
+    "bake_margin": 16,
+    "bake_device": "AUTO",
     "apply_normal_to_shader": True,
     "maps": {
         "normal": "",
@@ -1269,7 +1346,8 @@ def _build_uv_texel_map(ob, grid_w, grid_h):
             hit = in_box & (w0 >= -0.02) & (w1 >= -0.02) & (w2 >= -0.02)
             t_loc, y_loc, x_loc = np.nonzero(hit)
             if len(t_loc) > 0:
-                p_flat = py[t_loc, y_loc, x_loc] * grid_w + px[t_loc, y_loc, x_loc]
+                # Coordinates retain their singleton axes; only hit/weights are fully broadcast.
+                p_flat = py[t_loc, y_loc, 0] * grid_w + px[t_loc, 0, x_loc]
                 buf_tri[p_flat] = s_idx[t_loc]
                 buf_w1[p_flat] = np.clip(w1[t_loc, y_loc, x_loc], 0.0, 1.0)
                 buf_w2[p_flat] = np.clip(w2[t_loc, y_loc, x_loc], 0.0, 1.0)
@@ -1569,7 +1647,9 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
         if o.type == 'MESH' and o.data is not None and not o.hide_get() and len(o.data.vertices) > 0 and len(o.data.polygons) > 0
     ]
     obs_sig = tuple(
-        (o.name, o.data.as_pointer(), len(o.data.vertices), len(o.data.polygons), tuple(round(v, 3) for row in o.matrix_world for v in row))
+        (o.name, o.data.as_pointer(), len(o.data.vertices), len(o.data.polygons),
+         (o.data.uv_layers.active.name, o.data.uv_layers.active.as_pointer()) if o.data.uv_layers.active else None,
+         tuple(round(v, 3) for row in o.matrix_world for v in row))
         for o in (scene_obs if use_global_ao else sharing_obs)
     )
 
@@ -1634,6 +1714,9 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
     orig_gen_noise = c_layer.mask_gen_noise
     orig_gen_noise_scale = c_layer.mask_gen_noise_scale
     orig_gen_invert = c_layer.mask_gen_invert
+    orig_flag = c_layer.flag
+    orig_target = node.paint_target
+    was_reprojecting = _INTERNAL_REPROJECTING
 
     # Temporarily clear bNode.id (offset 216) so rna_TexPaintLayer_mask_gen_update skips the redundant
     # intermediate BKE_tex_paint_composite_rect (~8.4ms saved) before Python evaluates the full mask stack.
@@ -1641,7 +1724,11 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
     orig_node_id = c_node_id.value
 
     c_data_slot, orig_mesh_ptr = _get_object_data_ptr_slot(first_c_ob) if first_c_ob is not None else (None, None)
-    eval_obs = sharing_obs if sharing_obs else ([first_c_ob] if first_c_ob is not None else [])
+    candidates = sharing_obs if sharing_obs else ([first_c_ob] if first_c_ob is not None else [])
+    # Native generation rejects meshes without UVs and leaves the old output intact.
+    # Such output is an evaluated mask, never a new raw generator source.
+    eval_obs = [ob for ob in candidates if ob.data is not None and ob.data.uv_layers.active is not None
+                and len(ob.data.vertices) > 0 and len(ob.data.polygons) > 0]
     raw_u8 = np.zeros(w * h, dtype=np.uint8)
 
     # Precompute assembly world Z span for continuous multi-part POSITION_Z when use_global_ao is True
@@ -1698,21 +1785,170 @@ def _ensure_generator_raw_u8(node, layer, eff, w, h, force=False):
                 mask_sel = cov_u8 > 0
                 raw_u8[mask_sel] = part_u8[mask_sel]
     finally:
-        if c_data_slot is not None and orig_mesh_ptr is not None:
-            c_data_slot.value = orig_mesh_ptr
-        c_node_id.value = orig_node_id
-        _INTERNAL_REPROJECTING = False
-        c_layer.mask_gen_type = orig_gen_type
-        c_layer.mask_gen_blend = orig_gen_blend
-        c_layer.mask_gen_balance = orig_gen_balance
-        c_layer.mask_gen_contrast = orig_gen_contrast
-        c_layer.mask_gen_radius = orig_gen_radius
-        c_layer.mask_gen_noise = orig_gen_noise
-        c_layer.mask_gen_noise_scale = orig_gen_noise_scale
-        c_layer.mask_gen_invert = orig_gen_invert
+        try:
+            if c_data_slot is not None and orig_mesh_ptr is not None:
+                c_data_slot.value = orig_mesh_ptr
+            c_layer.mask_gen_type = orig_gen_type
+            c_layer.mask_gen_blend = orig_gen_blend
+            c_layer.mask_gen_balance = orig_gen_balance
+            c_layer.mask_gen_contrast = orig_gen_contrast
+            c_layer.mask_gen_radius = orig_gen_radius
+            c_layer.mask_gen_noise = orig_gen_noise
+            c_layer.mask_gen_noise_scale = orig_gen_noise_scale
+            c_layer.mask_gen_invert = orig_gen_invert
+            c_layer.flag = orig_flag
+            if node.paint_target != orig_target:
+                node.paint_target = orig_target
+        finally:
+            c_node_id.value = orig_node_id
+            _INTERNAL_REPROJECTING = was_reprojecting
 
     _EFFECT_RAW_CACHE[rkey] = {"sig": sig, "raw_u8": raw_u8}
     return raw_u8
+
+
+def _mask_projection_transform(eff, bbox_center, max_extent):
+    """Calculate mask-owned projection settings without touching its layer's color projection."""
+    mode = eff.get("proj_mode", "TRIPLANAR")
+    repeat = eff.get("uv_wrap", "REPEAT") != 'CLAMP'
+    base_scale = max(float(eff.get("scale", 2.0)), 0.02)
+    locked = eff.get("lock_scale", True)
+    sx = base_scale if locked else max(float(eff.get("scale_x", base_scale)), 0.02)
+    sy = base_scale if locked else max(float(eff.get("scale_y", base_scale)), 0.02)
+    offset_x, offset_y = float(eff.get("offset_x", 0.0)), float(eff.get("offset_y", 0.0))
+    angle = float(eff.get("rotation", 0.0))
+    if mode in {'REPEAT', 'UV', 'FIT'}:
+        scale = (sx, sy, 1.0) if mode != 'FIT' and repeat else (1.0 / sx, 1.0 / sy, 1.0)
+        return (offset_x, offset_y, 0.0), (0.0, 0.0, angle), scale
+    override = eff.get("gizmo_override") and eff.get("gizmo_loc") and eff.get("gizmo_rot")
+    if override:
+        base_loc = Vector(eff["gizmo_loc"])
+        base_rot = Euler(eff["gizmo_rot"], 'XYZ').to_matrix()
+    elif mode in {'DECAL', 'WARP'}:
+        base_loc = Vector((bbox_center.x, bbox_center.y + max_extent * 0.5, bbox_center.z))
+        base_rot = Euler((math.pi * 0.5, 0.0, 0.0), 'XYZ').to_matrix()
+    else:
+        base_loc, base_rot = bbox_center.copy(), Matrix.Identity(3)
+    location = (base_loc + base_rot.col[0].normalized() * (offset_x * max_extent * 0.5) +
+                base_rot.col[1].normalized() * (offset_y * max_extent * 0.5))
+    rotation = (base_rot @ Matrix.Rotation(angle, 3, 'Z')).to_euler('XYZ')
+    half_x, half_y = max(max_extent * 0.5 / sx, 1e-3), max(max_extent * 0.5 / sy, 1e-3)
+    half_z = max(max_extent * 0.5 / ((sx + sy) * 0.5), 1e-3) if mode == 'TRIPLANAR' else max(max_extent * 0.6, 1e-3)
+    stored_scale = eff.get("gizmo_scale") if override else None
+    if stored_scale and len(stored_scale) == 3:
+        # Keep the widget's independent depth; numeric XY scale changes scale it
+        # proportionally without replacing the color layer's transform.
+        ratio = (half_x / max(abs(stored_scale[0]), 1e-3) +
+                 half_y / max(abs(stored_scale[1]), 1e-3)) * 0.5
+        half_z = max(abs(stored_scale[2]) * ratio, 1e-3)
+    signed_z = (half_z if repeat else -half_z) if mode == 'TRIPLANAR' else (-half_z if repeat else half_z)
+    return tuple(location), tuple(rotation), (half_x, half_y, signed_z)
+
+
+def _projection_object_bounds(ob):
+    if ob is None:
+        return Vector((0.0, 0.0, 0.0)), 2.0
+    points = [Vector(co) for co in ob.bound_box]
+    minimum = Vector(tuple(min(p[i] for p in points) for i in range(3)))
+    maximum = Vector(tuple(max(p[i] for p in points) for i in range(3)))
+    return (minimum + maximum) * 0.5, max(*(maximum - minimum), 1e-3)
+
+
+def _get_projection_transform(node, layer, ob=None):
+    """Read the selected target's transform; layer RNA exclusively represents color."""
+    if node.paint_target == 'MASK' and _is_layer_grunge_gizmo_eligible(node, layer):
+        eff = _get_active_mask_effect(node, layer)
+        if ob is None:
+            ob = _find_mesh_object_for_node(node)
+        location, rotation, scale = _mask_projection_transform(eff, *_projection_object_bounds(ob))
+        return location, rotation, tuple(abs(v) for v in scale)
+    return tuple(layer.proj_location), tuple(layer.proj_rotation), tuple(layer.proj_scale)
+
+
+def _set_projection_transform(node, layer, location=None, rotation=None, scale=None, ob=None):
+    """Store a mask widget in its effect, or update the selected color projection through RNA."""
+    if node.paint_target == 'MASK':
+        if not _is_layer_grunge_gizmo_eligible(node, layer):
+            return False
+        if ob is None:
+            ob = _find_mesh_object_for_node(node)
+        old_location, old_rotation, old_scale = _get_projection_transform(node, layer, ob)
+        location = old_location if location is None else location
+        rotation = old_rotation if rotation is None else rotation
+        scale = old_scale if scale is None else scale
+        scale = tuple(max(abs(float(v)), 1e-3) for v in scale)
+        _center, extent = _projection_object_bounds(ob)
+        sx, sy = max(extent * .5 / scale[0], .02), max(extent * .5 / scale[1], .02)
+        eff = _get_active_mask_effect(node, layer)
+        eff.update({"gizmo_override": True, "gizmo_loc": [float(v) for v in location],
+                    "gizmo_rot": [float(v) for v in rotation],
+                    "gizmo_scale": list(scale), "scale": sx, "scale_x": sx, "scale_y": sy,
+                    "lock_scale": abs(sx - sy) < 1e-6, "offset_x": 0.0, "offset_y": 0.0, "rotation": 0.0})
+        _save_layer_grunge_state(node, layer)
+    else:
+        if location is not None:
+            layer.proj_location = location
+        if rotation is not None:
+            layer.proj_rotation = rotation
+        if scale is not None:
+            layer.proj_scale = scale
+    return True
+
+
+def _projection_target_key(node, layer):
+    eff = _get_active_mask_effect(node, layer) if node.paint_target == 'MASK' else None
+    return node.as_pointer(), _layer_uid(layer), node.paint_target, int(eff['uid']) if eff else 0
+
+
+def _capture_projection_edit(node, layer, ob=None):
+    eff = _get_active_mask_effect(node, layer) if node.paint_target == 'MASK' else None
+    return {"key": _projection_target_key(node, layer),
+            "transform": _get_projection_transform(node, layer, ob),
+            "effect": json.loads(json.dumps(eff)) if eff else None}
+
+
+def _restore_projection_edit(node, layer, snapshot):
+    if snapshot is None or snapshot['key'] != _projection_target_key(node, layer):
+        return False
+    if snapshot['effect'] is not None:
+        eff = _get_active_mask_effect(node, layer)
+        eff.clear()
+        eff.update(json.loads(json.dumps(snapshot['effect'])))
+        _save_layer_grunge_state(node, layer)
+    else:
+        location, rotation, scale = snapshot['transform']
+        _set_projection_transform(node, layer, location=location, rotation=rotation, scale=scale)
+    _PENDING_HIRES_REFINE.pop((node.as_pointer(), _layer_uid(layer)), None)
+    return True
+
+
+def _set_gizmo_projection_transform(group, node, layer, **updates):
+    snapshot = getattr(group, '_projection_edit', None)
+    if snapshot is None:
+        snapshot = group._projection_edit = _capture_projection_edit(node, layer)
+    if snapshot['key'] != _projection_target_key(node, layer):
+        return
+    _set_projection_transform(node, layer, **updates)
+    restored = False
+    if snapshot['effect'] is not None:
+        current = _get_projection_transform(node, layer)
+        if all(abs(float(a) - float(b)) < 1e-6
+               for values, original in zip(current, snapshot['transform']) for a, b in zip(values, original)):
+            # Native handles cancel by restoring the original property values.
+            # Restore the original authoring metadata too, including automatic placement.
+            restored = _restore_projection_edit(node, layer, snapshot)
+    _notify_gizmo_projection_changed(node, layer, interactive=not restored)
+
+
+def _next_mask_projection_uid():
+    # The borrowed output contains the final adjusted mask between projections,
+    # including UV gutters. A distinct temporary identity forces the native
+    # projector to clear its entire COW-owned scratch output before sampling.
+    # Real layer identities are positive; stay within the signed DNA int range.
+    previous = getattr(_next_mask_projection_uid, '_last_uid', 0)
+    value = previous - 1 if -2147483648 < previous <= 0 else -1
+    _next_mask_projection_uid._last_uid = value
+    return value
 
 
 def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, from_gizmo=False, interactive=False):
@@ -1747,14 +1983,6 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
         }
         proj_mode_int = proj_mode_map.get(proj_mode_str, 3)
 
-    lock_scale = bool(eff.get("lock_scale", True))
-    base_scale = max(float(eff.get("scale", 2.0)), 0.02)
-    sx = base_scale if lock_scale else max(float(eff.get("scale_x", base_scale)), 0.02)
-    sy = base_scale if lock_scale else max(float(eff.get("scale_y", base_scale)), 0.02)
-
-    rot_z = float(eff.get("rotation", 0.0))
-    off_x = float(eff.get("offset_x", 0.0))
-    off_y = float(eff.get("offset_y", 0.0))
     box_blend = float(np.clip(eff.get("box_blend", 0.5), 0.0, 1.0))
     channel_mode = eff.get("channel", "AUTO")
 
@@ -1762,73 +1990,12 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
     ob = sharing_obs[-1] if sharing_obs else first_c_ob
 
     def _compute_ob_bbox(target_ob):
-        bc = Vector((0.0, 0.0, 0.0))
-        me = 2.0
-        if target_ob is not None and getattr(target_ob, "bound_box", None):
-            pts = [Vector(co) for co in target_ob.bound_box]
-            bmin = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
-            bmax = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
-            bc = (bmin + bmax) * 0.5
-            bsize = bmax - bmin
-            me = max(bsize.x, bsize.y, bsize.z, 1e-3)
-        return bc, me
+        return _projection_object_bounds(target_ob)
 
     bbox_center, max_extent = _compute_ob_bbox(ob)
 
-    if from_gizmo and getattr(layer, "show_projection_widget", False) and proj_mode_int >= 3:
-        eff["gizmo_loc"] = [float(c_layer.proj_location[0]), float(c_layer.proj_location[1]), float(c_layer.proj_location[2])]
-        eff["gizmo_rot"] = [float(c_layer.proj_rotation[0]), float(c_layer.proj_rotation[1]), float(c_layer.proj_rotation[2])]
-        gx = max(abs(float(c_layer.proj_scale[0])), 1e-3)
-        gy = max(abs(float(c_layer.proj_scale[1])), 1e-3)
-        gz = max(abs(float(c_layer.proj_scale[2])), 1e-3)
-        eff["gizmo_scale"] = [gx, gy, gz]
-        eff["gizmo_override"] = True
-        new_sx = round(max(max_extent * 0.5 / gx, 0.02), 3)
-        new_sy = round(max(max_extent * 0.5 / gy, 0.02), 3)
-        eff["scale"] = new_sx
-        eff["scale_x"] = new_sx
-        eff["scale_y"] = new_sy
-        eff["offset_x"] = 0.0
-        eff["offset_y"] = 0.0
-        eff["rotation"] = 0.0
-        sx, sy = new_sx, new_sy
-        off_x, off_y, rot_z = 0.0, 0.0, 0.0
-
     def _compute_proj_xform(bc, me):
-        if proj_mode_int in {1, 2}:
-            l_out = (off_x, off_y, 0.0)
-            r_out = (0.0, 0.0, rot_z)
-            s_out = (sx, sy, 1.0) if proj_mode_int == 2 else (1.0 / sx, 1.0 / sy, 1.0)
-            return l_out, r_out, s_out
-        if eff.get("gizmo_override") and eff.get("gizmo_loc") and eff.get("gizmo_rot"):
-            base_loc = Vector(eff["gizmo_loc"])
-            base_rot_mat = Euler(eff["gizmo_rot"], 'XYZ').to_matrix()
-        elif proj_mode_str in {'DECAL', 'WARP'}:
-            base_loc = Vector((bc.x, bc.y + me * 0.5, bc.z))
-            base_rot_mat = Euler((math.pi * 0.5, 0.0, 0.0), 'XYZ').to_matrix()
-        else:
-            base_loc = bc.copy()
-            base_rot_mat = Matrix.Identity(3)
-
-        ax_x = base_rot_mat.col[0].normalized()
-        ax_y = base_rot_mat.col[1].normalized()
-        final_loc = base_loc + ax_x * (off_x * me * 0.5) + ax_y * (off_y * me * 0.5)
-        final_rot_mat = base_rot_mat @ Matrix.Rotation(rot_z, 3, 'Z')
-        final_rot = final_rot_mat.to_euler('XYZ')
-
-        half_x = max(me * 0.5 / sx, 1e-3)
-        half_y = max(me * 0.5 / sy, 1e-3)
-        half_z = (
-            max(me * 0.5 / ((sx + sy) * 0.5), 1e-3)
-            if proj_mode_str == 'TRIPLANAR'
-            else max(me * 0.6, 1e-3)
-        )
-        z_signed = (half_z if is_repeat else -half_z) if proj_mode_str == 'TRIPLANAR' else (-half_z if is_repeat else half_z)
-        return (
-            (float(final_loc.x), float(final_loc.y), float(final_loc.z)),
-            (float(final_rot.x), float(final_rot.y), float(final_rot.z)),
-            (half_x, half_y, z_signed),
-        )
+        return _mask_projection_transform(eff, bc, me)
 
     loc, rot, scl = _compute_proj_xform(bbox_center, max_extent)
     obs_sig = (
@@ -1860,6 +2027,12 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
     orig_flag = c_layer.flag
     orig_proj_mode = c_layer.proj_mode
     orig_proj_name = bytes(c_layer.proj_image_name)
+    orig_uid = c_layer.uid
+    orig_loc = tuple(c_layer.proj_location)
+    orig_rot = tuple(c_layer.proj_rotation)
+    orig_scl = tuple(c_layer.proj_scale)
+    orig_falloff = c_layer.proj_blend_falloff
+    was_reprojecting = _INTERNAL_REPROJECTING
 
     # Temporarily clear bNode.id (offset 216) so rna_TexPaintLayer_projection_update skips the redundant
     # intermediate BKE_tex_paint_composite_rect (~8.4ms saved) before Python evaluates the full mask stack.
@@ -1947,8 +2120,7 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
                 c_layer.proj_location[i] = loc_0[i]
                 c_layer.proj_rotation[i] = rot_0[i]
                 c_layer.proj_scale[i] = scl_0[i]
-            orig_uid = c_layer.uid
-            c_layer.uid = orig_uid + 10000
+            c_layer.uid = _next_mask_projection_uid()
             layer.proj_blend_falloff = box_blend
             c_layer.uid = orig_uid
             raw_u8, _ = _extract_projected_u8_and_cov()
@@ -1968,9 +2140,8 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
                     c_layer.proj_location[i] = loc_p[i]
                     c_layer.proj_rotation[i] = rot_p[i]
                     c_layer.proj_scale[i] = scl_p[i]
-                # Reset last_proj_layer_uid via temporary uid flip so C++ clears between objects
-                orig_uid = c_layer.uid
-                c_layer.uid = orig_uid + 10000 + idx
+                # Each object needs a fresh scratch projection, including UV gutters.
+                c_layer.uid = _next_mask_projection_uid()
                 layer.proj_blend_falloff = box_blend
                 c_layer.uid = orig_uid
                 part_u8, cov_m = _extract_projected_u8_and_cov()
@@ -1984,18 +2155,19 @@ def _ensure_grunge_raw_u8(node, layer, eff, w, h, context=None, force=False, fro
         if c_data_slot is not None and orig_mesh_ptr is not None:
             c_data_slot.value = orig_mesh_ptr
         c_node_id.value = orig_node_id
-        _INTERNAL_REPROJECTING = False
+        _INTERNAL_REPROJECTING = was_reprojecting
         c_layer.type = orig_type
         c_layer.ibuf = orig_ibuf
         c_layer.mask_ibuf = orig_mask_ibuf
-        c_layer.flag = orig_flag | (1 << 4)
-        if orig_type == 0:
-            c_layer.proj_mode = orig_proj_mode
-            c_layer.proj_image_name = orig_proj_name
-        if proj_mode_int >= 3 and not from_gizmo and getattr(layer, "show_projection_widget", False):
-            c_layer.proj_location[0], c_layer.proj_location[1], c_layer.proj_location[2] = loc[0], loc[1], loc[2]
-            c_layer.proj_rotation[0], c_layer.proj_rotation[1], c_layer.proj_rotation[2] = rot[0], rot[1], rot[2]
-            c_layer.proj_scale[0], c_layer.proj_scale[1], c_layer.proj_scale[2] = abs(scl[0]), abs(scl[1]), abs(scl[2])
+        c_layer.flag = orig_flag
+        c_layer.uid = orig_uid
+        c_layer.proj_mode = orig_proj_mode
+        c_layer.proj_image_name = orig_proj_name
+        c_layer.proj_blend_falloff = orig_falloff
+        for i in range(3):
+            c_layer.proj_location[i] = orig_loc[i]
+            c_layer.proj_rotation[i] = orig_rot[i]
+            c_layer.proj_scale[i] = orig_scl[i]
 
     _EFFECT_RAW_CACHE[rkey] = {"sig": sig, "raw_u8": raw_u8}
     return raw_u8
@@ -2349,6 +2521,84 @@ def _evaluate_single_effect_onto_acc(node, layer, eff, acc_u8, w, h, context=Non
     return acc_u8
 
 
+def _publish_native_mask_stack(node, layer, st, w, h, init_val):
+    """Publish settings/source maps once; native painting owns coverage and evaluation."""
+    import numpy as np
+    effects = st.get("effects", [])
+    key = (node.as_pointer(), _layer_uid(layer))
+    wanted = {int(eff["uid"]) for eff in effects}
+    for native in list(layer.mask_effects):
+        if native.uid not in wanted:
+            _NATIVE_MASK_SOURCES.pop((*key, native.uid), None)
+            layer.mask_effect_remove(native.uid)
+    blends = ('REPLACE', 'ADD', 'SUBTRACT', 'MULTIPLY', 'SCREEN', 'OVERLAY', 'MAX', 'MIN')
+    filters = ('BLUR', 'BLUR_SLOPE', 'SHARPEN', 'DILATE_ERODE', 'BEVEL', 'THRESHOLD', 'POSTERIZE', 'HIGHPASS')
+    for eff in effects:
+        uid = int(eff["uid"])
+        etype = eff.get("type", 'GRUNGE')
+        native_type = {'PAINT': 1, 'LEVELS': 2, 'FILTER': 3}.get(etype, 0)
+        previous = _native_mask_effect(layer, uid)
+        pbuf = None
+        if etype == 'PAINT':
+            # Read existing native pixels before ensure: a new effect must first
+            # migrate its legacy stored coverage, not its fresh empty buffer.
+            pbuf = _ensure_paint_effect_buffer(key[0], key[1], eff, w, h)
+        is_new = previous is None
+        native = layer.mask_effect_ensure(uid=uid, type=native_type)
+        native.enabled = bool(eff.get("enabled", True))
+        native.blend_mode = blends.index(eff.get("blend_mode", 'REPLACE'))
+        native.opacity = float(eff.get("opacity", 1.0))
+        native.invert = bool(eff.get("invert", False))
+        if native_type in {0, 2}:
+            native.curve = _effect_curve_256(eff)
+        if native_type == 0:
+            rkey = (*key, uid)
+            raw = _EFFECT_RAW_CACHE.get(rkey, {}).get("raw_u8")
+            previous_raw = _NATIVE_MASK_SOURCES.get(rkey)
+            if raw is not None and (is_new or previous_raw is not raw):
+                rgba = np.empty((w * h, 4), dtype=np.float32)
+                rgba[:, :3] = raw.reshape(-1, 1) * (1.0 / 255.0)
+                rgba[:, 3] = 1.0
+                native.pixels.foreach_set(rgba.ravel())
+                _NATIVE_MASK_SOURCES[rkey] = raw
+        elif native_type == 1:
+            if is_new or pbuf.get("native_dirty", False):
+                rgba = np.empty((w * h, 4), dtype=np.float32)
+                rgba[:, :3] = pbuf["val_u8"][:, None] * (1.0 / 255.0)
+                rgba[:, 3] = pbuf["alpha_u8"] * (1.0 / 255.0)
+                native.pixels.foreach_set(rgba.ravel())
+                pbuf["native_revision"] = native.revision
+                pbuf["native_pointer"] = native.as_pointer()
+                pbuf["native_dirty"] = False
+        elif native_type == 3:
+            native.filter_type = filters.index(eff.get("filter_type", 'BLUR'))
+            native.filter_radius = float(eff.get("flt_radius", 6.0))
+            native.filter_strength = float(eff.get("flt_strength", 1.0))
+            native.filter_scale = float(eff.get("flt_scale", 8.0))
+    layer.mask_base_value = int(init_val)
+    layer.mask_effects_active = bool(effects)
+    _select_native_mask_paint_target(layer, st)
+    result = layer.mask_stack_evaluate()
+    _sync_layer_mask_to_companion_channels(node, layer)
+    return result
+
+
+def _select_native_mask_paint_target(layer, st):
+    paints = [e for e in st.get("effects", []) if e.get("type") == 'PAINT']
+    active = int(st.get("active_effect_uid", 0))
+    layer.active_mask_effect_uid = next((int(e["uid"]) for e in paints if int(e["uid"]) == active),
+                                       0)
+    ntree = getattr(layer, "id_data", None)
+    if ntree is None or getattr(ntree, "name", "") == _2D_STANDALONE_NG_NAME:
+        return
+    layer_uid = _layer_uid(layer)
+    for node in ntree.nodes:
+        if node.bl_idname == 'ShaderNodeTexPaint':
+            other = _find_layer_by_uid(node, layer_uid)
+            if other is not None and other != layer and other.mask_effects_active:
+                other.active_mask_effect_uid = layer.active_mask_effect_uid
+
+
 def _evaluate_layer_grunge_mask(node, layer=None, context=None, force_reproject=False, from_gizmo=False, skip_absorb=False, interactive=False):
     """Evaluate the entire Substance-style Multi-Layer Mask Stack into layer.mask_ibuf in real time."""
     global _INTERNAL_REPROJECTING
@@ -2394,7 +2644,8 @@ def _evaluate_layer_grunge_mask(node, layer=None, context=None, force_reproject=
     key = (node_ptr, layer_uid)
 
     # Determine initial base mask value (0 or 255) before effect 0
-    enabled_indices = [i for i, e in enumerate(effects) if e.get("enabled", True)]
+    enabled_indices = [i for i, e in enumerate(effects)
+                           if e.get("enabled", True) and float(e.get("opacity", 1.0)) > 1e-5]
     first_enabled = effects[enabled_indices[0]] if enabled_indices else None
     if first_enabled is None:
         init_val = int(st.get("base_value", 255))
@@ -2429,172 +2680,8 @@ def _evaluate_layer_grunge_mask(node, layer=None, context=None, force_reproject=
             if inter_this and force_this:
                 _PENDING_HIRES_REFINE[key] = (node, layer, time.perf_counter())
 
-    c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
-    has_byte_dst = bool(c_imb.byte_data)
-    if has_byte_dst:
-        buf_u32 = (ctypes.c_uint32 * (w * h)).from_address(c_imb.byte_data)
-        dst_u32 = np.frombuffer(buf_u32, dtype=np.uint32)
+    return _publish_native_mask_stack(node, layer, st, w, h, init_val)
 
-    last_enabled_idx = enabled_indices[-1] if enabled_indices else -1
-    top_eff = effects[last_enabled_idx] if last_enabled_idx >= 0 else None
-    top_opacity = float(np.clip(top_eff.get("opacity", 1.0), 0.0, 1.0)) if top_eff else 0.0
-
-    # ULTRA-FAST FUSED PATH: When writing to an 8-bit mask_ibuf and the topmost enabled effect is GRUNGE,
-    # GENERATOR, or LEVELS with opacity > 0, fuse the final effect's LUT + RGBA uint32 packing into ONE
-    # multi-threaded pass directly into c_imb.byte_data (eliminates acc_u8 copy + second np.take pass).
-    top_rkey = (node_ptr, layer_uid, int(top_eff["uid"])) if top_eff is not None else None
-    can_fuse_top = (
-        has_byte_dst and
-        top_eff is not None and
-        top_eff.get("type") in {'GRUNGE', 'GENERATOR', 'LEVELS'} and
-        top_opacity > 1e-5 and
-        (top_eff.get("type") == 'LEVELS' or top_rkey in _EFFECT_RAW_CACHE)
-    )
-
-    if can_fuse_top:
-        # Evaluate all enabled effects strictly below last_enabled_idx into below_u8
-        below_top_sig = (
-            init_val,
-            w,
-            h,
-            tuple(_effect_state_sig(node_ptr, layer_uid, e) for e in effects[:last_enabled_idx]),
-        )
-        enabled_below = [i for i in enabled_indices if i < last_enabled_idx]
-        if not enabled_below:
-            below_u8 = None  # Constant init_val base!
-        else:
-            below_cached = _STACK_BELOW_CACHE.get(key)
-            if below_cached is not None and below_cached.get("sig") == below_top_sig:
-                below_u8 = below_cached["below_u8"]
-            else:
-                below_u8 = np.full(w * h, init_val, dtype=np.uint8)
-                for i in enabled_below:
-                    _evaluate_single_effect_onto_acc(
-                        node, layer, effects[i], below_u8, w, h,
-                        context=context, force_reproject=False, from_gizmo=False,
-                        is_first=(i == enabled_indices[0]), interactive=False,
-                    )
-                _STACK_BELOW_CACHE[key] = {"sig": below_top_sig, "below_u8": below_u8}
-
-        etype = top_eff.get("type", "GRUNGE")
-        blend_mode = 'REPLACE' if etype == 'LEVELS' else top_eff.get("blend_mode", "REPLACE")
-        s_curve = _effect_curve_256(top_eff)
-
-        if etype == 'LEVELS':
-            src_1d = below_u8 if below_u8 is not None else np.full(w * h, init_val, dtype=np.uint8)
-            b_1d = np.linspace(0.0, 1.0, 256, dtype=np.float32)
-            s_1d = np.clip(s_curve, 0.0, 1.0)
-            m_1d = b_1d + (s_1d - b_1d) * top_opacity
-            lut_256_u32 = _pack_u8_lut_to_rgba_u32(m_1d)
-            _parallel_take_u32(lut_256_u32, src_1d, dst_u32)
-        else:
-            rkey = (node_ptr, layer_uid, int(top_eff["uid"]))
-            raw_u8 = _EFFECT_RAW_CACHE[rkey]["raw_u8"]
-
-            if below_u8 is None or (blend_mode == 'REPLACE' and top_opacity >= 0.9999):
-                # 1D 256-entry uint32 LUT (L1-cache resident, zero 16-bit pair index needed!)
-                m_1d = _compute_blend_matrix_or_curve(
-                    s_curve, blend_mode, top_opacity,
-                    const_base_val=(init_val if below_u8 is None else None),
-                )
-                lut_256_u32 = _pack_u8_lut_to_rgba_u32(m_1d)
-                _parallel_take_u32(lut_256_u32, raw_u8, dst_u32)
-            else:
-                # 2D 64K-entry uint32 LUT with cached 16-bit pair index (zero shifts, zero allocations on Balance/Contrast drag!)
-                m_2d = _compute_blend_matrix_or_curve(s_curve, blend_mode, top_opacity, const_base_val=None)
-                lut_64k_u32 = _pack_u8_lut_to_rgba_u32(m_2d)
-
-                pcache = _PAIR_IDX_CACHE.get(key)
-                raw_id = id(raw_u8)
-                if pcache is None or pcache["w"] != w or pcache["h"] != h:
-                    idx_u16 = np.empty(w * h, dtype=np.uint16)
-                    pcache = {"w": w, "h": h, "below_sig": None, "raw_id": None, "idx_u16": idx_u16}
-                    _PAIR_IDX_CACHE[key] = pcache
-                else:
-                    idx_u16 = pcache["idx_u16"]
-
-                need_below = below_u8 if pcache["below_sig"] != below_top_sig else None
-                need_raw = raw_u8 if pcache["raw_id"] != raw_id else None
-                idx_pairs = idx_u16.view(np.uint8).reshape(-1, 2) if (need_below is not None or need_raw is not None) else None
-
-                _parallel_take_u32(
-                    lut_64k_u32, idx_u16, dst_u32,
-                    raw_u8=need_raw, below_u8=need_below, idx_pairs=idx_pairs,
-                )
-                pcache["below_sig"] = below_top_sig
-                pcache["raw_id"] = raw_id
-
-        # Record 1024-point strided sample for 8us brush stroke detection; defer full 4MB copy to idle timer
-        step = max(1, (w * h) // 1024)
-        cur_u8 = dst_u32.view(np.uint8).reshape(-1, 4)[:, 0]
-        _LAST_MASK_SAMPLE[key] = cur_u8[::step].copy()
-        if bpy.app.background and any(e.get("type") == 'PAINT' for e in effects):
-            _LAST_COMPOSITED_MASK[key] = cur_u8.copy()
-        else:
-            _LAST_COMPOSITED_MASK[key] = None
-    else:
-        # General fallback path (e.g. topmost effect is PAINT or float_data buffer)
-        below_sig = (
-            init_val,
-            w,
-            h,
-            tuple(_effect_state_sig(node_ptr, layer_uid, e) for e in effects[:act_idx]),
-        )
-        below_cached = _STACK_BELOW_CACHE.get(key)
-        if act_idx > 0 and below_cached is not None and below_cached.get("sig") == below_sig:
-            acc_u8 = below_cached["below_u8"].copy()
-            start_idx = act_idx
-        else:
-            acc_u8 = np.full(w * h, init_val, dtype=np.uint8)
-            for i in range(act_idx):
-                _evaluate_single_effect_onto_acc(
-                    node, layer, effects[i], acc_u8, w, h,
-                    context=context, force_reproject=False, from_gizmo=False, is_first=(i == 0),
-                )
-            if act_idx > 0:
-                _STACK_BELOW_CACHE[key] = {"sig": below_sig, "below_u8": acc_u8.copy()}
-            start_idx = act_idx
-
-        for i in range(start_idx, len(effects)):
-            _evaluate_single_effect_onto_acc(
-                node, layer, effects[i], acc_u8, w, h,
-                context=context,
-                force_reproject=False,
-                from_gizmo=(from_gizmo and i == act_idx),
-                is_first=(i == 0),
-                interactive=(interactive and i == act_idx),
-            )
-
-        _LAST_COMPOSITED_MASK[key] = acc_u8.copy()
-        step = max(1, (w * h) // 1024)
-        _LAST_MASK_SAMPLE[key] = acc_u8[::step].copy()
-
-        if has_byte_dst:
-            v_u32 = np.arange(256, dtype=np.uint32)
-            lut_rgba = (255 << 24) | (v_u32 << 16) | (v_u32 << 8) | v_u32
-            _parallel_take_u32(lut_rgba, acc_u8, dst_u32)
-        elif c_imb.float_data:
-            buf_f32 = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-            dst_f32 = np.frombuffer(buf_f32, dtype=np.float32).reshape(-1, 4)
-            g = acc_u8.astype(np.float32) * (1.0 / 255.0)
-            dst_f32[:, 0] = g
-            dst_f32[:, 1] = g
-            dst_f32[:, 2] = g
-            dst_f32[:, 3] = 1.0
-
-    c_layer.runtime_dirty = 1
-    st["active"] = True
-    _save_layer_grunge_state(node, layer, st, flush_json=not interactive)
-    if getattr(node, "paint_target", None) != 'MASK':
-        node.paint_target = 'MASK'
-    layer.invert_mask = layer.invert_mask
-    _sync_layer_mask_to_companion_channels(node, layer)
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Context Lookup & 3D Projection Helpers
-# ---------------------------------------------------------------------------
 
 def _find_any_tex_paint_node(ntree):
     if ntree is None:
@@ -2756,12 +2843,10 @@ def _active_uv_projection_from_context(context):
         eff.get("proj_mode", "TRIPLANAR") in {'REPEAT', 'UV', 'FIT'}
     )
 
-    if p_target == 'MASK' and has_mask_uv:
-        return ob, node, layer, 'MASK_FILL', eff
+    if p_target == 'MASK':
+        return (ob, node, layer, 'MASK_FILL', eff) if has_mask_uv else (None, None, None, None, None)
     if has_color_uv:
         return ob, node, layer, 'COLOR_LAYER', None
-    if has_mask_uv:
-        return ob, node, layer, 'MASK_FILL', eff
     return None, None, None, None, None
 
 
@@ -2840,19 +2925,19 @@ def _active_projection_layer_from_context(context):
     layer = node.active_layer
     if layer is None or layer.hide or layer.lock:
         return None, None, None
+    if node.paint_target == 'MASK':
+        return (ob, node, layer) if _is_layer_grunge_gizmo_eligible(node, layer) else (None, None, None)
     if layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
-        return ob, node, layer
-    if _is_layer_grunge_gizmo_eligible(node, layer):
         return ob, node, layer
     return None, None, None
 
 
 def _effective_proj_mode(node, layer):
-    if layer is not None and layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
-        return layer.proj_mode
-    if _is_layer_grunge_gizmo_eligible(node, layer):
+    if node.paint_target == 'MASK' and _is_layer_grunge_gizmo_eligible(node, layer):
         eff = _get_active_mask_effect(node, layer)
         return eff.get("proj_mode", "TRIPLANAR") if eff else 'TRIPLANAR'
+    if node.paint_target == 'COLOR' and layer is not None and layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
+        return layer.proj_mode
     return 'NONE'
 
 
@@ -2972,10 +3057,12 @@ def _reproject_color_layer_multi_object(node, layer, context=None, force=True):
     return True
 
 
-def _notify_gizmo_projection_changed(node, layer, context=None):
-    if _is_layer_grunge_gizmo_eligible(node, layer):
-        _evaluate_layer_grunge_mask(node, layer, context=context, force_reproject=True, from_gizmo=True, interactive=True)
-    elif layer is not None and layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
+def _notify_gizmo_projection_changed(node, layer, context=None, interactive=True):
+    if node.paint_target == 'MASK' and _is_layer_grunge_gizmo_eligible(node, layer):
+        _evaluate_layer_grunge_mask(node, layer, context=context, force_reproject=True, from_gizmo=True, interactive=interactive)
+        if not interactive:
+            _PENDING_HIRES_REFINE.pop((node.as_pointer(), _layer_uid(layer)), None)
+    elif node.paint_target == 'COLOR' and layer is not None and layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') in _3D_GIZMO_PROJ_MODES:
         _reproject_color_layer_multi_object(node, layer, context=context, force=True)
 
 
@@ -3066,7 +3153,9 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
 
     @classmethod
     def poll(cls, context):
-        _ob, _node, layer = _active_projection_layer_from_context(context)
+        if context.space_data is None or context.space_data.type != 'VIEW_3D':
+            return False
+        _ob, node, layer = _active_projection_layer_from_context(context)
         if layer is not None:
             return True
         _uob, _unode, ulayer, _tk, _eff = _active_uv_projection_from_context(context)
@@ -3114,31 +3203,32 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
                 ok, hit_loc, hit_no, _ = ob.closest_point_on_mesh(center)
                 if ok:
                     center = hit_loc
-                    layer.proj_rotation = _rotation_from_normal_and_up(hit_no, Vector((0.0, 0.0, 1.0)))
-            layer.proj_location = center
+                    _set_projection_transform(node, layer, rotation=_rotation_from_normal_and_up(hit_no, Vector((0.0, 0.0, 1.0))))
+            _set_projection_transform(node, layer, location=center)
             _notify_gizmo_projection_changed(node, layer, context)
         elif self.mode == 'RESET_ROT':
-            layer.proj_rotation = (0.0, 0.0, 0.0)
+            _set_projection_transform(node, layer, rotation=(0.0, 0.0, 0.0))
             _notify_gizmo_projection_changed(node, layer, context)
         elif self.mode == 'RESET_SCALE' and ob is not None:
             dims = ob.dimensions
             avg_ext = max((dims.x + dims.y + dims.z) / 6.0, 0.1)
             if eff_mode == 'DECAL':
-                layer.proj_scale = (avg_ext * 0.5, avg_ext * 0.5, avg_ext * 0.8)
+                _set_projection_transform(node, layer, scale=(avg_ext * 0.5, avg_ext * 0.5, avg_ext * 0.8))
             else:
-                layer.proj_scale = (avg_ext, avg_ext, avg_ext)
+                _set_projection_transform(node, layer, scale=(avg_ext, avg_ext, avg_ext))
             _notify_gizmo_projection_changed(node, layer, context)
 
         _tag_view3d_gizmo_refresh(context)
         return {'FINISHED'}
 
-    def _init_modal_basis(self, context, ob, layer, event):
+    def _init_modal_basis(self, context, ob, node, layer, event):
         from bpy_extras import view3d_utils
 
-        self._init_loc = Vector(layer.proj_location)
-        self._init_rot = Euler(layer.proj_rotation, 'XYZ')
+        location, rotation, scale = _get_projection_transform(node, layer, ob)
+        self._init_loc = Vector(location)
+        self._init_rot = Euler(rotation, 'XYZ')
         self._init_rot_mat = self._init_rot.to_matrix()
-        self._init_scale = Vector(layer.proj_scale)
+        self._init_scale = Vector(scale)
 
         self._ob_mat = ob.matrix_world.copy()
         self._ob_inv = self._ob_mat.inverted_safe()
@@ -3261,7 +3351,7 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
 
             new_world_pos = self._init_world_pos + delta_w
             _MODAL_TRANSFORM_STATE["world_current"] = new_world_pos
-            layer.proj_location = self._ob_inv @ new_world_pos
+            _set_projection_transform(node, layer, location=self._ob_inv @ new_world_pos)
             _notify_gizmo_projection_changed(node, layer, context)
             self._update_modal_overlay_and_header(context, info_str)
 
@@ -3303,7 +3393,7 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
 
             rot_delta = Matrix.Rotation(angle_rad * sign, 3, ax_obj)
             new_rot_mat = rot_delta @ self._init_rot_mat
-            layer.proj_rotation = new_rot_mat.to_euler('XYZ', self._init_rot)
+            _set_projection_transform(node, layer, rotation=new_rot_mat.to_euler('XYZ', self._init_rot))
             _MODAL_TRANSFORM_STATE["world_current"] = self._init_world_pos
             _notify_gizmo_projection_changed(node, layer, context)
             info_str = f"Angle = {math.degrees(angle_rad):+.1f}°"
@@ -3339,7 +3429,7 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
             else:
                 new_rot_mat = self._init_rot_mat.copy()
 
-            layer.proj_rotation = new_rot_mat.to_euler('XYZ', self._init_rot)
+            _set_projection_transform(node, layer, rotation=new_rot_mat.to_euler('XYZ', self._init_rot))
             _MODAL_TRANSFORM_STATE["world_current"] = self._init_world_pos
             _notify_gizmo_projection_changed(node, layer, context)
             info_str = f"Trackball: {math.degrees(phi0):+.2f}°  {math.degrees(phi1):+.2f}°"
@@ -3372,7 +3462,7 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
                 new_scale = [max(0.005, s * ratio) for s in self._init_scale]
                 info_str = f"Scale = {ratio:.3f}x"
 
-            layer.proj_scale = new_scale
+            _set_projection_transform(node, layer, scale=new_scale)
             _MODAL_TRANSFORM_STATE["world_current"] = self._init_world_pos
             _notify_gizmo_projection_changed(node, layer, context)
             self._update_modal_overlay_and_header(context, info_str)
@@ -3382,11 +3472,8 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
 
     def _restore_initial_state(self, context):
         _ob, node, layer = _active_projection_layer_from_context(context)
-        if layer is not None:
-            layer.proj_location = self._init_loc
-            layer.proj_rotation = self._init_rot
-            layer.proj_scale = self._init_scale
-            _notify_gizmo_projection_changed(node, layer, context)
+        if layer is not None and _restore_projection_edit(node, layer, self._projection_edit):
+            _notify_gizmo_projection_changed(node, layer, context, interactive=False)
 
     def _finish_modal(self, context):
         _MODAL_TRANSFORM_STATE["active"] = False
@@ -3437,7 +3524,8 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
         self._local_space = True
         context.window_manager.tex_paint_gizmo_mode = self._active_mode
 
-        self._init_modal_basis(context, ob, layer, event)
+        self._projection_edit = _capture_projection_edit(node, layer, ob)
+        self._init_modal_basis(context, ob, node, layer, event)
         context.window.cursor_modal_set('SCROLL_XY')
         self._update_modal_overlay_and_header(context, "Move mouse to adjust")
         self._tag_redraw(context)
@@ -3450,7 +3538,8 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
 
     def modal(self, context, event):
         ob, node, layer = _active_projection_layer_from_context(context)
-        if ob is None or layer is None:
+        if (ob is None or layer is None or
+                self._projection_edit['key'] != _projection_target_key(node, layer)):
             self._finish_modal(context)
             return {'CANCELLED'}
 
@@ -3493,7 +3582,7 @@ class NODE_OT_tex_paint_gizmo_mode(Operator):
                 context.window_manager.tex_paint_gizmo_mode = (
                     'ROTATE' if self._active_mode == 'TRACKBALL' else self._active_mode
                 )
-                self._init_modal_basis(context, ob, layer, event)
+                self._init_modal_basis(context, ob, node, layer, event)
                 self._apply_modal_transform(context, event)
             return {'RUNNING_MODAL'}
 
@@ -3564,7 +3653,7 @@ class NODE_OT_tex_paint_layer_align_view(Operator):
 
     @classmethod
     def poll(cls, context):
-        _ob, _node, layer = _active_projection_layer_from_context(context)
+        _ob, node, layer = _active_projection_layer_from_context(context)
         return layer is not None and context.region_data is not None
 
     def execute(self, context):
@@ -3578,7 +3667,7 @@ class NODE_OT_tex_paint_layer_align_view(Operator):
         view_z_obj = (ob_inv_3x3 @ Vector(view_inv.col[2][:3])).normalized()
         view_y_obj = (ob_inv_3x3 @ Vector(view_inv.col[1][:3])).normalized()
 
-        layer.proj_rotation = _rotation_from_normal_and_up(view_z_obj, view_y_obj)
+        _set_projection_transform(node, layer, rotation=_rotation_from_normal_and_up(view_z_obj, view_y_obj))
 
         bbox = [Vector(co) for co in ob.bound_box]
         center_obj = sum(bbox, Vector((0.0, 0.0, 0.0))) / 8.0
@@ -3586,7 +3675,7 @@ class NODE_OT_tex_paint_layer_align_view(Operator):
         ray_start = center_obj + view_z_obj * (radius * 2.0)
         hit, hit_loc, _hit_no, _ = ob.ray_cast(ray_start, -view_z_obj, distance=radius * 4.0)
         if hit:
-            layer.proj_location = hit_loc
+            _set_projection_transform(node, layer, location=hit_loc)
 
         layer.show_projection_widget = True
         _notify_gizmo_projection_changed(node, layer, context)
@@ -3602,7 +3691,7 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
 
     @classmethod
     def poll(cls, context):
-        _ob, _node, layer = _active_projection_layer_from_context(context)
+        _ob, node, layer = _active_projection_layer_from_context(context)
         return (
             layer is not None and
             context.space_data is not None and
@@ -3655,19 +3744,17 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
             rot_mat = base_euler.to_matrix() @ Matrix.Rotation(self._spin_angle, 3, 'Z')
             base_euler = rot_mat.to_euler('XYZ')
 
-        layer.proj_location = hit_loc
-        layer.proj_rotation = base_euler
+        _set_projection_transform(node, layer, location=hit_loc)
+        _set_projection_transform(node, layer, rotation=base_euler)
         _notify_gizmo_projection_changed(node, layer, context)
         return True
 
     def invoke(self, context, event):
-        ob, _node, layer = _active_projection_layer_from_context(context)
+        ob, node, layer = _active_projection_layer_from_context(context)
         if ob is None or layer is None:
             return {'CANCELLED'}
 
-        self._init_loc = Vector(layer.proj_location)
-        self._init_rot = Euler(layer.proj_rotation, 'XYZ')
-        self._init_scale = Vector(layer.proj_scale)
+        self._projection_edit = _capture_projection_edit(node, layer, ob)
         self._spin_angle = 0.0
         self._last_mouse_x = event.mouse_region_x
         self._dragging = False
@@ -3682,7 +3769,7 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
 
     def modal(self, context, event):
         _ob, node, layer = _active_projection_layer_from_context(context)
-        if layer is None:
+        if layer is None or self._projection_edit['key'] != _projection_target_key(node, layer):
             self._finish(context)
             return {'CANCELLED'}
 
@@ -3691,14 +3778,14 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
 
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
             fac = 1.1
-            layer.proj_scale = [max(0.005, s * fac) for s in layer.proj_scale]
+            _set_projection_transform(node, layer, scale=[max(0.005, s * fac) for s in _get_projection_transform(node, layer)[2]])
             _notify_gizmo_projection_changed(node, layer, context)
             _tag_view3d_gizmo_refresh(context)
             return {'RUNNING_MODAL'}
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
             fac = 1.0 / 1.1
-            layer.proj_scale = [max(0.005, s * fac) for s in layer.proj_scale]
+            _set_projection_transform(node, layer, scale=[max(0.005, s * fac) for s in _get_projection_transform(node, layer)[2]])
             _notify_gizmo_projection_changed(node, layer, context)
             _tag_view3d_gizmo_refresh(context)
             return {'RUNNING_MODAL'}
@@ -3718,8 +3805,8 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
             if event.shift:
                 dx = event.mouse_region_x - self._last_mouse_x
                 self._spin_angle -= dx * 0.015
-                rot_mat = Euler(layer.proj_rotation, 'XYZ').to_matrix() @ Matrix.Rotation(-dx * 0.015, 3, 'Z')
-                layer.proj_rotation = rot_mat.to_euler('XYZ')
+                rot_mat = Euler(_get_projection_transform(node, layer)[1], 'XYZ').to_matrix() @ Matrix.Rotation(-dx * 0.015, 3, 'Z')
+                _set_projection_transform(node, layer, rotation=rot_mat.to_euler('XYZ'))
                 _notify_gizmo_projection_changed(node, layer, context)
                 _tag_view3d_gizmo_refresh(context)
             elif self._dragging:
@@ -3733,10 +3820,8 @@ class NODE_OT_tex_paint_layer_snap_decal(Operator):
             return {'FINISHED'}
 
         if event.type == 'ESC':
-            layer.proj_location = self._init_loc
-            layer.proj_rotation = self._init_rot
-            layer.proj_scale = self._init_scale
-            _notify_gizmo_projection_changed(node, layer, context)
+            if _restore_projection_edit(node, layer, self._projection_edit):
+                _notify_gizmo_projection_changed(node, layer, context, interactive=False)
             self._finish(context)
             return {'CANCELLED'}
 
@@ -3761,9 +3846,9 @@ class NODE_OT_tex_paint_layer_bake_projection(Operator):
         layer = node.active_layer if node else None
         if layer is None:
             return False
-        if layer.type == 'PAINT' and getattr(layer, "proj_mode", 'NONE') != 'NONE':
+        if node.paint_target == 'COLOR' and layer.type == 'PAINT' and getattr(layer, "proj_mode", 'NONE') != 'NONE':
             return True
-        return _is_layer_grunge_gizmo_eligible(node, layer)
+        return node.paint_target == 'MASK' and _is_layer_grunge_gizmo_eligible(node, layer)
 
     def execute(self, context):
         node = tex_paint_node_from_context(context)
@@ -3771,7 +3856,7 @@ class NODE_OT_tex_paint_layer_bake_projection(Operator):
         if layer is None:
             return {'CANCELLED'}
         layer.show_projection_widget = False
-        if layer.type == 'PAINT':
+        if node.paint_target == 'COLOR' and layer.type == 'PAINT':
             layer.proj_mode = 'NONE'
         _tag_view3d_gizmo_refresh(context)
         return {'FINISHED'}
@@ -3795,7 +3880,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             return False
         if getattr(context, "mode", "") != 'PAINT_TEXTURE':
             return False
-        _ob, _node, layer = _active_projection_layer_from_context(context)
+        _ob, node, layer = _active_projection_layer_from_context(context)
         if layer is None:
             return False
         return bool(getattr(layer, "show_projection_widget", False))
@@ -3807,9 +3892,10 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             return None
         ob_mat = ob.matrix_world
         ob_3x3 = ob_mat.to_3x3()
-        loc_obj = Vector(layer.proj_location)
-        rot_obj = Euler(layer.proj_rotation, 'XYZ').to_matrix()
-        scale_obj = Vector(layer.proj_scale)
+        location, rotation, scale = _get_projection_transform(node, layer, ob)
+        loc_obj = Vector(location)
+        rot_obj = Euler(rotation, 'XYZ').to_matrix()
+        scale_obj = Vector(scale)
         world_pos = ob_mat @ loc_obj
 
         axes_obj = [rot_obj.col[i].normalized() for i in range(3)]
@@ -3841,8 +3927,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             axis_w = axes_world[axis]
             cur_proj = float(world_pos.dot(axis_w))
             new_world_pos = world_pos + axis_w * (float(value) - cur_proj)
-            layer.proj_location = ob.matrix_world.inverted_safe() @ new_world_pos
-            _notify_gizmo_projection_changed(node, layer)
+            _set_gizmo_projection_transform(self, node, layer, location=ob.matrix_world.inverted_safe() @ new_world_pos)
         return set_fn
 
     def _make_scale_get(self, axis):
@@ -3861,10 +3946,9 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
                 return
             _ob, node, layer, _loc_obj, _rot_obj, _scale_obj, _world_pos, _axes_obj, _axes_world, axis_scales = state
             new_s = max(0.005, abs(float(value)) / max(axis_scales[axis], 1e-6))
-            s_vec = list(layer.proj_scale)
+            s_vec = list(_get_projection_transform(node, layer)[2])
             s_vec[axis] = new_s
-            layer.proj_scale = s_vec
-            _notify_gizmo_projection_changed(node, layer)
+            _set_gizmo_projection_transform(self, node, layer, scale=s_vec)
         return set_fn
 
     def _uni_scale_get(self):
@@ -3881,8 +3965,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
         _ob, node, layer, _loc_obj, _rot_obj, scale_obj, _world_pos, _axes_obj, _axes_world, axis_scales = state
         cur_avg = max((scale_obj[0] * axis_scales[0] + scale_obj[1] * axis_scales[1]) * 0.5, 1e-5)
         ratio = max(0.005, float(value)) / cur_avg
-        layer.proj_scale = [max(0.005, s * ratio) for s in scale_obj]
-        _notify_gizmo_projection_changed(node, layer)
+        _set_gizmo_projection_transform(self, node, layer, scale=[max(0.005, s * ratio) for s in scale_obj])
 
     def _make_rot_get(self, axis):
         def get_fn():
@@ -3898,12 +3981,22 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             self._rot_modal_angle[axis] = float(value)
             axis_char = ('X', 'Y', 'Z')[axis]
             rot_new = self._rot_start_mat @ Matrix.Rotation(-float(value), 3, axis_char)
-            layer.proj_rotation = rot_new.to_euler('XYZ', Euler(layer.proj_rotation, 'XYZ'))
-            _notify_gizmo_projection_changed(node, layer)
+            _set_gizmo_projection_transform(self, node, layer, rotation=rot_new.to_euler('XYZ', Euler(_get_projection_transform(node, layer)[1], 'XYZ')))
         return set_fn
+
+    def _free_move_get(self):
+        state = self._get_world_state()
+        return tuple(state[3]) if state is not None else (0.0, 0.0, 0.0)
+
+    def _free_move_set(self, value):
+        state = self._get_world_state()
+        if state is not None:
+            _ob, node, layer = state[:3]
+            _set_gizmo_projection_transform(self, node, layer, location=value)
 
     def setup(self, context):
         self.gizmos.clear()
+        self._projection_edit = None
         self._rot_start_mat = Matrix.Identity(3)
         self._rot_modal_angle = [0.0, 0.0, 0.0]
 
@@ -3923,6 +4016,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
         gz_free.scale_basis = 0.18
         gz_free.line_width = 2.2
         gz_free.use_draw_modal = True
+        gz_free.use_undo = True
         self.gz_free_move = gz_free
 
         self.move_arrows = []
@@ -3936,6 +4030,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             gz.scale_basis = 1.0
             gz.line_width = 2.5
             gz.use_draw_modal = True
+            gz.use_undo = True
             gz.target_set_handler(
                 "offset",
                 get=self._make_move_get(i),
@@ -3954,6 +4049,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             gz.scale_basis = 1.0
             gz.line_width = 2.2
             gz.use_draw_modal = True
+            gz.use_undo = True
             gz.target_set_handler(
                 "offset",
                 get=self._make_scale_get(i),
@@ -3970,6 +4066,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
         gz_uni.alpha_highlight = 1.0
         gz_uni.scale_basis = 1.25
         gz_uni.use_draw_modal = True
+        gz_uni.use_undo = True
         gz_uni.target_set_handler(
             "offset",
             get=self._uni_scale_get,
@@ -3987,6 +4084,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
             gz.scale_basis = 0.95 if i == 2 else 0.82
             gz.line_width = 2.8 if i == 2 else 2.0
             gz.use_draw_modal = True
+            gz.use_undo = True
             gz.use_draw_value = True
             gz.incremental_angle = math.radians(15.0)
             gz.target_set_handler(
@@ -4002,7 +4100,9 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
         state = self._get_world_state()
         if state is None:
             return
-        ob, _node, layer, _loc_obj, rot_obj, scale_obj, world_pos, _axes_obj, axes_world, axis_scales = state
+        ob, node, layer, _loc_obj, rot_obj, scale_obj, world_pos, _axes_obj, axes_world, axis_scales = state
+        if not any(gizmo.is_modal for gizmo in self.gizmos):
+            self._projection_edit = _capture_projection_edit(node, layer, ob)
 
         wm = getattr(context, "window_manager", None)
         gizmo_mode = getattr(wm, "tex_paint_gizmo_mode", 'ALL') if wm else 'ALL'
@@ -4014,7 +4114,7 @@ class VIEW3D_GGT_tex_paint_projection(GizmoGroup):
         if not self.gz_free_move.is_modal:
             self.gz_free_move.matrix_space = ob.matrix_world
             self.gz_free_move.matrix_basis = Matrix.Identity(4)
-            self.gz_free_move.target_set_prop("offset", layer, "proj_location")
+            self.gz_free_move.target_set_handler("offset", get=self._free_move_get, set=self._free_move_set)
 
         for i, gz in enumerate(self.move_arrows):
             gz.hide = not show_move
@@ -4071,11 +4171,10 @@ def _draw_projection_wireframe_3d():
     import gpu
     from gpu_extras.batch import batch_for_shader
 
-    loc = Vector(layer.proj_location)
-    rot = Euler(layer.proj_rotation, 'XYZ').to_matrix().to_4x4()
-    sx = max(layer.proj_scale[0], 0.001)
-    sy = max(layer.proj_scale[1], 0.001)
-    sz = max(layer.proj_scale[2], 0.001)
+    location, rotation, scale = _get_projection_transform(node, layer, ob)
+    loc = Vector(location)
+    rot = Euler(rotation, 'XYZ').to_matrix().to_4x4()
+    sx, sy, sz = (max(v, 0.001) for v in scale)
     scale_mat = Matrix.Diagonal((sx, sy, sz, 1.0))
     widget_world_mat = ob.matrix_world @ Matrix.Translation(loc) @ rot @ scale_mat
 
@@ -4396,6 +4495,9 @@ def _draw_uv_projection_gizmo_2d():
         return
 
     _draw_2d_selection_and_tool_overlay(context, region)
+    tool = context.workspace.tools.from_space_image_mode(context.space_data.mode, create=False)
+    if tool is None or tool.idname != 'builtin.image_projection':
+        return
 
     ob, node, layer, target_kind, eff = _active_uv_projection_from_context(context)
     if node is None or layer is None or not getattr(layer, "show_projection_widget", False):
@@ -5004,6 +5106,10 @@ class NODE_OT_tex_paint_mask_effect_add(Operator):
             fill_source=self.fill_source or 'GRUNGE',
             filter_type=self.filter_type or 'BLUR',
         )
+        space = getattr(context, "space_data", None)
+        is_2d = _is_standalone_2d_node(node) or (space is not None and space.type == 'IMAGE_EDITOR')
+        if self.effect_type == 'GRUNGE' and is_2d:
+            eff["proj_mode"] = 'REPEAT'
         if self.blend_override:
             eff["blend_mode"] = self.blend_override
 
@@ -5028,6 +5134,29 @@ class NODE_OT_tex_paint_mask_effect_add(Operator):
             layer.show_projection_widget = True
 
         _evaluate_layer_grunge_mask(node, layer, context=context, force_reproject=True, skip_absorb=True)
+        _tag_view3d_gizmo_refresh(context)
+        return {'FINISHED'}
+
+
+class NODE_OT_tex_paint_mask_fill_canvas_mapping(Operator):
+    """Map this mask fill onto the image canvas, preserving its source and editable settings"""
+    bl_idname = "node.tex_paint_mask_fill_canvas_mapping"
+    bl_label = "Use Canvas Mapping"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        node = tex_paint_node_from_context(context)
+        effect = _get_active_mask_effect(node) if node else None
+        return bool(node and node.active_layer and not node.active_layer.lock and
+                    effect and effect.get("type") == 'GRUNGE')
+
+    def execute(self, context):
+        node = tex_paint_node_from_context(context)
+        _update_active_mask_effect(node, node.active_layer,
+                                   {"proj_mode": 'REPEAT', "gizmo_override": False},
+                                   ensure_type='GRUNGE', flush_json=True)
+        _evaluate_layer_grunge_mask(node, node.active_layer, context=context, force_reproject=True)
         _tag_view3d_gizmo_refresh(context)
         return {'FINISHED'}
 
@@ -5063,6 +5192,7 @@ class NODE_OT_tex_paint_mask_effect_remove(Operator):
         node_ptr = node.as_pointer()
         layer_uid = _layer_uid(layer)
         _EFFECT_RAW_CACHE.pop((node_ptr, layer_uid, target_uid), None)
+        _NATIVE_MASK_SOURCES.pop((node_ptr, layer_uid, target_uid), None)
         _PAINT_EFFECT_BUFFERS.pop((node_ptr, layer_uid, target_uid), None)
 
         st["effects"] = new_effects
@@ -5205,6 +5335,10 @@ class NODE_OT_tex_paint_mask_effect_select(Operator):
         st = _get_layer_grunge_state(node, layer)
         st["active_effect_uid"] = int(self.effect_uid)
         _save_layer_grunge_state(node, layer, st)
+        if layer.mask_effects_active:
+            _select_native_mask_paint_target(layer, st)
+        else:
+            _evaluate_layer_grunge_mask(node, layer, context=context, skip_absorb=True)
 
         eff = _get_active_mask_effect(node, layer)
         if eff is not None and eff.get("type") == 'PAINT':
@@ -5283,12 +5417,11 @@ class NODE_OT_tex_paint_mask_paint_action(Operator):
         if eff is None or eff.get("type") != 'PAINT':
             return {'CANCELLED'}
 
-        c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-        if not c_layer.mask_ibuf:
+        w = int(node.canvas_width or (node.image.size[0] if node.image else 0))
+        h = int(node.canvas_height or (node.image.size[1] if node.image else 0))
+        if w <= 0 or h <= 0:
             return {'CANCELLED'}
-        c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
-        w, h = int(c_imb.x), int(c_imb.y)
-        pbuf = _ensure_paint_effect_buffer(node.as_pointer(), int(c_layer.uid), eff, w, h)
+        pbuf = _ensure_paint_effect_buffer(node.as_pointer(), _layer_uid(layer), eff, w, h)
 
         if self.action == 'CLEAR':
             pbuf["val_u8"].fill(0)
@@ -5687,6 +5820,7 @@ class NODE_OT_tex_paint_mask_stack_init(Operator):
         for eff in st.get("effects", []):
             e_uid = int(eff["uid"])
             _EFFECT_RAW_CACHE.pop((node_ptr, layer_uid, e_uid), None)
+            _NATIVE_MASK_SOURCES.pop((node_ptr, layer_uid, e_uid), None)
             _PAINT_EFFECT_BUFFERS.pop((node_ptr, layer_uid, e_uid), None)
         _STACK_BELOW_CACHE.pop((node_ptr, layer_uid), None)
         _LAST_COMPOSITED_MASK.pop((node_ptr, layer_uid), None)
@@ -6583,25 +6717,7 @@ def _ensure_companion_node_layers_synced(context, mat, primary_node, comp_node, 
                     c_layer.fill_color = (def_rgb[0], def_rgb[1], def_rgb[2], 0.0)
 
         if c_layer is not None and getattr(p_layer, "use_mask", False):
-            if not c_layer.use_mask:
-                c_layer.use_mask = True
-            c_layer.invert_mask = p_layer.invert_mask
-            c_src = _C_TexPaintLayer.from_address(p_layer.as_pointer())
-            c_dst = _C_TexPaintLayer.from_address(c_layer.as_pointer())
-            if not c_dst.mask_ibuf:
-                c_layer.opacity = c_layer.opacity
-                c_dst = _C_TexPaintLayer.from_address(c_layer.as_pointer())
-            if c_src.mask_ibuf and c_dst.mask_ibuf:
-                imb_s = _C_ImBuf.from_address(c_src.mask_ibuf)
-                imb_d = _C_ImBuf.from_address(c_dst.mask_ibuf)
-                w, h = int(imb_s.x), int(imb_s.y)
-                if int(imb_d.x) == w and int(imb_d.y) == h and w > 0 and h > 0:
-                    if imb_s.byte_data and imb_d.byte_data:
-                        ctypes.memmove(imb_d.byte_data, imb_s.byte_data, w * h * 4)
-                        c_dst.runtime_dirty = 1
-                    elif imb_s.float_data and imb_d.float_data:
-                        ctypes.memmove(imb_d.float_data, imb_s.float_data, w * h * 16)
-                        c_dst.runtime_dirty = 1
+            c_layer.mask_stack_copy_from(p_layer)
 
     if 0 <= orig_active_idx < len(primary_node.layers):
         primary_node.active_layer_index = orig_active_idx
@@ -6933,182 +7049,99 @@ class NODE_OT_tex_paint_layer_pixel_action(Operator):
         if col_rgb is None:
             col_rgb = (1.0, 1.0, 1.0)
 
-        if self.action == 'FILL_BRUSH':
-            if layer.type == 'FILL':
-                layer.fill_color = (col_rgb[0], col_rgb[1], col_rgb[2], layer.fill_color[3])
+        if self.action in {'FILL_BRUSH', 'CLEAR', 'INVERT_RGB', 'FLIP_H', 'FLIP_V'}:
+            if layer.hide or layer.lock:
+                self.report({'WARNING'}, "Show and unlock the layer before editing its pixels")
+                return {'CANCELLED'}
+            if layer.type == 'FILL' and self.action in {'FILL_BRUSH', 'INVERT_RGB'}:
+                fc = tuple(layer.fill_color)
+                rgb = col_rgb[:3] if self.action == 'FILL_BRUSH' else tuple(1.0 - c for c in fc[:3])
+                layer.fill_color = (*rgb, fc[3])
                 return {'FINISHED'}
             if layer.type != 'PAINT':
-                self.report({'WARNING'}, "Switch to a Paint or Fill layer to fill with color")
+                self.report({'WARNING'}, "Select a Paint layer to edit its pixels")
                 return {'CANCELLED'}
-            c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-            if not c_layer.ibuf:
-                return {'CANCELLED'}
-            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
-            w, h = int(c_imb.x), int(c_imb.y)
-            lock_a = bool(layer.lock_alpha)
-            if c_imb.byte_data:
-                # Convert scene linear brush color to sRGB byte slightly approximated via gamma 1/2.2 or color management
-                srgb = [int(round(min(max(pow(max(c, 0.0), 1.0 / 2.2), 0.0), 1.0) * 255.0)) for c in col_rgb[:3]]
-                buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                arr = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
-                arr[:, 0] = srgb[0]
-                arr[:, 1] = srgb[1]
-                arr[:, 2] = srgb[2]
-                if not lock_a:
-                    arr[:, 3] = 255
-            elif c_imb.float_data:
-                buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-                arr = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)
-                if lock_a:
-                    a = arr[:, 3:4]
-                    arr[:, 0:1] = col_rgb[0] * a
-                    arr[:, 1:2] = col_rgb[1] * a
-                    arr[:, 2:3] = col_rgb[2] * a
+
+            # RNA owns the write: it detaches shared ImBuf storage and invalidates the
+            # native composite/effect caches. These actions always address layer color,
+            # even when the inspector currently selects a mask or a mask effect.
+            original_target = node.paint_target
+            try:
+                node.paint_target = 'COLOR'
+                w, h = int(node.canvas_width), int(node.canvas_height)
+                count = w * h * 4
+                if count == 0 or len(node.paint_pixels) != count:
+                    self.report({'WARNING'}, "The layer has no editable color pixels")
+                    return {'CANCELLED'}
+                values = np.empty(count, dtype=np.float32)
+                node.paint_pixels.foreach_get(values)
+                pixels = values.reshape(h, w, 4)
+                if self.action == 'FILL_BRUSH':
+                    rgb = col_rgb[:3]
+                    image = node.image
+                    if (image is not None and not image.is_float and
+                            not image.colorspace_settings.is_data and
+                            image.colorspace_settings.name == 'sRGB'):
+                        from mathutils import Color
+                        rgb = Color(rgb).from_scene_linear_to_srgb()
+                    pixels[..., :3] = rgb
+                    if not layer.lock_alpha:
+                        pixels[..., 3] = 1.0
+                elif self.action == 'CLEAR':
+                    pixels[:] = 0.0
+                elif self.action == 'INVERT_RGB':
+                    # The RNA array is straight RGBA. Keep alpha and unbounded HDR
+                    # values; the native writer premultiplies float storage once.
+                    pixels[..., :3] = 1.0 - pixels[..., :3]
+                elif self.action == 'FLIP_H':
+                    pixels[:] = pixels[:, ::-1, :].copy()
                 else:
-                    arr[:, 0] = col_rgb[0]
-                    arr[:, 1] = col_rgb[1]
-                    arr[:, 2] = col_rgb[2]
-                    arr[:, 3] = 1.0
-            c_layer.runtime_dirty = 1
-            layer.opacity = layer.opacity
-            return {'FINISHED'}
-
-        if self.action == 'CLEAR':
-            if layer.type != 'PAINT':
-                return {'CANCELLED'}
-            c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-            if not c_layer.ibuf:
-                return {'CANCELLED'}
-            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
-            w, h = int(c_imb.x), int(c_imb.y)
-            if c_imb.byte_data:
-                ctypes.memset(c_imb.byte_data, 0, w * h * 4)
-            elif c_imb.float_data:
-                ctypes.memset(c_imb.float_data, 0, w * h * 16)
-            c_layer.runtime_dirty = 1
-            layer.opacity = layer.opacity
-            return {'FINISHED'}
-
-        if self.action == 'INVERT_RGB':
-            if layer.type == 'FILL':
-                fc = layer.fill_color
-                layer.fill_color = (1.0 - fc[0], 1.0 - fc[1], 1.0 - fc[2], fc[3])
-                return {'FINISHED'}
-            if layer.type != 'PAINT':
-                return {'CANCELLED'}
-            c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-            if not c_layer.ibuf:
-                return {'CANCELLED'}
-            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
-            w, h = int(c_imb.x), int(c_imb.y)
-            if c_imb.byte_data:
-                buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                arr = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
-                arr[:, :3] = 255 - arr[:, :3]
-            elif c_imb.float_data:
-                buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-                arr = np.frombuffer(buf, dtype=np.float32).reshape(-1, 4)
-                arr[:, :3] = np.clip(arr[:, 3:4] - arr[:, :3], 0.0, 1.0)
-            c_layer.runtime_dirty = 1
-            layer.opacity = layer.opacity
-            return {'FINISHED'}
-
-        if self.action in {'FLIP_H', 'FLIP_V'}:
-            if layer.type != 'PAINT':
-                return {'CANCELLED'}
-            c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-            if not c_layer.ibuf:
-                return {'CANCELLED'}
-            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
-            w, h = int(c_imb.x), int(c_imb.y)
-            if c_imb.byte_data:
-                buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
-                arr[:] = arr[:, ::-1, :].copy() if self.action == 'FLIP_H' else arr[::-1, :, :].copy()
-            elif c_imb.float_data:
-                buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-                arr = np.frombuffer(buf, dtype=np.float32).reshape(h, w, 4)
-                arr[:] = arr[:, ::-1, :].copy() if self.action == 'FLIP_H' else arr[::-1, :, :].copy()
-            c_layer.runtime_dirty = 1
-            layer.opacity = layer.opacity
+                    pixels[:] = pixels[::-1, :, :].copy()
+                node.paint_pixels.foreach_set(values)
+            finally:
+                node.paint_target = original_target
             return {'FINISHED'}
 
         if self.action == 'RASTERIZE_TO_PAINT':
-            if layer.type == 'PAINT' and getattr(layer, "proj_mode", 'NONE') != 'NONE':
+            if layer.hide or layer.lock:
+                self.report({'WARNING'}, "Show and unlock the layer before rasterizing it")
+                return {'CANCELLED'}
+            if layer.type == 'PAINT' and layer.proj_mode != 'NONE':
                 with context.temp_override(node=node):
-                    bpy.ops.node.tex_paint_layer_bake_projection()
-                return {'FINISHED'}
-            if layer.type == 'FILL':
-                fc = tuple(layer.fill_color)
-                orig_name = layer.name
-                orig_blend = layer.blend_mode
-                orig_opacity = layer.opacity
-                orig_clip = layer.use_clipping
-                orig_use_mask = layer.use_mask
-                orig_inv_mask = layer.invert_mask
-                st_copy = dict(_get_layer_grunge_state(node, layer))
-                mask_bytes = None
-                c_old = _C_TexPaintLayer.from_address(layer.as_pointer())
-                if orig_use_mask and c_old.mask_ibuf:
-                    c_m = _C_ImBuf.from_address(c_old.mask_ibuf)
-                    mw, mh = int(c_m.x), int(c_m.y)
-                    if c_m.byte_data and mw > 0 and mh > 0:
-                        mbuf = (ctypes.c_uint8 * (mw * mh * 4)).from_address(c_m.byte_data)
-                        mask_bytes = np.frombuffer(mbuf, dtype=np.uint8).copy()
-
-                with context.temp_override(node=node):
-                    bpy.ops.node.tex_paint_layer_add(type='PAINT')
-                new_layer = node.active_layer
-                new_layer.name = orig_name
-                new_layer.blend_mode = orig_blend
-                new_layer.opacity = orig_opacity
-                new_layer.use_clipping = orig_clip
-
-                # Fill new paint layer with the fill_color
-                c_new = _C_TexPaintLayer.from_address(new_layer.as_pointer())
-                if c_new.ibuf:
-                    c_imb = _C_ImBuf.from_address(c_new.ibuf)
-                    w, h = int(c_imb.x), int(c_imb.y)
-                    if c_imb.byte_data:
-                        srgb = [int(round(min(max(pow(max(c, 0.0), 1.0 / 2.2), 0.0), 1.0) * 255.0)) for c in fc[:3]]
-                        a_u8 = int(round(min(max(fc[3], 0.0), 1.0) * 255.0))
-                        buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                        arr = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
-                        arr[:, 0] = srgb[0]
-                        arr[:, 1] = srgb[1]
-                        arr[:, 2] = srgb[2]
-                        arr[:, 3] = a_u8
-                    c_new.runtime_dirty = 1
-
-                if orig_use_mask:
-                    new_layer.use_mask = True
-                    new_layer.invert_mask = orig_inv_mask
-                    _save_layer_grunge_state(node, new_layer, st_copy)
-                    c_new = _C_TexPaintLayer.from_address(new_layer.as_pointer())
-                    if mask_bytes is not None and c_new.mask_ibuf:
-                        c_nm = _C_ImBuf.from_address(c_new.mask_ibuf)
-                        if c_nm.byte_data:
-                            dst_m = np.frombuffer(
-                                (ctypes.c_uint8 * len(mask_bytes)).from_address(c_nm.byte_data),
-                                dtype=np.uint8,
-                            )
-                            dst_m[:] = mask_bytes
-                            c_new.runtime_dirty = 1
-
-                # Remove old Fill layer (which is now immediately below new_layer)
-                old_idx = node.active_layer_index - 1
-                if 0 <= old_idx < len(node.layers):
-                    node.active_layer_index = old_idx
-                    with context.temp_override(node=node):
-                        bpy.ops.node.tex_paint_layer_remove()
-                    node.active_layer_index = old_idx
-                if node.active_layer is not None:
-                    node.active_layer.name = orig_name
-                    node.active_layer.opacity = node.active_layer.opacity
-                return {'FINISHED'}
-            return {'CANCELLED'}
+                    return bpy.ops.node.tex_paint_layer_bake_projection()
+            if layer.type != 'FILL':
+                return {'CANCELLED'}
+            targets = [layer]
+            if node.id_data.name != '.TexPaint_2D_Layers':
+                targets += [other for candidate in node.id_data.nodes
+                            if candidate != node and candidate.bl_idname == 'ShaderNodeTexPaint'
+                            and candidate.image is not None
+                            if (other := _find_layer_by_uid(candidate, _layer_uid(layer))) is not None]
+            # Keep matching channel identities and their independent masks/effects. Validate
+            # all channels before conversion so a locked or unsupported one cannot lose data.
+            for target in targets:
+                if target.lock or target.type not in {'FILL', 'PAINT'}:
+                    self.report({'WARNING'}, "Unlock all matching channel layers before rasterizing")
+                    return {'CANCELLED'}
+                if target.type == 'FILL' and not target.rasterize(check_only=True):
+                    self.report({'WARNING'},
+                                "Cannot rasterize this projection or clipping coverage; "
+                                "evaluate the projection and use full Fill alpha on clipping bases")
+                    return {'CANCELLED'}
+            for target in targets:
+                if target.type == 'FILL' and not target.rasterize():
+                    self.report({'ERROR'}, "Rasterization could not complete")
+                    return {'CANCELLED'}
+                target.show_projection_widget = False
+                target.proj_mode = 'NONE'
+                target.proj_image_name = ''
+            _tag_view3d_gizmo_refresh(context)
+            return {'FINISHED'}
 
         if self.action == 'COPY_MASK_BELOW':
+            if layer.hide or layer.lock:
+                self.report({'WARNING'}, "Show and unlock the layer before replacing its mask")
+                return {'CANCELLED'}
             idx = node.active_layer_index
             if idx <= 0 or idx >= len(node.layers):
                 self.report({'WARNING'}, "No layer below to copy mask from")
@@ -7117,78 +7150,22 @@ class NODE_OT_tex_paint_layer_pixel_action(Operator):
             if not below.use_mask:
                 self.report({'WARNING'}, "Layer below does not have a mask")
                 return {'CANCELLED'}
-            layer.use_mask = True
-            layer.invert_mask = below.invert_mask
-            c_below = _C_TexPaintLayer.from_address(below.as_pointer())
-            c_cur = _C_TexPaintLayer.from_address(layer.as_pointer())
-            if c_below.mask_ibuf and c_cur.mask_ibuf:
-                cb_imb = _C_ImBuf.from_address(c_below.mask_ibuf)
-                cc_imb = _C_ImBuf.from_address(c_cur.mask_ibuf)
-                w, h = int(cb_imb.x), int(cb_imb.y)
-                if cb_imb.byte_data and cc_imb.byte_data and int(cc_imb.x) == w and int(cc_imb.y) == h:
-                    ctypes.memmove(cc_imb.byte_data, cb_imb.byte_data, w * h * 4)
-                    c_cur.runtime_dirty = 1
+            if not layer.mask_stack_copy_from(below):
+                self.report({'ERROR'}, "Could not copy mask: canvas sizes must match")
+                return {'CANCELLED'}
+            key = (node.as_pointer(), _layer_uid(layer))
+            for cache in (_PAINT_EFFECT_BUFFERS, _NATIVE_MASK_SOURCES, _EFFECT_RAW_CACHE):
+                for old_key in [k for k in cache if k[:2] == key]:
+                    cache.pop(old_key, None)
             below_st = _get_layer_grunge_state(node, below)
             st_dup = json.loads(json.dumps(below_st))
             _save_layer_grunge_state(node, layer, st_dup)
-            layer.opacity = layer.opacity
             _sync_layer_mask_to_companion_channels(node, layer)
             return {'FINISHED'}
 
         if self.action in {'MERGE_VISIBLE', 'FLATTEN_ALL'}:
-            if node.image is None or len(node.layers) <= 1:
-                return {'FINISHED'}
-            w, h = int(node.canvas_width), int(node.canvas_height)
-            comp_pixels = np.empty(w * h * 4, dtype=np.float32)
-            node.image.pixels.foreach_get(comp_pixels)
-
-            if self.action == 'FLATTEN_ALL':
-                while len(node.layers) > 1:
-                    node.active_layer_index = len(node.layers) - 1
-                    with context.temp_override(node=node):
-                        bpy.ops.node.tex_paint_layer_remove()
-                base = node.active_layer
-                if base.type != 'PAINT':
-                    with context.temp_override(node=node):
-                        bpy.ops.node.tex_paint_layer_add(type='PAINT')
-                    node.active_layer_index = 0
-                    with context.temp_override(node=node):
-                        bpy.ops.node.tex_paint_layer_remove()
-                    base = node.active_layer
-                base.name = "Merged Base"
-                base.use_mask = False
-                base.use_clipping = False
-                base.blend_mode = 'MIX'
-                base.opacity = 1.0
-                target_layer = base
-            else:
-                # MERGE_VISIBLE: remove all visible layers except the bottom-most visible one (or create a Paint layer)
-                vis_indices = [i for i, l in enumerate(node.layers) if not l.hide]
-                if len(vis_indices) <= 1:
-                    return {'FINISHED'}
-                for i in reversed(vis_indices):
-                    node.active_layer_index = i
-                    with context.temp_override(node=node):
-                        bpy.ops.node.tex_paint_layer_remove()
-                with context.temp_override(node=node):
-                    bpy.ops.node.tex_paint_layer_add(type='PAINT')
-                target_layer = node.active_layer
-                target_layer.name = "Merged Visible"
-
-            c_t = _C_TexPaintLayer.from_address(target_layer.as_pointer())
-            if c_t.ibuf:
-                c_imb = _C_ImBuf.from_address(c_t.ibuf)
-                if c_imb.byte_data:
-                    buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                    dst = np.frombuffer(buf, dtype=np.uint8).reshape(-1)
-                    dst[:] = (np.clip(comp_pixels, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-                elif c_imb.float_data:
-                    buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-                    dst = np.frombuffer(buf, dtype=np.float32).reshape(-1)
-                    dst[:] = comp_pixels
-                c_t.runtime_dirty = 1
-                target_layer.opacity = target_layer.opacity
-            return {'FINISHED'}
+            with context.temp_override(node=node):
+                return bpy.ops.node.tex_paint_layers_flatten(visible_only=self.action == 'MERGE_VISIBLE')
 
         return {'CANCELLED'}
 
@@ -7550,33 +7527,120 @@ class NODE_OT_tex_paint_make_material_unique(Operator):
                 _reproject_color_layer_multi_object(node, l_item, context=context, force=True)
 
     @staticmethod
-    def _clone_material_for_object(src_mat, target_ob, context):
+    def _clone_material_for_object(src_mat, target_ob, context, created_materials=None, created_images=None):
+        orig_images = {
+            im
+            for n in (src_mat.node_tree.nodes if src_mat.node_tree else ())
+            if n.bl_idname == "ShaderNodeTexPaint"
+            for im in (getattr(n, "image", None), getattr(n, "pbr_image", None), getattr(n, "emission_image", None))
+            if im is not None
+        }
         new_mat = src_mat.copy()
+        if created_materials is not None:
+            created_materials.append(new_mat)
         new_mat.name = f"{src_mat.name}_{target_ob.name}"
         if new_mat.node_tree is not None:
             for n in new_mat.node_tree.nodes:
                 if n.bl_idname == "ShaderNodeTexPaint" and n.image is not None:
-                    new_ima = n.image.copy()
-                    new_ima.name = f"{new_mat.name}_BaseColor"
-                    new_ima.use_fake_user = True
-                    n_ptr = n.as_pointer()
-                    # Assign bNode::id (offset 216) to the new per-part master image
-                    ctypes.c_void_p.from_address(n_ptr + 216).value = new_ima.as_pointer()
-                    # Clear aux image pointers in NodeTexPaint (offsets 1072, 1080) so C++ allocates fresh per-part PBR/Emission images
-                    c_storage_ptr = ctypes.c_void_p.from_address(n_ptr + 224).value
-                    if c_storage_ptr:
-                        ctypes.c_void_p.from_address(c_storage_ptr + 1072).value = 0
-                        ctypes.c_void_p.from_address(c_storage_ptr + 1080).value = 0
-                    if len(n.layers) > 0:
-                        n.layers[0].opacity = n.layers[0].opacity
+                    if not n.make_images_single_user():
+                        raise RuntimeError("Could not create independent paint images")
+                    if created_images is not None:
+                        for im in (getattr(n, "image", None), getattr(n, "pbr_image", None), getattr(n, "emission_image", None)):
+                            if im is not None and im not in orig_images and im not in created_images:
+                                created_images.append(im)
+                    ch_id, ch_lbl, _ = _detect_node_pbr_channel(n)
+                    suffix = "BaseColor" if ch_id == 'BASE_COLOR' else (ch_lbl.split()[0] if ch_id != 'CUSTOM' else "Canvas")
+                    n.image.name = f"{new_mat.name}_{suffix}"
         for slot in target_ob.material_slots:
             if slot.material == src_mat:
+                # A linked duplicate can share its mesh and data-linked slots.
+                # The explicit per-object split must not reassign its siblings.
+                slot.link = 'OBJECT'
                 slot.material = new_mat
         if new_mat.node_tree is not None:
-            for n in new_mat.node_tree.nodes:
-                if n.bl_idname == "ShaderNodeTexPaint":
-                    NODE_OT_tex_paint_make_material_unique._rebake_node_layers(n, context)
+            with context.temp_override(active_object=target_ob, object=target_ob):
+                for n in new_mat.node_tree.nodes:
+                    if n.bl_idname == "ShaderNodeTexPaint":
+                        NODE_OT_tex_paint_make_material_unique._rebake_node_layers(n, bpy.context)
         return new_mat
+
+    @staticmethod
+    def _snapshot_material_nodes(mat):
+        import numpy as np
+        snapshots = []
+        if mat is None or mat.node_tree is None:
+            return snapshots
+        for n in mat.node_tree.nodes:
+            if n.bl_idname != "ShaderNodeTexPaint":
+                continue
+            img_snaps = []
+            for im in (getattr(n, "image", None), getattr(n, "pbr_image", None), getattr(n, "emission_image", None)):
+                if im is not None and len(im.pixels) > 0:
+                    arr = np.empty(len(im.pixels), dtype=np.float32)
+                    im.pixels.foreach_get(arr)
+                    img_snaps.append((im, arr))
+            layer_snaps = []
+            orig_idx = int(n.active_layer_index)
+            orig_target = str(n.paint_target)
+            for idx, l_item in enumerate(n.layers):
+                n.active_layer_index = idx
+                n.paint_target = 'COLOR'
+                color_arr = None
+                if len(n.paint_pixels) > 0:
+                    color_arr = np.empty(len(n.paint_pixels), dtype=np.float32)
+                    n.paint_pixels.foreach_get(color_arr)
+                mask_arr = None
+                if l_item.use_mask and not l_item.mask_effects_active and len(l_item.mask_pixels) > 0:
+                    mask_arr = np.empty(len(l_item.mask_pixels), dtype=np.float32)
+                    l_item.mask_pixels.foreach_get(mask_arr)
+                eff_snaps = []
+                for eff in l_item.mask_effects:
+                    if len(eff.pixels) > 0:
+                        earr = np.empty(len(eff.pixels), dtype=np.float32)
+                        eff.pixels.foreach_get(earr)
+                        eff_snaps.append((eff.uid, earr))
+                layer_snaps.append((l_item.uid, color_arr, mask_arr, eff_snaps))
+            n.active_layer_index = orig_idx
+            n.paint_target = orig_target
+            snapshots.append((n, n.get("_grunge_layers_json"), orig_idx, orig_target, img_snaps, layer_snaps))
+        return snapshots
+
+    @staticmethod
+    def _restore_material_nodes(snapshots):
+        for n, raw_json, orig_idx, orig_target, img_snaps, layer_snaps in snapshots:
+            if raw_json is None:
+                if "_grunge_layers_json" in n:
+                    del n["_grunge_layers_json"]
+            else:
+                n["_grunge_layers_json"] = raw_json
+            for l_uid, color_arr, mask_arr, eff_snaps in layer_snaps:
+                l_item = _find_layer_by_uid(n, l_uid)
+                if l_item is None:
+                    continue
+                idx = next((i for i, cand in enumerate(n.layers) if cand == l_item), -1)
+                if idx >= 0 and color_arr is not None:
+                    n.active_layer_index = idx
+                    n.paint_target = 'COLOR'
+                    if len(n.paint_pixels) == len(color_arr):
+                        n.paint_pixels.foreach_set(color_arr)
+                if idx >= 0 and mask_arr is not None and not l_item.mask_effects_active:
+                    n.active_layer_index = idx
+                    n.paint_target = 'MASK'
+                    if len(n.paint_pixels) == len(mask_arr):
+                        n.paint_pixels.foreach_set(mask_arr)
+                for e_uid, earr in eff_snaps:
+                    native = _native_mask_effect(l_item, e_uid)
+                    if native is not None and len(native.pixels) == len(earr):
+                        native.pixels.foreach_set(earr)
+                if l_item.mask_effects_active:
+                    l_item.mask_stack_evaluate()
+            n.active_layer_index = orig_idx
+            n.paint_target = orig_target
+            for im, arr in img_snaps:
+                if len(im.pixels) == len(arr):
+                    im.pixels.foreach_set(arr)
+                    im.update()
+        _clear_all_runtime_mask_caches(clear_raw_cache=False)
 
     def execute(self, context):
         node = tex_paint_node_from_context(context)
@@ -7593,22 +7657,55 @@ class NODE_OT_tex_paint_make_material_unique(Operator):
 
         active_ob = getattr(context, "active_object", None) or sharing_obs[-1]
         if self.mode == 'ACTIVE_OBJECT' and active_ob in sharing_obs:
-            new_mat = self._clone_material_for_object(mat, active_ob, context)
+            target_obs = [active_ob]
+        elif self.mode == 'ALL_SHARED_OBJECTS':
+            keep_ob = active_ob if active_ob in sharing_obs else sharing_obs[0]
+            target_obs = [o for o in sharing_obs if o != keep_ob]
+        else:
+            return {'CANCELLED'}
+
+        slot_snapshot = [
+            (ob, slot_idx, slot.link, slot.material)
+            for ob in target_obs
+            for slot_idx, slot in enumerate(ob.material_slots)
+            if slot.material == mat
+        ]
+        node_snapshots = self._snapshot_material_nodes(mat)
+        created_materials = []
+        created_images = []
+        try:
+            for ob_part in target_obs:
+                self._clone_material_for_object(
+                    mat, ob_part, context,
+                    created_materials=created_materials,
+                    created_images=created_images,
+                )
             self._rebake_node_layers(node, context)
+        except Exception as err:
+            for ob, slot_idx, orig_link, orig_mat in slot_snapshot:
+                if slot_idx < len(ob.material_slots):
+                    ob.material_slots[slot_idx].link = orig_link
+                    ob.material_slots[slot_idx].material = orig_mat
+                    if orig_link == 'DATA' and slot_idx < len(ob.data.materials):
+                        ob.data.materials[slot_idx] = orig_mat
+            for m in created_materials:
+                if m and m.name in bpy.data.materials:
+                    bpy.data.materials.remove(m, do_unlink=True)
+            for im in created_images:
+                if im and im.name in bpy.data.images:
+                    bpy.data.images.remove(im, do_unlink=True)
+            self._restore_material_nodes(node_snapshots)
             _tag_view3d_gizmo_refresh(context)
+            self.report({'WARNING'}, f"Material split rolled back: {err}")
+            return {'CANCELLED'}
+
+        _tag_view3d_gizmo_refresh(context)
+        if self.mode == 'ACTIVE_OBJECT':
+            new_mat = created_materials[-1]
             self.report({'INFO'}, f"Created unique material '{new_mat.name}' for '{active_ob.name}'")
-            return {'FINISHED'}
-
-        if self.mode == 'ALL_SHARED_OBJECTS':
-            # Keep the original material on the first object, and clone unique materials for all other objects
-            for ob_part in sharing_obs[1:]:
-                self._clone_material_for_object(mat, ob_part, context)
-            self._rebake_node_layers(node, context)
-            _tag_view3d_gizmo_refresh(context)
+        else:
             self.report({'INFO'}, f"Split shared material across {len(sharing_obs)} modular objects")
-            return {'FINISHED'}
-
-        return {'CANCELLED'}
+        return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
@@ -7668,614 +7765,105 @@ def _apply_baked_normal_map_to_shader(mat, node, normal_ima):
     return True
 
 
-def _ensure_baked_map_image(mat_prefix, slot_key, w, h, is_color=False):
-    """Create or resize a `bpy.data.images` target for a Mesh Map slot (`normal`, `ao`, `curvature`, etc.)."""
-    suffix_map = {
-        "normal": "Normal",
-        "normal_ws": "WorldNormal",
-        "id_map": "ID",
-        "ao": "AO",
-        "curvature": "Curvature",
-        "position": "Position",
-        "thickness": "Thickness",
-    }
-    img_name = f"{mat_prefix}_{suffix_map.get(slot_key, slot_key)}"
-    ima = bpy.data.images.get(img_name)
-    if ima is None:
-        ima = bpy.data.images.new(name=img_name, width=int(w), height=int(h), alpha=False, float_buffer=False)
-    elif int(ima.size[0]) != int(w) or int(ima.size[1]) != int(h):
-        try:
-            ima.scale(int(w), int(h))
-        except Exception:
-            pass
-    try:
-        ima.colorspace_settings.name = 'sRGB' if is_color else 'Non-Color'
-    except Exception:
-        pass
-    return ima
-
-
-def _write_rgb_f32_to_image(ima, rgb_f32, w, h):
-    """Write float32[H, W, 3] into `ima.pixels` and pack for persistence."""
-    import numpy as np
-    rgba = np.ones((h, w, 4), dtype=np.float32)
-    rgba[:, :, :3] = np.clip(rgb_f32, 0.0, 1.0)
-    ima.pixels.foreach_set(rgba.ravel())
-    ima.update()
-    try:
-        ima.pack()
-    except Exception:
-        pass
-
-
-def _golden_ratio_color_rgb(idx):
-    """Generate a distinct saturated RGB color for Color ID map index `idx`."""
-    import colorsys
-    h = (float(idx) * 0.61803398875 + 0.13) % 1.0
-    s = 0.78 if (idx % 2 == 0) else 0.62
-    v = 0.92 if (idx % 3 != 0) else 0.76
-    return colorsys.hsv_to_rgb(h, s, v)
-
-
-def _build_high_poly_bvh_and_data(hp_obs, context=None):
-    """Build a combined World-Space C++ `BVHTree` plus per-triangle vertex normals, positions, and Color IDs
-    from High-Poly source objects `hp_obs` (evaluating modifiers when depsgraph is available).
-    """
-    import numpy as np
-    from mathutils.bvhtree import BVHTree
-
-    depsgraph = None
-    if context is not None:
-        try:
-            depsgraph = context.evaluated_depsgraph_get()
-        except Exception:
-            depsgraph = None
-
-    all_verts = []
-    all_vnorms = []
-    all_tris = []
-    all_tri_colors = []
-    v_offset = 0
-
-    for ob_idx, ob in enumerate(hp_obs):
-        if ob is None or ob.type != 'MESH' or ob.data is None:
-            continue
-        eval_ob = ob.evaluated_get(depsgraph) if depsgraph is not None else ob
-        mesh = eval_ob.to_mesh() if depsgraph is not None else ob.data
-        if mesh is None:
-            continue
-        try:
-            nv = len(mesh.vertices)
-            if nv == 0 or len(mesh.polygons) == 0:
-                continue
-            mesh.calc_loop_triangles()
-            nt = len(mesh.loop_triangles)
-            if nt == 0:
-                continue
-
-            v_co = np.empty(nv * 3, dtype=np.float32)
-            v_no = np.empty(nv * 3, dtype=np.float32)
-            mesh.vertices.foreach_get("co", v_co)
-            mesh.vertices.foreach_get("normal", v_no)
-            v_co = v_co.reshape(nv, 3)
-            v_no = v_no.reshape(nv, 3)
-
-            mw = np.array(eval_ob.matrix_world, dtype=np.float32)
-            rot = mw[:3, :3]
-            inv_t = np.linalg.inv(rot).T
-            v_w = v_co @ rot.T + mw[:3, 3]
-            n_w = v_no @ inv_t.T
-            n_len = np.maximum(np.linalg.norm(n_w, axis=1, keepdims=True), 1e-6)
-            n_w /= n_len
-
-            t_v = np.empty(nt * 3, dtype=np.int32)
-            t_m = np.empty(nt, dtype=np.int32)
-            mesh.loop_triangles.foreach_get("vertices", t_v)
-            mesh.loop_triangles.foreach_get("material_index", t_m)
-            t_v = t_v.reshape(nt, 3) + v_offset
-
-            # Per-triangle Color ID based on High-Poly object + material index (or object color)
-            ob_col = getattr(ob, "color", None)
-            use_ob_col = (
-                ob_col is not None and
-                (abs(float(ob_col[0]) - 1.0) > 1e-3 or abs(float(ob_col[1]) - 1.0) > 1e-3 or abs(float(ob_col[2]) - 1.0) > 1e-3)
-            )
-            tri_cols = np.empty((nt, 3), dtype=np.float32)
-            if use_ob_col:
-                tri_cols[:] = (float(ob_col[0]), float(ob_col[1]), float(ob_col[2]))
-            else:
-                unique_mats = np.unique(t_m)
-                for m_idx in unique_mats:
-                    rgb = _golden_ratio_color_rgb(ob_idx * 7 + int(m_idx) + 1)
-                    tri_cols[t_m == m_idx] = rgb
-
-            all_verts.append(v_w)
-            all_vnorms.append(n_w)
-            all_tris.append(t_v)
-            all_tri_colors.append(tri_cols)
-            v_offset += nv
-        finally:
-            if depsgraph is not None and mesh is not ob.data:
-                try:
-                    eval_ob.to_mesh_clear()
-                except Exception:
-                    pass
-
-    if not all_verts:
-        return None
-
-    V = np.vstack(all_verts)
-    N = np.vstack(all_vnorms)
-    T = np.vstack(all_tris)
-    C = np.vstack(all_tri_colors)
-    bvh = BVHTree.FromPolygons(V.tolist(), T.tolist())
-    return {
-        "bvh": bvh,
-        "verts": V,
-        "vnorms": N,
-        "tris": T,
-        "tri_colors": C,
-    }
-
-
 def _bake_mesh_maps_for_node(node, context=None, target_map='ALL'):
-    """Bake Substance-Painter-style Mesh Maps (`normal`, `normal_ws`, `id_map`, `ao`, `curvature`, `position`, `thickness`)
-    across all Low-Poly mesh objects sharing `node`'s material, optionally transferring details from High-Poly mesh(es)
-    and evaluating Global Scene AO across surrounding objects.
-    """
+    from . import tex_paint_baking
+    context = context or bpy.context
+    try:
+        return tex_paint_baking.run_sync(context, _bake_mesh_map_steps(node, context, target_map))
+    except (RuntimeError, ValueError) as error:
+        return False, str(error)
+
+
+def _bake_mesh_map_steps(node, context, target_map):
+    """Bake full-resolution Cycles mesh maps without borrowing paint or mask buffers."""
     global _INTERNAL_REPROJECTING
-    import numpy as np
+    from . import tex_paint_baking
 
     if node is None:
         return False, "No active Layered Texture Paint node"
-
-    owner_node = _canonical_mask_owner_node(node)
-    mat = _get_material_for_node(owner_node, context)
-    st = _get_mesh_maps_state(owner_node)
-
-    sharing_obs, first_c_ob = _find_all_mesh_objects_for_node(owner_node, context)
-    low_obs = sharing_obs if sharing_obs else ([first_c_ob] if first_c_ob is not None else [])
-    low_obs = [o for o in low_obs if o is not None and o.type == 'MESH' and o.data is not None and len(o.data.vertices) > 0 and len(o.data.polygons) > 0]
-    if not low_obs:
-        return False, "No mesh objects with UVs found for this material"
-
-    # Determine output resolution
-    res_mode = st.get("bake_res", "MATCH")
-    if res_mode == 'MATCH' and owner_node.image is not None:
-        out_w = max(int(owner_node.image.size[0]), 64)
-        out_h = max(int(owner_node.image.size[1]), 64)
+    context = context or bpy.context
+    owner = _canonical_mask_owner_node(node)
+    material = _get_material_for_node(owner, context)
+    if material is None:
+        return False, "Mesh maps require a material texture set"
+    settings = _get_mesh_maps_state(owner)
+    low_objects = [ob for ob in context.view_layer.objects
+                   if ob.type == 'MESH' and ob.visible_get(view_layer=context.view_layer)
+                   and any(slot.material == material for slot in ob.material_slots)]
+    high_objects = []
+    source = settings.get("source_mode", "LOW_POLY")
+    if source == 'HIGH_POLY_OB':
+        ob = bpy.data.objects.get(settings.get("high_poly_ob", ""))
+        if ob is not None and ob.type == 'MESH' and ob.name in context.view_layer.objects:
+            high_objects = [ob]
+    elif source == 'HIGH_POLY_COL':
+        collection = bpy.data.collections.get(settings.get("high_poly_col", ""))
+        if collection:
+            high_objects = [ob for ob in collection.all_objects
+                            if ob.type == 'MESH' and ob.name in context.view_layer.objects]
+    if source != 'LOW_POLY' and not high_objects:
+        return False, "Choose a high-poly mesh source in the current view layer"
+    if any(ob in low_objects for ob in high_objects):
+        return False, "High-poly sources must be separate from the receiving texture-set objects"
+    resolution = settings.get("bake_res", "MATCH")
+    if resolution == 'MATCH' and owner.image is not None:
+        width, height = (max(int(size), 64) for size in owner.image.size)
     else:
-        try:
-            r_val = int(res_mode)
-        except Exception:
-            r_val = 1024
-        out_w, out_h = r_val, r_val
-
-    # Evaluation grid resolution for raycast maps (up to 1024x1024 for fast raycasting, upsampled to out_w x out_h)
-    eval_w = min(out_w, 1024)
-    eval_h = min(out_h, 1024)
-
-    source_mode = st.get("source_mode", "LOW_POLY")
-    ao_scope = st.get("ao_scope", "GLOBAL")
-    cage_dist = max(float(st.get("cage_dist", 0.08)), 1e-4)
-    ao_dist_factor = max(float(st.get("ao_dist", 0.65)), 0.02)
-
-    hp_obs = []
-    if source_mode == 'HIGH_POLY_OB':
-        hp_ob = bpy.data.objects.get(st.get("high_poly_ob", ""))
-        if hp_ob is not None and hp_ob.type == 'MESH':
-            hp_obs = [hp_ob]
-    elif source_mode == 'HIGH_POLY_COL':
-        hp_col = bpy.data.collections.get(st.get("high_poly_col", ""))
-        if hp_col is not None:
-            hp_obs = [o for o in hp_col.all_objects if o.type == 'MESH' and o.data is not None]
-
-    hp_data = _build_high_poly_bvh_and_data(hp_obs, context=context) if hp_obs else None
-
-    all_slots = ("normal", "normal_ws", "id_map", "ao", "curvature", "position", "thickness")
-    bake_slots = all_slots if target_map == 'ALL' else (target_map,)
-
-    # Compute assembly world-space bounding box across all low_obs
-    all_w_pts = [o.matrix_world @ Vector(co) for o in low_obs for co in o.bound_box]
-    asm_bmin = np.array([min(p.x for p in all_w_pts), min(p.y for p in all_w_pts), min(p.z for p in all_w_pts)], dtype=np.float32)
-    asm_bmax = np.array([max(p.x for p in all_w_pts), max(p.y for p in all_w_pts), max(p.z for p in all_w_pts)], dtype=np.float32)
-    asm_span = np.maximum(asm_bmax - asm_bmin, 1e-5)
-    asm_extent = float(np.max(asm_span))
-
-    # Accumulator buffers at (eval_h, eval_w)
-    acc_normal = np.dstack([
-        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
-        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
-        np.ones((eval_h, eval_w), dtype=np.float32),
-    ])
-    acc_normal_ws = np.dstack([
-        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
-        np.full((eval_h, eval_w), 0.5, dtype=np.float32),
-        np.ones((eval_h, eval_w), dtype=np.float32),
-    ])
-    acc_id = np.zeros((eval_h, eval_w, 3), dtype=np.float32)
-    acc_pos = np.zeros((eval_h, eval_w, 3), dtype=np.float32)
-    acc_thick = np.ones((eval_h, eval_w), dtype=np.float32)
-
-    # Scene objects for Global AO
-    scene_obs = [
-        o for o in bpy.data.objects
-        if o.type == 'MESH' and o.data is not None and not o.hide_get() and o not in hp_obs and len(o.data.vertices) > 0 and len(o.data.polygons) > 0
-    ]
-
-    need_surf = any(s in bake_slots for s in ("normal", "normal_ws", "id_map", "position", "curvature"))
-    need_thick = ("thickness" in bake_slots)
-
-    for part_idx, ob_part in enumerate(low_obs):
-        tmap = _build_uv_texel_map(ob_part, eval_w, eval_h)
-        if tmap is None or len(tmap["pix_idx"]) == 0:
-            continue
-
-        mesh = ob_part.data
-        nv = len(mesh.vertices)
-        nt = len(mesh.loop_triangles)
-        v_co = np.empty(nv * 3, dtype=np.float32)
-        v_no = np.empty(nv * 3, dtype=np.float32)
-        mesh.vertices.foreach_get("co", v_co)
-        mesh.vertices.foreach_get("normal", v_no)
-        v_co = v_co.reshape(nv, 3)
-        v_no = v_no.reshape(nv, 3)
-
-        mw = np.array(ob_part.matrix_world, dtype=np.float32)
-        rot = mw[:3, :3]
-        inv_t = np.linalg.inv(rot).T
-        V_w = v_co @ rot.T + mw[:3, 3]
-        N_w = v_no @ inv_t.T
-        N_w /= np.maximum(np.linalg.norm(N_w, axis=1, keepdims=True), 1e-6)
-
-        pix_idx = tmap["pix_idx"]
-        tri_idx = tmap["tri_idx"]
-        w0, w1, w2 = tmap["w0"], tmap["w1"], tmap["w2"]
-        tv = tmap["tri_verts"][tri_idx]
-        cov_2d = np.zeros((eval_h, eval_w), dtype=bool)
-        cov_2d.ravel()[pix_idx] = True
-
-        if need_surf:
-            # Interpolate Low-Poly world position & normal at each covered UV texel
-            P_low = V_w[tv[:, 0]] * w0[:, None] + V_w[tv[:, 1]] * w1[:, None] + V_w[tv[:, 2]] * w2[:, None]
-            N_low = N_w[tv[:, 0]] * w0[:, None] + N_w[tv[:, 1]] * w1[:, None] + N_w[tv[:, 2]] * w2[:, None]
-            N_low /= np.maximum(np.linalg.norm(N_low, axis=1, keepdims=True), 1e-6)
-
-            # Per-triangle Tangent & Bitangent in World Space from UV derivatives
-            tl = tmap["tri_loops"]
-            uvs = tmap["uvs"]
-            dp1 = V_w[tmap["tri_verts"][:, 1]] - V_w[tmap["tri_verts"][:, 0]]
-            dp2 = V_w[tmap["tri_verts"][:, 2]] - V_w[tmap["tri_verts"][:, 0]]
-            duv1 = uvs[tl[:, 1]] - uvs[tl[:, 0]]
-            duv2 = uvs[tl[:, 2]] - uvs[tl[:, 0]]
-            det = duv1[:, 0] * duv2[:, 1] - duv1[:, 1] * duv2[:, 0]
-            inv_det = np.where(np.abs(det) > 1e-8, 1.0 / np.where(np.abs(det) > 1e-8, det, 1.0), 1.0)[:, None]
-            T_tri = (dp1 * duv2[:, 1:2] - dp2 * duv1[:, 1:2]) * inv_det
-            t_len = np.linalg.norm(T_tri, axis=1, keepdims=True)
-            T_tri = np.where(t_len > 1e-6, T_tri / np.maximum(t_len, 1e-6), np.array([1.0, 0.0, 0.0], dtype=np.float32))
-
-            T_low = T_tri[tri_idx]
-            # Gram-Schmidt orthogonalize T_low against N_low
-            T_low = T_low - N_low * np.sum(T_low * N_low, axis=1, keepdims=True)
-            T_low /= np.maximum(np.linalg.norm(T_low, axis=1, keepdims=True), 1e-6)
-            B_low = np.cross(N_low, T_low)
-
-            if hp_data is not None:
-                # Raycast from Low-Poly UV texels onto High-Poly BVHTree!
-                hp_bvh = hp_data["bvh"]
-                hp_V = hp_data["verts"]
-                hp_N = hp_data["vnorms"]
-                hp_T = hp_data["tris"]
-                hp_C = hp_data["tri_colors"]
-                ray_cast = hp_bvh.ray_cast
-                find_nearest = hp_bvh.find_nearest
-
-                N_surf = N_low.copy()
-                P_surf = P_low.copy()
-                ID_surf = np.full((len(pix_idx), 3), _golden_ratio_color_rgb(part_idx + 1), dtype=np.float32)
-                max_ray = cage_dist * 2.5
-
-                for k in range(len(pix_idx)):
-                    px, py, pz = float(P_low[k, 0]), float(P_low[k, 1]), float(P_low[k, 2])
-                    nx, ny, nz = float(N_low[k, 0]), float(N_low[k, 1]), float(N_low[k, 2])
-                    orig = Vector((px + nx * cage_dist, py + ny * cage_dist, pz + nz * cage_dist))
-                    rdir = Vector((-nx, -ny, -nz))
-                    hit_loc, _hit_no, hit_i, _hit_d = ray_cast(orig, rdir, max_ray)
-                    if hit_loc is None or hit_i is None:
-                        hit_loc, _hit_no, hit_i, _hit_d = find_nearest(Vector((px, py, pz)), max_ray)
-                    if hit_loc is not None and hit_i is not None:
-                        P_surf[k] = (float(hit_loc.x), float(hit_loc.y), float(hit_loc.z))
-                        ID_surf[k] = hp_C[hit_i]
-                        # Barycentric smooth normal interpolation on High-Poly triangle hit_i
-                        iv0, iv1, iv2 = int(hp_T[hit_i, 0]), int(hp_T[hit_i, 1]), int(hp_T[hit_i, 2])
-                        a = hp_V[iv0]
-                        b = hp_V[iv1]
-                        c = hp_V[iv2]
-                        v0_hp = b - a
-                        v1_hp = c - a
-                        v2_hp = P_surf[k] - a
-                        d00 = float(np.dot(v0_hp, v0_hp))
-                        d01 = float(np.dot(v0_hp, v1_hp))
-                        d11 = float(np.dot(v1_hp, v1_hp))
-                        d20 = float(np.dot(v2_hp, v0_hp))
-                        d21 = float(np.dot(v2_hp, v1_hp))
-                        den = d00 * d11 - d01 * d01
-                        if abs(den) > 1e-10:
-                            bv = max(0.0, min(1.0, (d11 * d20 - d01 * d21) / den))
-                            bw = max(0.0, min(1.0 - bv, (d00 * d21 - d01 * d20) / den))
-                            bu = max(0.0, 1.0 - bv - bw)
-                            nh = hp_N[iv0] * bu + hp_N[iv1] * bv + hp_N[iv2] * bw
-                        else:
-                            nh = hp_N[iv0]
-                        n_l = max(float(np.linalg.norm(nh)), 1e-6)
-                        N_surf[k] = nh / n_l
-
-                # Project High-Poly world normal N_surf into Low-Poly tangent space (T_low, B_low, N_low)
-                tan_x = np.sum(N_surf * T_low, axis=1)
-                tan_y = np.sum(N_surf * B_low, axis=1)
-                tan_z = np.maximum(np.sum(N_surf * N_low, axis=1), 0.05)
-                tan_len = np.maximum(np.sqrt(tan_x * tan_x + tan_y * tan_y + tan_z * tan_z), 1e-6)
-                N_tan = np.stack([
-                    0.5 + 0.5 * (tan_x / tan_len),
-                    0.5 + 0.5 * (tan_y / tan_len),
-                    0.5 + 0.5 * (tan_z / tan_len),
-                ], axis=1)
-            else:
-                # Low-Poly mode: smooth bevel normal variations across edges + part/material Color ID
-                P_surf = P_low
-                N_surf = N_low
-                N_tan = np.column_stack([
-                    np.full(len(pix_idx), 0.5, dtype=np.float32),
-                    np.full(len(pix_idx), 0.5, dtype=np.float32),
-                    np.ones(len(pix_idx), dtype=np.float32),
-                ])
-                t_m = np.empty(nt, dtype=np.int32)
-                mesh.loop_triangles.foreach_get("material_index", t_m)
-                ob_col = getattr(ob_part, "color", None)
-                use_ob_col = (
-                    ob_col is not None and
-                    (abs(float(ob_col[0]) - 1.0) > 1e-3 or abs(float(ob_col[1]) - 1.0) > 1e-3 or abs(float(ob_col[2]) - 1.0) > 1e-3)
-                )
-                if use_ob_col:
-                    ID_surf = np.full((len(pix_idx), 3), (float(ob_col[0]), float(ob_col[1]), float(ob_col[2])), dtype=np.float32)
-                else:
-                    tri_cols = np.empty((nt, 3), dtype=np.float32)
-                    for m_idx in np.unique(t_m):
-                        tri_cols[t_m == m_idx] = _golden_ratio_color_rgb(part_idx * 7 + int(m_idx) + 1)
-                    ID_surf = tri_cols[tri_idx]
-
-            # Write part texels into dilated 2D maps
-            for c_i in range(3):
-                ch_n = acc_normal[:, :, c_i].copy()
-                ch_n.ravel()[pix_idx] = N_tan[:, c_i]
-                acc_normal[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_n, cov_2d, iterations=3)
-
-                ch_ws = acc_normal_ws[:, :, c_i].copy()
-                ch_ws.ravel()[pix_idx] = 0.5 + 0.5 * N_surf[:, c_i]
-                acc_normal_ws[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_ws, cov_2d, iterations=3)
-
-                ch_id = acc_id[:, :, c_i].copy()
-                ch_id.ravel()[pix_idx] = ID_surf[:, c_i]
-                acc_id[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_id, cov_2d, iterations=3)
-
-                ch_pos = acc_pos[:, :, c_i].copy()
-                ch_pos.ravel()[pix_idx] = np.clip((P_surf[:, c_i] - asm_bmin[c_i]) / asm_span[c_i], 0.0, 1.0)
-                acc_pos[:, :, c_i] = _dilate_2d_buffer_into_gutter(ch_pos, cov_2d, iterations=3)
-
-        if need_thick:
-            # Interior cone raycast at texel resolution (up to 64x64 per part) so flat low-poly faces
-            # still capture thin edges/corners vs thick face interiors, as well as High-Poly thickness.
-            bvh_thick = hp_data["bvh"] if hp_data is not None else _build_world_bvh_for_objects([ob_part])
-            if bvh_thick is not None:
-                th_w = min(eval_w, 64)
-                th_h = min(eval_h, 64)
-                tmap_th = _build_uv_texel_map(ob_part, th_w, th_h)
-                if tmap_th is not None and len(tmap_th["pix_idx"]) > 0:
-                    p_th = tmap_th["pix_idx"]
-                    tv_th = tmap_th["tri_verts"][tmap_th["tri_idx"]]
-                    w0_t, w1_t, w2_t = tmap_th["w0"], tmap_th["w1"], tmap_th["w2"]
-                    P_th = V_w[tv_th[:, 0]] * w0_t[:, None] + V_w[tv_th[:, 1]] * w1_t[:, None] + V_w[tv_th[:, 2]] * w2_t[:, None]
-                    # Use geometric triangle normal blended with vertex normal for accurate inward cone
-                    e1_t = V_w[tv_th[:, 1]] - V_w[tv_th[:, 0]]
-                    e2_t = V_w[tv_th[:, 2]] - V_w[tv_th[:, 0]]
-                    FN_th = np.cross(e1_t, e2_t)
-                    FN_th /= np.maximum(np.linalg.norm(FN_th, axis=1, keepdims=True), 1e-6)
-                    VN_th = N_w[tv_th[:, 0]] * w0_t[:, None] + N_w[tv_th[:, 1]] * w1_t[:, None] + N_w[tv_th[:, 2]] * w2_t[:, None]
-                    N_th = FN_th * 0.65 + VN_th * 0.35
-                    N_th /= np.maximum(np.linalg.norm(N_th, axis=1, keepdims=True), 1e-6)
-
-                    max_thick = max(1.15 * asm_extent, 0.05)
-                    eps_t = 0.004 * asm_extent
-                    rc_t = bvh_thick.ray_cast
-                    pix_th = np.ones(len(p_th), dtype=np.float32)
-                    cone_dirs = (
-                        (0.0, 0.0, 1.0),
-                        (0.65, 0.0, 0.76),
-                        (-0.65, 0.0, 0.76),
-                        (0.0, 0.65, 0.76),
-                        (0.0, -0.65, 0.76),
-                    )
-                    for k in range(len(p_th)):
-                        px, py, pz = float(P_th[k, 0]), float(P_th[k, 1]), float(P_th[k, 2])
-                        inx, iny, inz = -float(N_th[k, 0]), -float(N_th[k, 1]), -float(N_th[k, 2])
-                        in_vec = Vector((inx, iny, inz))
-                        up = Vector((0.0, 0.0, 1.0)) if abs(inz) < 0.92 else Vector((1.0, 0.0, 0.0))
-                        tan = in_vec.cross(up).normalized()
-                        bitan = in_vec.cross(tan).normalized()
-                        orig = Vector((px + inx * eps_t, py + iny * eps_t, pz + inz * eps_t))
-                        d_sum = 0.0
-                        for lx, ly, lz in cone_dirs:
-                            rdir = tan * lx + bitan * ly + in_vec * lz
-                            hit_loc, _hit_no, _hit_i, hit_d = rc_t(orig, rdir, max_thick)
-                            if hit_loc is not None and hit_d is not None:
-                                d_sum += min(max(float(hit_d) / max_thick, 0.0), 1.0)
-                            else:
-                                d_sum += 1.0
-                        pix_th[k] = d_sum / float(len(cone_dirs))
-
-                    # Normalize part thickness contrast so thin vs thick regions span [0.05..0.98]
-                    t_min, t_max = float(np.min(pix_th)), float(np.max(pix_th))
-                    if (t_max - t_min) > 1e-4:
-                        pix_th = 0.05 + 0.93 * ((pix_th - t_min) / (t_max - t_min))
-
-                    th_small = np.ones((th_h, th_w), dtype=np.float32)
-                    cov_small = np.zeros((th_h, th_w), dtype=bool)
-                    th_small.ravel()[p_th] = pix_th
-                    cov_small.ravel()[p_th] = True
-                    th_small = _dilate_2d_buffer_into_gutter(th_small, cov_small, iterations=2)
-                    th_small = _fast_mask_box_blur_2d_f32(th_small, 1)
-
-                    if th_w != eval_w or th_h != eval_h:
-                        ys_t = np.clip((np.linspace(0.0, th_h - 1.0, eval_h)).astype(np.int32), 0, th_h - 1)
-                        xs_t = np.clip((np.linspace(0.0, th_w - 1.0, eval_w)).astype(np.int32), 0, th_w - 1)
-                        th_up = th_small[ys_t[:, None], xs_t[None, :]]
-                    else:
-                        th_up = th_small
-                    acc_thick[cov_2d] = th_up[cov_2d]
-                    acc_thick = _dilate_2d_buffer_into_gutter(acc_thick, cov_2d, iterations=3)
-
-    # Evaluate AO and Curvature at full (out_w, out_h) using C++ generator + Global Scene AO + High-Poly Normal Curvature
-    ao_2d = None
-    curv_2d = None
-    act_layer = owner_node.active_layer or (owner_node.layers[0] if len(owner_node.layers) > 0 else None)
-
-    if ("ao" in bake_slots or "curvature" in bake_slots) and act_layer is not None:
-        c_layer = _C_TexPaintLayer.from_address(act_layer.as_pointer())
-        saved_mask_bytes = None
-        orig_use_mask = bool(act_layer.use_mask)
-        if not orig_use_mask:
-            act_layer.use_mask = True
-            c_layer = _C_TexPaintLayer.from_address(act_layer.as_pointer())
-        if c_layer.mask_ibuf:
-            c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
-            mw_i, mh_i = int(c_imb.x), int(c_imb.y)
-            if c_imb.byte_data and mw_i > 0 and mh_i > 0:
-                saved_mask_bytes = ctypes.string_at(c_imb.byte_data, mw_i * mh_i * 4)
-        else:
-            mw_i, mh_i = out_w, out_h
-
-        try:
-            # Temporarily disable use_baked_maps so _ensure_generator_raw_u8 computes fresh geometry + Global AO
-            _save_mesh_maps_state(owner_node, updates={"use_baked_maps": False})
-            if "ao" in bake_slots:
-                dummy_ao_eff = {
-                    "uid": -9991,
-                    "gen_type": "AO",
-                    "gen_radius": min(max(ao_dist_factor * 0.6, 0.1), 1.0),
-                    "gen_noise": 0.0,
-                    "gen_noise_scale": 8.0,
-                    "gen_global_ao": (ao_scope in {'GLOBAL', 'MATERIAL'}),
-                }
-                ao_u8 = _ensure_generator_raw_u8(owner_node, act_layer, dummy_ao_eff, mw_i, mh_i, force=True)
-                ao_raw_2d = ao_u8.reshape(mh_i, mw_i).astype(np.float32) * (1.0 / 255.0)
-                if mw_i != out_w or mh_i != out_h:
-                    ys = np.clip((np.linspace(0.0, mh_i - 1.0, out_h)).astype(np.int32), 0, mh_i - 1)
-                    xs = np.clip((np.linspace(0.0, mw_i - 1.0, out_w)).astype(np.int32), 0, mw_i - 1)
-                    ao_2d = ao_raw_2d[ys[:, None], xs[None, :]]
-                else:
-                    ao_2d = ao_raw_2d
-
-            if "curvature" in bake_slots:
-                dummy_curv_eff = {
-                    "uid": -9992,
-                    "gen_type": "CURVATURE",
-                    "gen_radius": 0.35,
-                    "gen_noise": 0.0,
-                    "gen_noise_scale": 8.0,
-                    "gen_global_ao": False,
-                }
-                curv_u8 = _ensure_generator_raw_u8(owner_node, act_layer, dummy_curv_eff, mw_i, mh_i, force=True)
-                curv_raw_2d = curv_u8.reshape(mh_i, mw_i).astype(np.float32) * (1.0 / 255.0)
-                if mw_i != out_w or mh_i != out_h:
-                    ys = np.clip((np.linspace(0.0, mh_i - 1.0, out_h)).astype(np.int32), 0, mh_i - 1)
-                    xs = np.clip((np.linspace(0.0, mw_i - 1.0, out_w)).astype(np.int32), 0, mw_i - 1)
-                    curv_2d = curv_raw_2d[ys[:, None], xs[None, :]]
-                else:
-                    curv_2d = curv_raw_2d
-        finally:
-            _save_mesh_maps_state(owner_node, updates={"use_baked_maps": True})
-            if saved_mask_bytes is not None and c_layer.mask_ibuf:
-                c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
-                if c_imb.byte_data:
-                    ctypes.memmove(c_imb.byte_data, saved_mask_bytes, len(saved_mask_bytes))
-            if not orig_use_mask:
-                act_layer.use_mask = False
-
-    # Upsample eval_w x eval_h maps to out_w x out_h if needed
-    def _upsample_to_out(arr_2d_or_3d):
-        if eval_w == out_w and eval_h == out_h:
-            return arr_2d_or_3d
-        ys = np.clip((np.linspace(0.0, eval_h - 1.0, out_h)).astype(np.int32), 0, eval_h - 1)
-        xs = np.clip((np.linspace(0.0, eval_w - 1.0, out_w)).astype(np.int32), 0, eval_w - 1)
-        return arr_2d_or_3d[ys[:, None], xs[None, :]]
-
-    # Fuse Tangent-Space Normal Map UV derivatives into Curvature map (captures High-Poly sculpted bevels & grooves!)
-    if curv_2d is not None:
-        n_full = _upsample_to_out(acc_normal)
-        nx_2d = n_full[:, :, 0] * 2.0 - 1.0
-        ny_2d = n_full[:, :, 1] * 2.0 - 1.0
-        dnx_dx = (np.roll(nx_2d, -1, axis=1) - np.roll(nx_2d, 1, axis=1)) * 0.5
-        dny_dy = (np.roll(ny_2d, -1, axis=0) - np.roll(ny_2d, 1, axis=0)) * 0.5
-        normal_curv_delta = (dnx_dx + dny_dy) * 1.45
-        curv_2d = np.clip(curv_2d + normal_curv_delta, 0.0, 1.0)
-        # Also enrich AO crevices with deep concave High-Poly normal cavities
-        if ao_2d is not None and hp_data is not None:
-            hp_cav = np.maximum(-normal_curv_delta, 0.0) * 0.65
-            ao_2d = np.clip(ao_2d - hp_cav, 0.0, 1.0)
-
-    mat_prefix = (mat.name if mat else (owner_node.image.name if owner_node.image else "TexSet")).replace(" ", "_")
-    baked_names = {}
-
-    if "normal" in bake_slots:
-        ima = _ensure_baked_map_image(mat_prefix, "normal", out_w, out_h, is_color=False)
-        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_normal), out_w, out_h)
-        baked_names["normal"] = ima.name
-        if bool(st.get("apply_normal_to_shader", True)):
-            _apply_baked_normal_map_to_shader(mat, owner_node, ima)
-
-    if "normal_ws" in bake_slots:
-        ima = _ensure_baked_map_image(mat_prefix, "normal_ws", out_w, out_h, is_color=False)
-        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_normal_ws), out_w, out_h)
-        baked_names["normal_ws"] = ima.name
-
-    if "id_map" in bake_slots:
-        ima = _ensure_baked_map_image(mat_prefix, "id_map", out_w, out_h, is_color=True)
-        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_id), out_w, out_h)
-        baked_names["id_map"] = ima.name
-
-    if "ao" in bake_slots and ao_2d is not None:
-        ima = _ensure_baked_map_image(mat_prefix, "ao", out_w, out_h, is_color=False)
-        _write_rgb_f32_to_image(ima, np.dstack([ao_2d, ao_2d, ao_2d]), out_w, out_h)
-        baked_names["ao"] = ima.name
-
-    if "curvature" in bake_slots and curv_2d is not None:
-        ima = _ensure_baked_map_image(mat_prefix, "curvature", out_w, out_h, is_color=False)
-        _write_rgb_f32_to_image(ima, np.dstack([curv_2d, curv_2d, curv_2d]), out_w, out_h)
-        baked_names["curvature"] = ima.name
-
-    if "position" in bake_slots:
-        ima = _ensure_baked_map_image(mat_prefix, "position", out_w, out_h, is_color=False)
-        _write_rgb_f32_to_image(ima, _upsample_to_out(acc_pos), out_w, out_h)
-        baked_names["position"] = ima.name
-
-    if "thickness" in bake_slots:
-        ima = _ensure_baked_map_image(mat_prefix, "thickness", out_w, out_h, is_color=False)
-        th_out = _upsample_to_out(acc_thick)
-        _write_rgb_f32_to_image(ima, np.dstack([th_out, th_out, th_out]), out_w, out_h)
-        baked_names["thickness"] = ima.name
-
-    _save_mesh_maps_state(owner_node, updates={"use_baked_maps": True}, map_updates=baked_names)
-
-    # Clear generator raw cache and re-evaluate active layer masks so Smart Masks immediately reflect the baked maps
+        width = height = int(resolution) if resolution != 'MATCH' else 1024
+    slots = tuple(tex_paint_baking.MAP_LABELS) if target_map == 'ALL' else (target_map,)
+    was_reprojecting = _INTERNAL_REPROJECTING
+    _INTERNAL_REPROJECTING = True
+    try:
+        images = yield from tex_paint_baking.bake_map_steps(
+            context, material, low_objects, high_objects, settings, slots, width, height)
+    except (RuntimeError, ValueError) as error:
+        return False, str(error)
+    finally:
+        _INTERNAL_REPROJECTING = was_reprojecting
+    _save_mesh_maps_state(owner, map_updates={slot: image.name for slot, image in images.items()})
+    if 'normal' in images and settings.get('apply_normal_to_shader', True):
+        _apply_baked_normal_map_to_shader(material, owner, images['normal'])
+    for slot, image in images.items():
+        previous = bpy.data.images.get(settings['maps'].get(slot, ''))
+        if (previous and previous != image and previous.get('tex_paint_bake_engine') == 'CYCLES'
+                and previous.users == int(previous.use_fake_user)):
+            name = previous.name
+            bpy.data.images.remove(previous)
+            image.name = name
+    _save_mesh_maps_state(owner, map_updates={slot: image.name for slot, image in images.items()})
     _EFFECT_RAW_CACHE.clear()
     _GLOBAL_AO_CACHE.clear()
-    for l_item in owner_node.layers:
-        if getattr(l_item, "use_mask", False):
-            st_l = _get_layer_grunge_state(owner_node, l_item)
-            if st_l.get("effects"):
-                _evaluate_layer_grunge_mask(owner_node, l_item, context=context, force_reproject=True, skip_absorb=True)
+    if settings.get('use_baked_maps', True):
+        for layer in owner.layers:
+            if layer.use_mask and _get_layer_grunge_state(owner, layer).get('effects'):
+                _evaluate_layer_grunge_mask(owner, layer, context=context, force_reproject=True)
+    if context.window_manager:
+        context.window_manager.tex_paint_show_mesh_maps_hub = True
+    return True, f"Cycles baked {len(images)} map(s) at {width} x {height}, {settings.get('bake_samples', 64)} samples"
 
-    return True, f"Baked {len(baked_names)} Mesh Map(s) ({out_w}×{out_h}) across {len(low_obs)} part(s)"
+
+_MESH_MAP_BAKE_JOB = None
+
+
+@bpy.app.handlers.persistent
+def _mesh_map_bake_abort(*_args):
+    # File/undo transitions must join the native worker before freeing its inputs.
+    if _MESH_MAP_BAKE_JOB is not None:
+        _MESH_MAP_BAKE_JOB._finish(bpy.context, cancel=True)
+
+
+class NODE_OT_tex_paint_bake_cancel(Operator):
+    """Cancel baking and retain the previously assigned mesh maps"""
+    bl_idname = 'node.tex_paint_bake_cancel'
+    bl_label = 'Cancel Mesh Map Bake'
+
+    @classmethod
+    def poll(cls, context):
+        return _MESH_MAP_BAKE_JOB is not None
+
+    def execute(self, context):
+        _MESH_MAP_BAKE_JOB._request_cancel(context)
+        return {'FINISHED'}
 
 
 class NODE_OT_tex_paint_bake_mesh_maps(Operator):
@@ -8292,16 +7880,122 @@ class NODE_OT_tex_paint_bake_mesh_maps(Operator):
             ('normal_ws', "World Space Normal", "Bake World-Space Normal Map"),
             ('id_map', "ID (Color / Part)", "Bake Part / Material Color ID Map"),
             ('ao', "Ambient Occlusion (Global / Self)", "Bake Ambient Occlusion Map (including surrounding scene objects when Global AO is active)"),
-            ('curvature', "Curvature", "Bake Curvature Map (geometry + normal-map derivatives)"),
+            ('curvature', "Curvature (Pointiness)", "Bake Cycles geometry pointiness; depends on mesh topology"),
             ('position', "Position", "Bake normalized World-Space XYZ Position Map"),
-            ('thickness', "Thickness", "Bake interior raycast Thickness Map"),
+            ('thickness', "Thickness (Inward Occlusion)", "Bake inward Cycles occlusion; white is thick, black is thin, not a distance measurement"),
         ),
         default='ALL',
     )
 
     @classmethod
     def poll(cls, context):
-        return tex_paint_node_from_context(context) is not None
+        return _MESH_MAP_BAKE_JOB is None and tex_paint_node_from_context(context) is not None
+
+    def _redraw(self, context):
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+
+    def _request_cancel(self, context):
+        self._cancel_requested = True
+        if self._step is not None:
+            context.window_manager.object_bake_cancel(self._step.scene)
+        self._redraw(context)
+
+    def _bake_complete(self, *args):
+        if self._step is not None and args and args[0] == self._step.receiver:
+            self._step_done = True
+
+    def _bake_cancelled(self, *args):
+        if self._step is not None and args and args[0] == self._step.receiver:
+            self._cancel_requested = True
+            self._step_done = True
+
+    def _finish(self, context, cancel=False):
+        global _MESH_MAP_BAKE_JOB
+        if getattr(self, '_finished', False):
+            return
+        self._finished = True
+        if cancel and self._step is not None:
+            context.window_manager.object_bake_cancel(self._step.scene, wait=True)
+        for handlers, callback in (
+                (bpy.app.handlers.object_bake_complete, self._bake_complete),
+                (bpy.app.handlers.object_bake_cancel, self._bake_cancelled)):
+            if callback in handlers:
+                handlers.remove(callback)
+        self._steps.close()
+        self._step = None
+        context.window_manager.event_timer_remove(self._timer)
+        _MESH_MAP_BAKE_JOB = None
+        self._redraw(context)
+
+    def invoke(self, context, event):
+        global _MESH_MAP_BAKE_JOB
+        if bpy.app.background:
+            return self.execute(context)
+        self._finished = self._cancel_requested = self._step_done = False
+        self._step = None
+        self.progress = 0.0
+        self.progress_label = 'Preparing Cycles bake'
+        self._window, self._area, self._region = context.window, context.area, context.region
+        self._node = tex_paint_node_from_context(context)
+        self._steps = _bake_mesh_map_steps(self._node, context, self.map_type)
+        self._timer = context.window_manager.event_timer_add(.1, window=context.window)
+        bpy.app.handlers.object_bake_complete.append(self._bake_complete)
+        bpy.app.handlers.object_bake_cancel.append(self._bake_cancelled)
+        _MESH_MAP_BAKE_JOB = self
+        context.window_manager.modal_handler_add(self)
+        self._redraw(context)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if self._finished:
+            return {'CANCELLED'}
+        if event.type == 'ESC':
+            self._request_cancel(context)
+            return {'RUNNING_MODAL'}
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        try:
+            if self._step is not None:
+                progress = context.window_manager.object_bake_progress(self._step.scene)
+                if progress >= 0:
+                    self.progress = max(self.progress, (self._step.index + progress) / self._step.total)
+                    self.progress_label = ('Cancelling…' if self._cancel_requested else
+                                           f'{self._step.label} — {self.progress:.0%}')
+                    self._redraw(context)
+                    return {'RUNNING_MODAL'}
+                if not self._step_done:
+                    raise RuntimeError('Cycles bake stopped without a completion result')
+                self._step = None
+            if self._cancel_requested:
+                self._finish(context, cancel=True)
+                self.report({'INFO'}, 'Mesh map bake cancelled; previous maps retained')
+                return {'CANCELLED'}
+            with context.temp_override(window=self._window, area=self._area, region=self._region):
+                if self._node.id_data is None:
+                    raise RuntimeError('The texture set was removed during baking')
+                try:
+                    self._step = next(self._steps)
+                except StopIteration as done:
+                    ok, message = done.value
+                    self._finish(context)
+                    self.report({'INFO'} if ok else {'WARNING'}, message)
+                    return {'FINISHED'} if ok else {'CANCELLED'}
+                self._step_done = False
+                self.progress = self._step.index / self._step.total
+                self.progress_label = f'{self._step.label} — {self.progress:.0%}'
+                if self._step.run(context, 'INVOKE_DEFAULT') != {'RUNNING_MODAL'}:
+                    raise RuntimeError(f'Could not start Cycles {self._step.label} bake')
+            self._redraw(context)
+            return {'RUNNING_MODAL'}
+        except Exception as error:
+            self._finish(context, cancel=True)
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
+
+    def cancel(self, context):
+        self._finish(context, cancel=True)
 
     def execute(self, context):
         node = tex_paint_node_from_context(context)
@@ -8314,6 +8008,71 @@ class NODE_OT_tex_paint_bake_mesh_maps(Operator):
         return {'FINISHED'}
 
 
+_MESH_MAP_PREVIEW_WINDOW = None
+
+
+def _preview_mesh_map(context, image):
+    """Open/reuse one independent image window, leaving painting editors intact."""
+    global _MESH_MAP_PREVIEW_WINDOW
+    if bpy.app.background or context.window is None or context.area is None:
+        return False
+    wm = context.window_manager
+    window = next((win for win in wm.windows if win.as_pointer() == _MESH_MAP_PREVIEW_WINDOW), None)
+    if window is None:
+        existing = {win.as_pointer() for win in wm.windows}
+        if bpy.ops.screen.area_dupli('INVOKE_DEFAULT') != {'FINISHED'}:
+            return False
+        window = next((win for win in wm.windows if win.as_pointer() not in existing), None)
+        if window is None:
+            return False
+        _MESH_MAP_PREVIEW_WINDOW = window.as_pointer()
+    area = next(a for a in window.screen.areas if a.type not in {'TOPBAR', 'STATUSBAR'})
+    area.type = 'IMAGE_EDITOR'
+    space = area.spaces.active
+    space.mode = 'VIEW'
+    space.image = image
+    space.show_region_ui = False
+    space.show_region_toolbar = False
+    space.display_channels = 'COLOR'
+    region = next(r for r in area.regions if r.type == 'WINDOW')
+    with context.temp_override(window=window, area=area, region=region):
+        bpy.ops.image.view_all(fit_view=True)
+    area.tag_redraw()
+    return True
+
+
+class TEXPAINT_MT_preview_mesh_maps(Menu):
+    bl_label = "Preview Baked Maps"
+
+    def draw(self, context):
+        node = tex_paint_node_from_context(context)
+        maps = _get_mesh_maps_state(node)['maps']
+        for slot, label, icon in _MESH_MAP_SLOTS:
+            row = self.layout.row()
+            row.enabled = bool(bpy.data.images.get(maps.get(slot, '')))
+            op = row.operator('node.tex_paint_mesh_map_preview', text=label, icon=icon)
+            op.slot = slot
+
+
+class NODE_OT_tex_paint_mesh_map_preview(Operator):
+    """Open a baked map in its own image window without adding a paint undo step"""
+    bl_idname = 'node.tex_paint_mesh_map_preview'
+    bl_label = "Preview Baked Map"
+    slot: StringProperty(name="Map", default='ao')
+
+    @classmethod
+    def poll(cls, context):
+        return tex_paint_node_from_context(context) is not None and context.window is not None
+
+    def execute(self, context):
+        maps = _get_mesh_maps_state(tex_paint_node_from_context(context))['maps']
+        image = bpy.data.images.get(maps.get(self.slot, ''))
+        if image is None or not _preview_mesh_map(context, image):
+            self.report({'WARNING'}, "Choose a baked map in an interactive editor")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class NODE_OT_tex_paint_mesh_map_action(Operator):
     """Preview, Clear, or Connect a baked Mesh Map in the Texture Set Mesh Maps Hub"""
     bl_idname = "node.tex_paint_mesh_map_action"
@@ -8323,7 +8082,7 @@ class NODE_OT_tex_paint_mesh_map_action(Operator):
     action: EnumProperty(
         name="Action",
         items=(
-            ('PREVIEW_2D', "Preview in 2D Image Editor", "Display this Mesh Map in an open 2D Image Editor"),
+            ('PREVIEW_2D', "Preview Baked Map", "Open this map in a separate image window without changing painting editors"),
             ('APPLY_NORMAL', "Connect Normal Map to Shader", "Wire the baked Tangent-Space Normal Map into the material's Principled BSDF Normal input"),
             ('CLEAR_SLOT', "Clear Mesh Map Slot", "Unlink this Mesh Map slot"),
             ('CLEAR_ALL', "Clear All Mesh Map Slots", "Unlink all 7 Mesh Map slots on this material"),
@@ -8375,22 +8134,9 @@ class NODE_OT_tex_paint_mesh_map_action(Operator):
             return {'CANCELLED'}
 
         if self.action == 'PREVIEW_2D':
-            wm = getattr(context, "window_manager", None)
-            shown = False
-            if wm:
-                for win in wm.windows:
-                    if win.screen:
-                        for area in win.screen.areas:
-                            if area.type == 'IMAGE_EDITOR':
-                                for sp in area.spaces:
-                                    if sp.type == 'IMAGE_EDITOR':
-                                        sp.image = ima
-                                        shown = True
-                                area.tag_redraw()
-            if shown:
-                self.report({'INFO'}, f"Displaying '{ima.name}' in 2D Image Editor")
-            else:
-                self.report({'INFO'}, f"Mesh Map '{ima.name}' ready (open an Image Editor to view 2D)")
+            if not _preview_mesh_map(context, ima):
+                self.report({'WARNING'}, "Map preview needs an interactive editor window")
+                return {'CANCELLED'}
             return {'FINISHED'}
 
         return {'CANCELLED'}
@@ -8457,14 +8203,15 @@ class TEXPAINT_MT_layer_specials(Menu):
     bl_idname = "TEXPAINT_MT_layer_specials"
     bl_label = "Layer Specials"
 
-    def draw(self, _context):
+    def draw(self, context):
         layout = self.layout
-        layout.operator("node.tex_paint_export_texture_set", text="Export / Bake PBR Texture Set...", icon='EXPORT')
-        layout.separator()
-        layout.operator("node.tex_paint_make_material_unique", text="Re-Bake All Shared Models", icon='FILE_REFRESH').mode = 'REBAKE_ALL'
-        layout.operator("node.tex_paint_make_material_unique", text="Make Material Unique (Active Part)", icon='DUPLICATE').mode = 'ACTIVE_OBJECT'
-        layout.operator("node.tex_paint_make_material_unique", text="Split Shared Material Across All Parts", icon='MOD_EXPLODE').mode = 'ALL_SHARED_OBJECTS'
-        layout.separator()
+        if context.space_data.type != 'IMAGE_EDITOR':
+            layout.operator("node.tex_paint_export_texture_set", text="Export / Bake PBR Texture Set...", icon='EXPORT')
+            layout.separator()
+            layout.operator("node.tex_paint_make_material_unique", text="Re-Bake All Shared Models", icon='FILE_REFRESH').mode = 'REBAKE_ALL'
+            layout.operator("node.tex_paint_make_material_unique", text="Make Material Unique (Active Part)", icon='DUPLICATE').mode = 'ACTIVE_OBJECT'
+            layout.operator("node.tex_paint_make_material_unique", text="Split Shared Material Across All Parts", icon='MOD_EXPLODE').mode = 'ALL_SHARED_OBJECTS'
+            layout.separator()
         layout.operator("node.tex_paint_layer_pixel_action", text="Fill Layer with Brush Color", icon='COLOR').action = 'FILL_BRUSH'
         layout.operator("node.tex_paint_layer_pixel_action", text="Clear Layer to Transparent", icon='TRASH').action = 'CLEAR'
         layout.operator("node.tex_paint_layer_pixel_action", text="Invert Layer RGB", icon='ARROW_LEFTRIGHT').action = 'INVERT_RGB'
@@ -8479,8 +8226,6 @@ class TEXPAINT_MT_layer_specials(Menu):
         layout.operator("node.tex_paint_layer_merge_down", text="Merge Down", icon='TRIA_DOWN_BAR')
         layout.operator("node.tex_paint_layer_pixel_action", text="Merge Visible Layers", icon='RENDERLAYERS').action = 'MERGE_VISIBLE'
         layout.operator("node.tex_paint_layer_pixel_action", text="Flatten All Layers", icon='FULLSCREEN_EXIT').action = 'FLATTEN_ALL'
-        layout.separator()
-        layout.operator("node.tex_paint_canvas_resize", text="Resize Canvas...", icon='FULLSCREEN_ENTER')
 
 
 class NODE_OT_tex_paint_smart_mask_recipe(Operator):
@@ -8963,14 +8708,16 @@ class TEXPAINT_UL_layers(UIList):
 
         row.prop(layer, "name", text="", emboss=False)
 
-        # Inline Blend Mode Dropdown & Opacity Slider on each layer row
-        blend_sub = row.row(align=True)
-        blend_sub.ui_units_x = 3.1
-        blend_sub.prop(layer, "blend_mode", text="")
+        # The 2D sidebar reserves each row for a readable name and explicit pixel/mask targets.
+        if _context.space_data.type != 'IMAGE_EDITOR' and not _paint_sidebar_is_narrow(_context):
+            # Inline Blend Mode Dropdown & Opacity Slider on each layer row
+            blend_sub = row.row(align=True)
+            blend_sub.ui_units_x = 3.1
+            blend_sub.prop(layer, "blend_mode", text="")
 
-        op_sub = row.row(align=True)
-        op_sub.ui_units_x = 2.9
-        op_sub.prop(layer, "opacity", text="", slider=True)
+            op_sub = row.row(align=True)
+            op_sub.ui_units_x = 2.9
+            op_sub.prop(layer, "opacity", text="", slider=True)
 
         if layer.lock:
             row.prop(layer, "lock", text="", emboss=False)
@@ -8981,6 +8728,106 @@ class TEXPAINT_UL_layers(UIList):
         flt_flags = [self.bitflag_filter_item] * len(layers)
         flt_neworder = list(reversed(range(len(layers))))
         return flt_flags, flt_neworder
+
+
+def _paint_sidebar_is_narrow(context):
+    """Use the available sidebar width in UI pixels, independent of screen resolution."""
+    region = getattr(context, "region", None)
+    space = getattr(context, "space_data", None)
+    if region is None or space is None or space.type != 'VIEW_3D':
+        return False
+    scale = max(float(context.preferences.system.ui_scale), .5)
+    return region.width / scale < 420
+
+
+def _paint_target_status(node, layer):
+    """Read-only status for the actual layer/effect that can receive a brush stroke."""
+    if layer.hide:
+        return 'HIDDEN', "Layer is hidden", False
+    if layer.lock:
+        return 'LOCKED', "Layer is locked", False
+    if node.paint_target == 'COLOR':
+        if layer.type == 'FILL':
+            return 'FILL', "Fill settings", False
+        if layer.type == 'ADJUSTMENT':
+            return 'ADJUSTMENT', "Adjustment settings", False
+        return 'PIXELS', "Paint pixels", True
+    if not layer.use_mask:
+        return 'NO_MASK', "No layer mask", False
+    state = _get_layer_grunge_state(node, layer)
+    effect = _get_active_mask_effect(node, layer)
+    if state.get('effects'):
+        if effect is None or effect.get('type') != 'PAINT':
+            labels = {'GENERATOR': "Generator selected", 'GRUNGE': "Fill effect selected",
+                      'LEVELS': "Levels selected", 'FILTER': "Filter selected"}
+            return 'SELECT_PAINT', labels.get(effect.get('type') if effect else '', "Select a Paint effect"), False
+        if not effect.get('enabled', True):
+            return 'DISABLED_PAINT', "Paint effect is hidden", False
+        return 'PAINT_EFFECT', str(effect.get('name', "Paint Mask")), True
+    return 'BASE_MASK', "Paint layer mask", True
+
+
+def _draw_paint_target_status(layout, context, node, layer, narrow):
+    kind, title, paintable = _paint_target_status(node, layer)
+    status = layout.box()
+    header = status.row(align=True)
+    header.label(text=title, icon='BRUSH_DATA' if paintable else 'INFO')
+    if node.paint_target == 'MASK' and layer.use_mask:
+        preview = status.row(align=True) if narrow else header
+        preview.prop(layer, 'preview_mask', text="View Layer Mask" if narrow else "View Mask", toggle=True, icon='HIDE_OFF')
+        if narrow:
+            preview.prop(layer, 'invert_mask', text='', toggle=True, icon='ARROW_LEFTRIGHT')
+            preview.operator('node.tex_paint_mask_stack_init', text='', icon='X').mode = 'REMOVE'
+    status.label(text=f"Layer: {layer.name}")
+    if paintable:
+        status.label(text="Erase strokes", icon='EVENT_CTRL')
+    elif kind == 'HIDDEN':
+        status.prop(layer, 'hide', text="Show Layer", toggle=True, icon='HIDE_OFF')
+    elif kind == 'LOCKED':
+        status.prop(layer, 'lock', text="Unlock Layer", toggle=True, icon='UNLOCKED')
+    elif kind == 'DISABLED_PAINT':
+        effect = _get_active_mask_effect(node, layer)
+        op = status.operator('node.tex_paint_mask_effect_toggle', text="Show Paint Effect", icon='HIDE_OFF')
+        op.effect_uid = int(effect['uid'])
+        op.prop = 'ENABLED'
+    elif kind == 'SELECT_PAINT':
+        status.label(text="Select Paint to use the brush.")
+        paints = [e for e in _get_layer_grunge_state(node, layer).get('effects', [])
+                  if e.get('type') == 'PAINT' and e.get('enabled', True)]
+        actions = status.column(align=True) if narrow else status.row(align=True)
+        if paints:
+            op = actions.operator('node.tex_paint_mask_effect_select', text="Select Paint", icon='BRUSH_DATA')
+            op.effect_uid = int(paints[-1]['uid'])
+        op = actions.operator('node.tex_paint_mask_effect_add', text="Add Paint", icon='ADD')
+        op.effect_type = 'PAINT'
+    elif kind in {'FILL', 'ADJUSTMENT'}:
+        status.label(text="Use Paint or a mask for strokes.")
+        actions = status.column(align=True) if narrow else status.row(align=True)
+        actions.operator('node.tex_paint_layer_add', text="Add Paint Layer", icon='ADD').type = 'PAINT'
+        if layer.use_mask:
+            op = actions.operator('node.tex_paint_layer_target_select', text="Edit Layer Mask", icon='MOD_MASK')
+            op.layer_index = node.active_layer_index
+            op.target = 'MASK'
+        else:
+            actions.operator('node.tex_paint_mask_stack_init', text="Add Layer Mask", icon='MOD_MASK').mode = 'WHITE'
+
+
+def _material_layer_links_missing(mat, node):
+    """Inspect standard connections without changing an artist's material graph."""
+    if mat is None or mat.node_tree is None or node is None or node.image is None:
+        return False
+    if bool(node.get('_tex_paint_baked_set_active', False)):
+        return False
+    shader = next((n for n in mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
+    if shader is None:
+        return False
+    for output, input_name in (('Color', 'Base Color'), ('Roughness', 'Roughness'),
+                               ('Metallic', 'Metallic'), ('Normal', 'Normal'),
+                               ('Emission', 'Emission Color')):
+        source, target = node.outputs.get(output), shader.inputs.get(input_name)
+        if source is not None and target is not None and not any(link.from_socket == source for link in target.links):
+            return True
+    return False
 
 
 def _draw_mask_brush_bar(layout, context, node, layer, is_paint_sublayer=False):
@@ -9006,13 +8853,78 @@ def _draw_mask_brush_bar(layout, context, node, layer, is_paint_sublayer=False):
     op_hid.value = 0.0
     b_row.operator("paint.brush_colors_flip", text="", icon='FILE_REFRESH')
     if is_paint_sublayer:
-        b_row.separator()
+        if _paint_sidebar_is_narrow(context):
+            b_row = layout.row(align=True)
+        else:
+            b_row.separator()
         op_clr = b_row.operator("node.tex_paint_mask_paint_action", text="Clear", icon='LOOP_BACK')
         op_clr.action = 'CLEAR'
         op_inv = b_row.operator("node.tex_paint_mask_paint_action", text="", icon='ARROW_LEFTRIGHT')
         op_inv.action = 'INVERT_STROKES'
     elif hasattr(layer, "preview_mask"):
         b_row.prop(layer, "preview_mask", text="Inspect", toggle=True, icon='HIDE_OFF')
+
+
+class TEXPAINT_UL_color_filters(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="", emboss=False,
+                 icon='CHECKBOX_HLT' if item.enabled else 'CHECKBOX_DEHLT')
+        row.prop(item, "name", text="", emboss=False, icon='MODIFIER')
+
+
+class TEXPAINT_MT_add_color_filter(Menu):
+    bl_label = "Add Layer Filter"
+
+    def draw(self, context):
+        for kind, label in (
+                ('HSV', "Hue / Saturation / Value"),
+                ('BRIGHT_CONTRAST', "Brightness / Contrast"),
+                ('LEVELS', "Levels / Gamma"),
+                ('BLUR', "Blur"),
+                ('INVERT', "Invert"),
+                ('GRAYSCALE', "Grayscale")):
+            op = self.layout.operator("node.tex_paint_color_filter", text=label)
+            op.action = 'ADD'
+            op.type = kind
+
+
+def _draw_color_filter_stack(layout, layer):
+    box = layout.box()
+    box.enabled = not layer.lock
+    header = box.row(align=True)
+    header.label(text="Layer Effects", icon='MODIFIER')
+    header.menu("TEXPAINT_MT_add_color_filter", text="", icon='ADD')
+    if not layer.color_filters:
+        box.label(text="Add Blur or a color adjustment")
+        return
+    row = box.row()
+    row.template_list("TEXPAINT_UL_color_filters", "", layer, "color_filters",
+                      layer, "active_color_filter_index", rows=3, maxrows=5)
+    buttons = row.column(align=True)
+    for action, icon in (('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'),
+                         ('DUPLICATE', 'DUPLICATE'), ('REMOVE', 'REMOVE')):
+        buttons.operator("node.tex_paint_color_filter", text="", icon=icon).action = action
+    index = layer.active_color_filter_index
+    if not 0 <= index < len(layer.color_filters):
+        return
+    effect = layer.color_filters[index]
+    settings = box.column(align=True)
+    settings.enabled = effect.enabled
+    settings.use_property_split = True
+    settings.use_property_decorate = False
+    settings.prop(effect, "strength", slider=True)
+    if effect.type == 'HSV':
+        for i, label in enumerate(("Hue", "Saturation", "Value")):
+            settings.prop(effect, "hsv", index=i, text=label, slider=True)
+    elif effect.type == 'BRIGHT_CONTRAST':
+        for i, label in enumerate(("Brightness", "Contrast")):
+            settings.prop(effect, "bright_contrast", index=i, text=label, slider=True)
+    elif effect.type == 'LEVELS':
+        for prop in ("input_black", "input_white", "gamma", "output_black", "output_white"):
+            settings.prop(effect, prop)
+    elif effect.type == 'BLUR':
+        settings.prop(effect, "blur_radius", text="Radius (px)")
 
 
 def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
@@ -9022,6 +8934,7 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
     act_uid = st.get("active_effect_uid", 0)
     act_eff = _get_active_mask_effect(node, layer)
     wm = getattr(context, "window_manager", None)
+    narrow = not is_2d_only and _paint_sidebar_is_narrow(context)
 
     # Show the Reveal/Hide Mask Brush Bar at the top only when painting a plain base mask (no sub-layers yet)
     if (getattr(node, "paint_target", 'COLOR') == 'MASK' or layer.type != 'PAINT') and not effects:
@@ -9065,21 +8978,22 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
             erow = list_col.row(align=True)
             sel_op = erow.operator(
                 "node.tex_paint_mask_effect_select",
-                text=f"{eff.get('name', 'Mask')}  [{b_short} {op_pct}%]",
+                text=str(eff.get('name', 'Mask')) if narrow else f"{eff.get('name', 'Mask')}  [{b_short} {op_pct}%]",
                 icon=icon,
                 depress=is_sel,
                 emboss=True,
             )
             sel_op.effect_uid = e_uid
 
-            inv_op = erow.operator(
-                "node.tex_paint_mask_effect_toggle",
-                text="",
-                icon='ARROW_LEFTRIGHT',
-                depress=bool(eff.get("invert", False)),
-            )
-            inv_op.effect_uid = e_uid
-            inv_op.prop = 'INVERT'
+            if not narrow:
+                inv_op = erow.operator(
+                    "node.tex_paint_mask_effect_toggle",
+                    text="",
+                    icon='ARROW_LEFTRIGHT',
+                    depress=bool(eff.get("invert", False)),
+                )
+                inv_op.effect_uid = e_uid
+                inv_op.prop = 'INVERT'
 
             vis_op = erow.operator(
                 "node.tex_paint_mask_effect_toggle",
@@ -9090,8 +9004,9 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
             vis_op.effect_uid = e_uid
             vis_op.prop = 'ENABLED'
 
-            rem_op = erow.operator("node.tex_paint_mask_effect_remove", text="", icon='X')
-            rem_op.effect_uid = e_uid
+            if not narrow:
+                rem_op = erow.operator("node.tex_paint_mask_effect_remove", text="", icon='X')
+                rem_op.effect_uid = e_uid
 
     # Side Column: Up Arrow (▲), + Add Dropdown in the middle, Down Arrow (▼)
     side_col = stack_row.column(align=True)
@@ -9100,6 +9015,9 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
     side_col.menu("TEXPAINT_MT_add_mask_effect", text="", icon='ADD')
     op_dn = side_col.operator("node.tex_paint_mask_effect_move", text="", icon='TRIA_DOWN')
     op_dn.direction = 'DOWN'
+    if narrow:
+        side_col.separator()
+        side_col.operator("node.tex_paint_mask_effect_remove", text="", icon='REMOVE')
 
     # 2. Contextual Inspector for the Active Mask Sub-Layer
     if act_eff is None:
@@ -9107,6 +9025,13 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
 
     layout.separator(factor=0.35)
     etype = act_eff.get("type", "GRUNGE")
+    if narrow:
+        selected = layout.row(align=True)
+        selected.label(text=str(act_eff.get('name', "Mask Effect")), icon=type_icons.get(etype, 'MOD_MASK'))
+        invert = selected.operator('node.tex_paint_mask_effect_toggle', text='', icon='ARROW_LEFTRIGHT',
+                                   depress=bool(act_eff.get('invert', False)))
+        invert.effect_uid = int(act_eff['uid'])
+        invert.prop = 'INVERT'
 
     # Compact Single-Row Combine Mode & Opacity Bar (Substance Painter style)
     comb_row = layout.row(align=True)
@@ -9124,13 +9049,21 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
         # -------------------------------------------------------------------
         # STEP 1 (Substance Painter Order): Projection & Transform
         # -------------------------------------------------------------------
+        use_canvas_mapping = pmode in {'REPEAT', 'UV', 'FIT'}
+        if is_2d_only and not use_canvas_mapping:
+            layout.label(text="Existing 3D mapping", icon='INFO')
+            layout.operator("node.tex_paint_mask_fill_canvas_mapping", icon='IMAGE_DATA')
         p_col = layout.column(align=True)
+        p_col.enabled = not is_2d_only or use_canvas_mapping
 
         # Row 1: Projection Method + Repeat/Clamp Wrap + Reset Icon (all on 1 clean row!)
         proj_row = p_col.row(align=True)
-        proj_split = proj_row.split(factor=0.64, align=True)
-        proj_split.prop(node, "tex_paint_grunge_proj_mode", text="")
-        proj_split.prop(node, "tex_paint_fill_wrap_mode", text="")
+        if is_2d_only:
+            proj_row.prop(node, "tex_paint_fill_wrap_mode", text="Mapping")
+        else:
+            proj_split = proj_row.split(factor=0.64, align=True)
+            proj_split.prop(node, "tex_paint_grunge_proj_mode", text="")
+            proj_split.prop(node, "tex_paint_fill_wrap_mode", text="")
         op_rst = proj_row.operator("node.tex_paint_fill_transform_action", text="", icon='LOOP_BACK')
         op_rst.action = 'RESET'
 
@@ -9162,7 +9095,7 @@ def _draw_mask_effect_stack(layout, context, node, layer, is_2d_only=False):
         op_cw.action = 'ROT_90_CW'
 
         # Row 5: Falloff / Warp Depth + 3D Viewport Manipulator or 2D UV Image Editor Gizmo on one row
-        has_falloff = pmode in {'TRIPLANAR', 'DECAL', 'WARP'}
+        has_falloff = (not is_2d_only) and pmode in {'TRIPLANAR', 'DECAL', 'WARP'}
         has_3d_gizmo = (not is_2d_only) and (pmode in _3D_GIZMO_PROJ_MODES)
         has_uv_gizmo = (not is_2d_only) and (pmode in {'REPEAT', 'UV', 'FIT'})
         if has_falloff or has_3d_gizmo or has_uv_gizmo:
@@ -9340,6 +9273,7 @@ def _draw_mesh_maps_hub(layout, _context, node, wm):
     maps = st.get("maps", {})
     linked_count = sum(1 for k, _lbl, _ic in _MESH_MAP_SLOTS if maps.get(k) and bpy.data.images.get(maps.get(k)) is not None)
     expanded = bool(getattr(wm, "tex_paint_show_mesh_maps_hub", False)) if wm else False
+    narrow = _paint_sidebar_is_narrow(_context)
 
     hub_box = layout.box()
     hub_col = hub_box.column(align=True)
@@ -9348,17 +9282,27 @@ def _draw_mesh_maps_hub(layout, _context, node, wm):
         hdr.prop(
             wm,
             "tex_paint_show_mesh_maps_hub",
-            text=f"Mesh Maps & Baker ({linked_count}/7)",
+            text=f"Mesh Maps ({linked_count}/7)" if narrow else f"Mesh Maps & Baker ({linked_count}/7)",
             icon='TRIA_DOWN' if expanded else 'TRIA_RIGHT',
             emboss=True,
         )
     else:
         hdr.label(text=f"Mesh Maps & Baker ({linked_count}/7)", icon='SHADING_RENDERED')
 
-    op_bake_all = hdr.operator("node.tex_paint_bake_mesh_maps", text="Bake Mesh Maps", icon='RENDER_STILL')
+    actions = hub_col.row(align=True) if narrow else hdr
+    op_bake_all = actions.operator("node.tex_paint_bake_mesh_maps", text="Bake Mesh Maps", icon='RENDER_STILL')
     op_bake_all.map_type = 'ALL'
     if linked_count > 0 and hasattr(owner, "tex_paint_use_baked_mesh_maps"):
-        hdr.prop(owner, "tex_paint_use_baked_mesh_maps", text="", toggle=True, icon='CHECKMARK')
+        actions.prop(owner, "tex_paint_use_baked_mesh_maps", text="", toggle=True, icon='CHECKMARK')
+
+    if _MESH_MAP_BAKE_JOB is not None:
+        progress_row = hub_col.row(align=True)
+        progress_row.progress(factor=_MESH_MAP_BAKE_JOB.progress, type='BAR',
+                              text=_MESH_MAP_BAKE_JOB.progress_label)
+        progress_row.operator('node.tex_paint_bake_cancel', text='', icon='CANCEL')
+
+    if linked_count:
+        hub_col.menu('TEXPAINT_MT_preview_mesh_maps', text='Preview Baked Maps', icon='IMAGE_DATA')
 
     if not expanded:
         return
@@ -9379,46 +9323,53 @@ def _draw_mesh_maps_hub(layout, _context, node, wm):
         hp_row.prop_search(owner, "tex_paint_bake_high_poly_col", bpy.data, "collections", text="High-Poly Col", icon='OUTLINER_COLLECTION')
         hp_row.prop(owner, "tex_paint_bake_cage_dist", text="Cage Dist", slider=True)
 
-    b_row2 = hub_col.row(align=True)
-    b_row2.prop(owner, "tex_paint_bake_ao_scope", text="AO Scope")
-    b_row2.prop(owner, "tex_paint_bake_ao_dist", text="AO Spread", slider=True)
+    hub_col.prop(owner, "tex_paint_bake_ao_scope", text="AO Scope")
+    hub_col.prop(owner, "tex_paint_bake_ao_dist", text="AO Spread", slider=True)
 
     b_row3 = hub_col.row(align=True)
     b_row3.prop(owner, "tex_paint_bake_res", text="Size")
-    b_row3.prop(owner, "tex_paint_bake_apply_normal", text="Wire Normal to BSDF", toggle=True, icon='NODE_SEL')
     if linked_count > 0:
         op_ca = b_row3.operator("node.tex_paint_mesh_map_action", text="", icon='TRASH')
         op_ca.action = 'CLEAR_ALL'
+    hub_col.prop(owner, "tex_paint_bake_apply_normal", text="Connect Normal to Material", toggle=True, icon='NODE_SEL')
+
+    hub_col.label(text="Cycles Baker", icon='RENDER_STILL')
+    quality = hub_col.row(align=True)
+    quality.prop(owner, 'tex_paint_bake_samples', text='Samples')
+    quality.prop(owner, 'tex_paint_bake_margin', text='Margin')
+    hub_col.prop(owner, 'tex_paint_bake_device', text='Device')
 
     hub_col.separator(factor=0.35)
 
     # 2. The 7 Substance Painter Mesh Map Slots (Normal, World Normal, ID, AO, Curvature, Position, Thickness)
     for slot_key, slot_label, slot_icon in _MESH_MAP_SLOTS:
-        s_row = hub_col.row(align=True)
-        lbl_sub = s_row.row(align=True)
-        lbl_sub.ui_units_x = 5.2
-        lbl_sub.label(text=slot_label, icon=slot_icon)
+        slot_col = hub_col.column(align=True)
+        title = slot_col.split(factor=0.5, align=True)
+        short_labels = {'normal': "Normal", 'normal_ws': "World Normal", 'id_map': "Color ID", 'ao': "AO"}
+        title.label(text=short_labels.get(slot_key, slot_label), icon=slot_icon)
+        s_row = title.row(align=True)
+        op_bk = s_row.operator("node.tex_paint_bake_mesh_maps", text="Bake", icon='RENDER_STILL')
+        op_bk.map_type = slot_key
+        im_name = maps.get(slot_key, "")
+        has_im = bool(im_name and bpy.data.images.get(im_name) is not None)
+        preview = s_row.row(align=True)
+        preview.enabled = has_im
+        op_prv = preview.operator('node.tex_paint_mesh_map_preview', text="View", icon='HIDE_OFF')
+        op_prv.slot = slot_key
 
+        s_row = slot_col.row(align=True)
         prop_name = f"tex_paint_mesh_map_{slot_key}"
         if hasattr(owner, prop_name):
             s_row.prop_search(owner, prop_name, bpy.data, "images", text="", icon='IMAGE_DATA')
 
-        op_bk = s_row.operator("node.tex_paint_bake_mesh_maps", text="", icon='RENDER_STILL')
-        op_bk.map_type = slot_key
-
         op_im = s_row.operator("node.tex_paint_import_mesh_map", text="", icon='FILE_FOLDER')
         op_im.slot = slot_key
 
-        im_name = maps.get(slot_key, "")
-        has_im = bool(im_name and bpy.data.images.get(im_name) is not None)
         if has_im:
             if slot_key == "normal":
                 op_con = s_row.operator("node.tex_paint_mesh_map_action", text="", icon='NODE_SEL')
                 op_con.action = 'APPLY_NORMAL'
                 op_con.slot = slot_key
-            op_prv = s_row.operator("node.tex_paint_mesh_map_action", text="", icon='HIDE_OFF')
-            op_prv.action = 'PREVIEW_2D'
-            op_prv.slot = slot_key
             op_clr = s_row.operator("node.tex_paint_mesh_map_action", text="", icon='X')
             op_clr.action = 'CLEAR_SLOT'
             op_clr.slot = slot_key
@@ -9430,7 +9381,8 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     space = getattr(context, "space_data", None)
     is_view3d = bool(space and space.type == 'VIEW_3D')
     is_image_editor = bool(space and space.type == 'IMAGE_EDITOR')
-    is_2d_only = _is_standalone_2d_node(node)
+    is_2d_only = is_image_editor or _is_standalone_2d_node(node)
+    narrow = is_view3d and (compact or _paint_sidebar_is_narrow(context))
     wm = getattr(context, "window_manager", None)
 
     # 0. Actionable Diagnostic Alerts (Missing UVs, Non-Textured Solid Viewport)
@@ -9441,12 +9393,12 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             uv_box = layout.box()
             uv_row = uv_box.row(align=True)
             uv_row.alert = True
-            uv_row.operator("node.tex_paint_quick_uv", text="Missing UVs — Click to Auto-Unwrap (Smart UV)", icon='UV').method = 'SMART'
+            uv_row.operator("node.tex_paint_quick_uv", text="Add UV Map" if narrow else "Missing UVs — Auto-Unwrap", icon='UV').method = 'SMART'
         shading = getattr(space, "shading", None)
         if shading and shading.type == 'SOLID' and shading.color_type != 'TEXTURE':
             sh_row = layout.row(align=True)
             sh_row.alert = True
-            sh_row.operator("node.tex_paint_viewport_shading", text="Viewport Hiding Textures — Click to Show", icon='TEXTURE').mode = 'STUDIO'
+            sh_row.operator("node.tex_paint_viewport_shading", text="Show Paint Textures" if narrow else "Viewport Hiding Textures — Click to Show", icon='TEXTURE').mode = 'STUDIO'
 
     if not compact and is_view3d:
         if ob and len(ob.material_slots) > 1:
@@ -9459,31 +9411,29 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     # 0b. Single Multilayer Texture Node Header + Viewport Lighting Switcher
     flat_slot_node, flat_slot_ima = _find_active_flat_paint_slot_node(mat) if not is_2d_only else (None, None)
     if not is_2d_only and mat is not None:
-        if node is not None and node.image is not None:
-            _ensure_single_node_pbr_links(mat, node)
-
         if is_view3d and not compact and getattr(space, "shading", None):
             sh = space.shading
             ov = getattr(space, "overlay", None)
             top_bar = layout.row(align=True)
-            top_bar.label(text="Multilayer Material", icon='MATERIAL')
+            if not narrow:
+                top_bar.label(text="Material", icon='MATERIAL')
             v_sub = top_bar.row(align=True)
             v_sub.operator(
                 "node.tex_paint_viewport_shading",
                 text="Flat",
-                icon='SHADING_TEXTURE',
+                icon='NONE' if narrow else 'SHADING_TEXTURE',
                 depress=(sh.type == 'SOLID' and sh.light == 'FLAT' and sh.color_type == 'TEXTURE'),
             ).mode = 'FLAT'
             v_sub.operator(
                 "node.tex_paint_viewport_shading",
                 text="Studio",
-                icon='SHADING_SOLID',
+                icon='NONE' if narrow else 'SHADING_SOLID',
                 depress=(sh.type == 'SOLID' and sh.light == 'STUDIO' and sh.color_type == 'TEXTURE'),
             ).mode = 'STUDIO'
             v_sub.operator(
                 "node.tex_paint_viewport_shading",
                 text="PBR",
-                icon='SHADING_RENDERED',
+                icon='NONE' if narrow else 'SHADING_RENDERED',
                 depress=(sh.type == 'MATERIAL'),
             ).mode = 'MATERIAL'
             if ov is not None:
@@ -9493,6 +9443,11 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
                     icon='SHADING_WIRE',
                     depress=bool(ov.show_wireframes),
                 ).mode = 'WIREFRAME'
+
+        if _material_layer_links_missing(mat, node):
+            connect = layout.operator('node.tex_paint_reconnect_live_layers',
+                                      text="Connect Material", icon='NODETREE')
+            connect.remove_baked_nodes = False
 
         if flat_slot_node is not None:
             flat_box = layout.box()
@@ -9533,7 +9488,7 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
         "TEXPAINT_UL_layers", "",
         node, "layers",
         node, "active_layer_index",
-        rows=4 if compact else 5,
+        rows=4 if compact else (8 if is_image_editor else 5),
         sort_lock=True,
     )
 
@@ -9549,8 +9504,8 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     if layer is None:
         return
 
-    # Alert if the active layer is Hidden or Locked
-    if layer.hide or layer.lock:
+    # The 3D target card below provides explicit actions without crowding the layer row.
+    if (layer.hide or layer.lock) and not is_view3d:
         warn_row = layout.row(align=True)
         warn_row.alert = True
         if layer.hide:
@@ -9575,7 +9530,7 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     tabs_sub = hdr_bar.row(align=True)
     op_tab_col = tabs_sub.operator(
         "node.tex_paint_layer_target_select",
-        text="Channels",
+        text="Pixels" if is_image_editor or layer.type == 'PAINT' else "Channels",
         icon='COLOR' if layer.type == 'FILL' else ('MODIFIER' if layer.type == 'ADJUSTMENT' else 'BRUSH_DATA'),
         depress=(paint_target == 'COLOR'),
     )
@@ -9591,8 +9546,14 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     op_tab_msk.layer_index = node.active_layer_index
     op_tab_msk.target = 'MASK'
 
-    hdr_bar.separator(factor=0.5)
-    flags_sub = hdr_bar.row(align=True)
+    if is_image_editor or narrow:
+        blend_row = insp_col.row(align=True)
+        blend_row.prop(layer, "blend_mode", text="")
+        blend_row.prop(layer, "opacity", text="Opacity", slider=True)
+        flags_sub = insp_col.row(align=True)
+    else:
+        hdr_bar.separator(factor=0.5)
+        flags_sub = hdr_bar.row(align=True)
     if layer.type == 'PAINT':
         flags_sub.prop(layer, "lock_alpha", text="", toggle=True, icon='IMAGE_ALPHA')
     flags_sub.prop(layer, "use_clipping", text="", toggle=True, icon='TRIA_DOWN_BAR')
@@ -9608,11 +9569,14 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
     if layer.type in {'FILL', 'PAINT'} and not is_2d_only:
         flags_sub.menu("TEXPAINT_MT_fill_channels_and_presets", text="", icon='PRESET')
 
+    if is_view3d:
+        _draw_paint_target_status(insp_col, context, node, layer, narrow)
+
     # =======================================================================
     # TAB A: LAYER CHANNELS INSPECTOR
     # =======================================================================
     if paint_target == 'COLOR':
-        if layer.type in {'FILL', 'ADJUSTMENT'}:
+        if layer.type in {'FILL', 'ADJUSTMENT'} and not is_view3d:
             insp_col.separator(factor=0.3)
             guard_row = insp_col.row(align=True)
             guard_lbl = "Fill Layer — Direct Brush Guarded" if layer.type == 'FILL' else "Adjustment — Direct Brush Guarded"
@@ -9631,7 +9595,7 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             insp_col.separator(factor=0.35)
 
             # Compact, Non-Truncating Channel Pill Strip: [ Color | Rough | Metal | Height | Normal | Emit ]
-            strip_row = insp_col.row(align=True)
+            strip_row = insp_col.grid_flow(row_major=True, columns=3 if narrow else 6, even_columns=True, align=True)
             diagram_channels = (
                 ('BASE_COLOR', "Color"),
                 ('ROUGHNESS', "Rough"),
@@ -9677,11 +9641,15 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
                     )
                     op_tex.action = 'SOLID' if has_tex else 'GRUNGE'
                 else:
-                    c_split = ch_val_col.split(factor=0.4, align=True)
-                    c_lbl = c_split.row(align=True)
-                    c_lbl.alignment = 'RIGHT'
-                    c_lbl.label(text="Base Color")
-                    act_sub = c_split.row(align=True)
+                    if narrow:
+                        ch_val_col.label(text="Paint Color")
+                        act_sub = ch_val_col.row(align=True)
+                    else:
+                        c_split = ch_val_col.split(factor=0.4, align=True)
+                        c_lbl = c_split.row(align=True)
+                        c_lbl.alignment = 'RIGHT'
+                        c_lbl.label(text="Base Color")
+                        act_sub = c_split.row(align=True)
                     act_sub.operator("node.tex_paint_layer_pixel_action", text="Fill", icon='COLOR').action = 'FILL_BRUSH'
                     act_sub.operator("node.tex_paint_layer_pixel_action", text="Clear", icon='TRASH').action = 'CLEAR'
 
@@ -9728,13 +9696,13 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             if not any_ch_on:
                 off_row = insp_col.row(align=True)
                 off_row.enabled = False
-                off_row.label(text="All channels OFF — passes through from below", icon='INFO')
+                off_row.label(text="All channels off" if narrow else "All channels OFF — passes through from below", icon='INFO')
             elif non_color_ch_on and is_view3d and getattr(space, "shading", None) and space.shading.type == 'SOLID':
                 insp_col.separator(factor=0.25)
                 sh_hint = insp_col.row(align=True)
                 sh_hint.operator(
                     "node.tex_paint_viewport_shading",
-                    text="Switch to PBR Viewport to Preview Channels",
+                    text="Preview Channels in PBR" if narrow else "Switch to PBR Viewport to Preview Channels",
                     icon='SHADING_RENDERED',
                 ).mode = 'MATERIAL'
 
@@ -9752,6 +9720,9 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             adj_col.prop(layer, "adjust_hsv", index=2, text="Value", slider=True)
             adj_col.prop(layer, "adjust_bright_contrast", index=0, text="Brightness", slider=True)
             adj_col.prop(layer, "adjust_bright_contrast", index=1, text="Contrast", slider=True)
+
+        if layer.type in {'PAINT', 'FILL'}:
+            _draw_color_filter_stack(insp_col, layer)
 
         # Compact Texture / Grunge Projection Sub-Box (shown only when Texture is enabled on the layer)
         has_color_proj = (layer.type in {'PAINT', 'FILL'} and getattr(layer, "proj_mode", 'NONE') != 'NONE')
@@ -9830,12 +9801,13 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             hdr_row.menu("TEXPAINT_MT_add_mask_effect", text="Add Effect", icon='ADD')
             if not is_2d_only:
                 hdr_row.menu("TEXPAINT_MT_smart_mask_recipes", text="Smart Masks", icon='PRESET')
-            act_sub = hdr_row.row(align=True)
-            if hasattr(layer, "preview_mask"):
-                act_sub.prop(layer, "preview_mask", text="", toggle=True, icon='HIDE_OFF')
-            act_sub.prop(layer, "invert_mask", text="", toggle=True, icon='ARROW_LEFTRIGHT')
-            op_rem = act_sub.operator("node.tex_paint_mask_stack_init", text="", icon='X')
-            op_rem.mode = 'REMOVE'
+            if not narrow:
+                act_sub = hdr_row.row(align=True)
+                if is_2d_only and hasattr(layer, "preview_mask"):
+                    act_sub.prop(layer, "preview_mask", text="", toggle=True, icon='HIDE_OFF')
+                act_sub.prop(layer, "invert_mask", text="", toggle=True, icon='ARROW_LEFTRIGHT')
+                op_rem = act_sub.operator("node.tex_paint_mask_stack_init", text="", icon='X')
+                op_rem.mode = 'REMOVE'
 
             insp_col.separator(factor=0.3)
             _draw_mask_effect_stack(insp_col, context, node, layer, is_2d_only=is_2d_only)
@@ -9856,8 +9828,10 @@ def draw_tex_paint_layers(layout, context, node, compact=False):
             ),
             icon='IMAGE_RGB_ALPHA',
         )
-        foot_row.operator("node.tex_paint_canvas_resize", text="Resize", icon='FULLSCREEN_ENTER')
-        foot_row.operator("node.tex_paint_export_texture_set", text="Export Set", icon='EXPORT')
+        if is_image_editor:
+            foot_row.operator("image.save_as", text="Export Image", icon='EXPORT')
+        else:
+            foot_row.operator("node.tex_paint_export_texture_set", text="Export Set", icon='EXPORT')
 
 
 class VIEW3D_PT_tex_paint_layers(Panel):
@@ -9900,7 +9874,7 @@ class IMAGE_PT_tex_paint_layers(Panel):
     """Paint Layers panel in the 2D Image Editor — ONLY shown when the chosen image is a multi-layer canvas."""
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = "Tool"
+    bl_category = "Layers"
     bl_label = "Paint Layers"
     bl_order = 0
 
@@ -9961,69 +9935,39 @@ def _sync_2d_image_to_3d_projections(context, ima):
 
 
 def _read_active_2d_rgba_f32(context):
-    """Read RGBA float32[H, W, 4] from either the active 2D Paint layer (if layered) or space.image (if flat)."""
+    """Read the explicit native layer/mask target without accessing C++ memory layouts."""
     import numpy as np
     space = getattr(context, "space_data", None)
-    ima = getattr(space, "image", None) if (space and space.type == 'IMAGE_EDITOR') else None
+    ima = getattr(space, "image", None) if space and space.type == 'IMAGE_EDITOR' else None
     if ima is None:
         return None, None, None, 0, 0, None
-
     node = _find_tex_paint_node_for_image(ima, context)
-    layer = node.active_layer if node is not None else None
-    if node is not None and layer is not None and layer.type == 'PAINT':
-        c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-        if not c_layer.ibuf:
-            try:
-                layer.opacity = layer.opacity
-            except Exception:
-                pass
-            c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-        if c_layer.ibuf:
-            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
-            w, h = int(c_imb.x), int(c_imb.y)
-            if w > 0 and h > 0:
-                if c_imb.byte_data:
-                    buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4).astype(np.float32) * (1.0 / 255.0)
-                    return ima, node, layer, w, h, arr
-                elif c_imb.float_data:
-                    buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-                    arr = np.frombuffer(buf, dtype=np.float32).reshape(h, w, 4).copy()
-                    return ima, node, layer, w, h, arr
-
     w, h = int(ima.size[0]), int(ima.size[1])
+    if node is not None:
+        layer = node.active_layer
+        if layer is None or len(node.paint_pixels) != w * h * 4:
+            return ima, node, layer, w, h, None
+        pixels = np.empty(w * h * 4, dtype=np.float32)
+        node.paint_pixels.foreach_get(pixels)
+        return ima, node, layer, w, h, pixels.reshape(h, w, 4)
     if w <= 0 or h <= 0:
-        return ima, node, layer, 0, 0, None
-    arr = np.empty(w * h * 4, dtype=np.float32)
-    ima.pixels.foreach_get(arr)
-    return ima, None, None, w, h, arr.reshape(h, w, 4)
+        return ima, None, None, w, h, None
+    pixels = np.empty(w * h * 4, dtype=np.float32)
+    ima.pixels.foreach_get(pixels)
+    return ima, None, None, w, h, pixels.reshape(h, w, 4)
 
 
 def _write_active_2d_rgba_f32(context, ima, node, layer, rgba_f32):
-    """Write RGBA float32[H, W, 4] back to the active 2D layer or flat image and sync any 3D projections."""
+    """Use the native target service; preserve float HDR values and native lock policy."""
     import numpy as np
-    rgba_f32 = np.clip(rgba_f32, 0.0, 1.0).astype(np.float32, copy=False)
-    h, w, _ = rgba_f32.shape
-
-    if node is not None and layer is not None and layer.type == 'PAINT':
-        c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
-        if c_layer.ibuf:
-            c_imb = _C_ImBuf.from_address(c_layer.ibuf)
-            if c_imb.byte_data:
-                buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                dst = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
-                dst[:] = (rgba_f32 * 255.0 + 0.5).astype(np.uint8)
-            elif c_imb.float_data:
-                buf = (ctypes.c_float * (w * h * 4)).from_address(c_imb.float_data)
-                dst = np.frombuffer(buf, dtype=np.float32).reshape(h, w, 4)
-                dst[:] = rgba_f32
-            c_layer.runtime_dirty = 1
-            layer.opacity = layer.opacity
-            _sync_2d_image_to_3d_projections(context, ima)
+    pixels = np.ascontiguousarray(rgba_f32, dtype=np.float32)
+    if node is not None:
+        if len(node.paint_pixels) != pixels.size:
             return
-
-    ima.pixels.foreach_set(rgba_f32.ravel())
-    ima.update()
+        node.paint_pixels.foreach_set(pixels.ravel())
+    else:
+        ima.pixels.foreach_set(pixels.ravel())
+        ima.update()
     _sync_2d_image_to_3d_projections(context, ima)
 
 
@@ -10032,18 +9976,19 @@ def _write_active_2d_rgba_f32(context, ima, node, layer, rgba_f32):
 # ---------------------------------------------------------------------------
 
 def _get_2d_selection_mask(ima, w=0, h=0):
-    """Return the active float32[H, W] selection mask in [0..1] for `ima`, or None if no selection is active."""
+    import numpy as np
     if ima is None:
         return None
+    node = _find_tex_paint_node_for_image(ima, bpy.context)
+    if node is not None:
+        if not node.selection_active:
+            return None
+        w, h = node.canvas_width, node.canvas_height
+        mask = np.empty(w * h, dtype=np.float32)
+        node.selection_mask.foreach_get(mask)
+        return mask.reshape(h, w)
     info = _2D_SELECTION_STATE.get(ima.name)
-    if info is None:
-        return None
-    m = info.get("mask")
-    if m is None:
-        return None
-    if w > 0 and h > 0 and m.shape != (h, w):
-        return None
-    return m
+    return info.get("mask") if info else None
 
 
 def _compute_selection_contour_uv(mask_f32):
@@ -10145,32 +10090,23 @@ def _compute_selection_contour_uv(mask_f32):
 
 
 def _set_2d_selection_mask(ima, mask_f32, context=None):
-    """Store `mask_f32` (float32[H, W] in [0..1]) as the active 2D selection for `ima` and refresh the Image Editor."""
     import numpy as np
     if ima is None:
         return
-    if mask_f32 is None:
+    node = _find_tex_paint_node_for_image(ima, context or bpy.context)
+    if node is not None:
+        if mask_f32 is None:
+            node.selection_active = False
+        else:
+            mask = np.ascontiguousarray(np.clip(mask_f32, 0.0, 1.0), dtype=np.float32)
+            node.selection_mask.foreach_set(mask.ravel())
         _2D_SELECTION_STATE.pop(ima.name, None)
-        _tag_view3d_gizmo_refresh(context)
-        return
-
-    m = np.clip(mask_f32, 0.0, 1.0).astype(np.float32, copy=False)
-    if float(m.max()) < 0.01:
-        _2D_SELECTION_STATE.pop(ima.name, None)
-        _tag_view3d_gizmo_refresh(context)
-        return
-
-    contour_uv, pct, bbox = _compute_selection_contour_uv(m)
-    if contour_uv is None:
+    elif mask_f32 is None:
         _2D_SELECTION_STATE.pop(ima.name, None)
     else:
-        _2D_SELECTION_STATE[ima.name] = {
-            "active": True,
-            "mask": m,
-            "contour_uv": contour_uv,
-            "pct": pct,
-            "bbox": bbox,
-        }
+        mask = np.ascontiguousarray(np.clip(mask_f32, 0.0, 1.0), dtype=np.float32)
+        contour, pct, bbox = _compute_selection_contour_uv(mask)
+        _2D_SELECTION_STATE[ima.name] = dict(active=True, mask=mask, contour_uv=contour, pct=pct, bbox=bbox)
     _tag_view3d_gizmo_refresh(context)
 
 
@@ -10324,32 +10260,24 @@ class IMAGE_OT_tex_paint_new_2d_canvas(Operator):
         res = int(self.resolution)
         base_name = self.name.strip() or ("Pattern_Tile" if self.preset == 'PATTERN' else "Logo_Decal")
 
-        if self.preset == 'LAYERED_2D':
-            ng = bpy.data.node_groups.get(_2D_STANDALONE_NG_NAME)
-            if ng is None:
-                ng = bpy.data.node_groups.new(_2D_STANDALONE_NG_NAME, "ShaderNodeTree")
-                ng.use_fake_user = True
-            node = ng.nodes.new("ShaderNodeTexPaint")
-            with context.temp_override(node=node):
-                bpy.ops.node.tex_paint_canvas_new(
-                    name=base_name,
-                    width=res,
-                    height=res,
-                    color=tuple(self.bg_color),
-                )
-            ima = node.image
-        else:
-            ima = bpy.data.images.new(
+        ng = bpy.data.node_groups.get(_2D_STANDALONE_NG_NAME)
+        if ng is None:
+            ng = bpy.data.node_groups.new(_2D_STANDALONE_NG_NAME, "ShaderNodeTree")
+            ng.use_fake_user = True
+        node = ng.nodes.new("ShaderNodeTexPaint")
+        with context.temp_override(node=node):
+            bpy.ops.node.tex_paint_canvas_new(
                 name=base_name,
                 width=res,
                 height=res,
-                alpha=True,
-                float_buffer=False,
+                color=tuple(self.bg_color),
             )
-            ima.generated_color = tuple(self.bg_color)
-
+        ima = node.image
         space.image = ima
         space.ui_mode = 'PAINT'
+        space.show_region_toolbar = True
+        space.show_region_tool_header = True
+        space.show_region_ui = True
 
         ip = getattr(context.tool_settings, "image_paint", None) if context.tool_settings else None
         if ip is not None:
@@ -11520,171 +11448,6 @@ class IMAGE_OT_tex_paint_2d_gradient(Operator):
         return {'RUNNING_MODAL'}
 
 
-class IMAGE_OT_tex_paint_2d_free_transform(Operator):
-    """Krita Free Transform Tool (Interactive Move, Rotate, and Scale of selected 2D pixels or active 2D layer)"""
-    bl_idname = "image.tex_paint_2d_free_transform"
-    bl_label = "Free Transform Selection / Layer (2D)"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    mode: EnumProperty(
-        name="Transform Mode",
-        items=(
-            ('TRANSLATE', "Move / Translate", "Drag to move selected pixels or layer"),
-            ('ROTATE', "Rotate", "Drag to rotate selected pixels or layer around pivot"),
-            ('SCALE', "Scale", "Drag to scale selected pixels or layer around pivot"),
-        ),
-        default='TRANSLATE',
-    )
-    offset_u: FloatProperty(name="Offset X", min=-1.0, max=1.0, default=0.0)
-    offset_v: FloatProperty(name="Offset Y", min=-1.0, max=1.0, default=0.0)
-    angle: FloatProperty(name="Rotation", min=-math.pi * 2.0, max=math.pi * 2.0, default=0.0, subtype='ANGLE')
-    scale_x: FloatProperty(name="Scale X", min=0.05, max=8.0, default=1.0)
-    scale_y: FloatProperty(name="Scale Y", min=0.05, max=8.0, default=1.0)
-
-    @classmethod
-    def poll(cls, context):
-        space = getattr(context, "space_data", None)
-        return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "image", None) is not None
-
-    def _apply_transform(self, context):
-        import numpy as np
-        w, h = self._w, self._h
-        ys = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
-        xs = (np.arange(w, dtype=np.float32) + 0.5) / float(w)
-
-        du = xs[None, :] - self._piv_u - self.offset_u
-        dv = ys[:, None] - self._piv_v - self.offset_v
-        ca, sa = math.cos(self.angle), math.sin(self.angle)
-        sx = max(self.scale_x, 0.02)
-        sy = max(self.scale_y, 0.02)
-
-        src_u = (du * ca + dv * sa) / sx + self._piv_u
-        src_v = (-du * sa + dv * ca) / sy + self._piv_v
-
-        valid = (src_u >= 0.0) & (src_u <= 1.0) & (src_v >= 0.0) & (src_v <= 1.0)
-        ix = np.clip((src_u * w).astype(np.int32), 0, w - 1)
-        iy = np.clip((src_v * h).astype(np.int32), 0, h - 1)
-
-        warped = self._floating_rgba[iy, ix].copy()
-        warped[~valid] = 0.0
-
-        out = self._bg_rgba.copy()
-        wa = warped[:, :, 3:4]
-        out_a = wa + out[:, :, 3:4] * (1.0 - wa)
-        safe_a = np.maximum(out_a, 1e-6)
-        out[:, :, :3] = (warped[:, :, :3] * wa + out[:, :, :3] * out[:, :, 3:4] * (1.0 - wa)) / safe_a
-        out[:, :, 3:4] = out_a
-
-        _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, out)
-        if self._has_sel and self._orig_sel is not None:
-            warped_sel = self._orig_sel[iy, ix].copy()
-            warped_sel[~valid] = 0.0
-            _set_2d_selection_mask(self._ima, warped_sel, context)
-
-    def _init_buffers(self, context):
-        import numpy as np
-        ima, node, layer, w, h, rgba = _read_active_2d_rgba_f32(context)
-        if rgba is None:
-            return False
-        self._ima, self._node, self._layer, self._w, self._h = ima, node, layer, w, h
-        self._orig_rgba = rgba.copy()
-        sel = _get_2d_selection_mask(ima, w, h)
-        self._orig_sel = sel.copy() if sel is not None else None
-        self._has_sel = sel is not None and bool(np.any(sel > 0.01))
-
-        if self._has_sel:
-            m3 = np.clip(sel, 0.0, 1.0)[:, :, None]
-            self._floating_rgba = rgba.copy()
-            self._floating_rgba[:, :, 3:4] *= m3
-            self._bg_rgba = rgba.copy()
-            self._bg_rgba[:, :, 3:4] *= (1.0 - m3)
-            ys, xs = np.nonzero(sel > 0.05)
-            self._piv_u = float(xs.mean() / w) if len(xs) else 0.5
-            self._piv_v = float(ys.mean() / h) if len(ys) else 0.5
-        else:
-            self._floating_rgba = rgba.copy()
-            self._bg_rgba = np.zeros_like(rgba)
-            op = rgba[:, :, 3] > 0.02
-            if np.any(op):
-                ys, xs = np.nonzero(op)
-                self._piv_u = float(xs.mean() / w)
-                self._piv_v = float(ys.mean() / h)
-            else:
-                self._piv_u, self._piv_v = 0.5, 0.5
-        return True
-
-    def execute(self, context):
-        if not self._init_buffers(context):
-            return {'CANCELLED'}
-        self._apply_transform(context)
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        if not self._init_buffers(context):
-            return {'CANCELLED'}
-        self.offset_u = 0.0
-        self.offset_v = 0.0
-        self.angle = 0.0
-        self.scale_x = 1.0
-        self.scale_y = 1.0
-        self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
-
-        context.window.cursor_modal_set('SCROLL_XY')
-        context.area.header_text_set(
-            f"2D Free Transform ({self.mode.title()}): Drag mouse | Press G=Move, R=Rotate, S=Scale | LMB/Enter=Confirm | Esc=Cancel"
-        )
-        context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
-
-    def modal(self, context, event):
-        if event.type in {'RIGHTMOUSE', 'ESC'}:
-            _write_active_2d_rgba_f32(context, self._ima, self._node, self._layer, self._orig_rgba)
-            if self._orig_sel is not None:
-                _set_2d_selection_mask(self._ima, self._orig_sel, context)
-            context.window.cursor_modal_restore()
-            context.area.header_text_set(None)
-            return {'CANCELLED'}
-
-        if event.value == 'PRESS':
-            if event.type == 'G':
-                self.mode = 'TRANSLATE'
-                self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
-                return {'RUNNING_MODAL'}
-            if event.type == 'R':
-                self.mode = 'ROTATE'
-                self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
-                return {'RUNNING_MODAL'}
-            if event.type == 'S':
-                self.mode = 'SCALE'
-                self._start_u, self._start_v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
-                return {'RUNNING_MODAL'}
-
-        if event.type == 'MOUSEMOVE':
-            u, v = context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
-            if self.mode == 'TRANSLATE':
-                self.offset_u = float(u - self._start_u)
-                self.offset_v = float(v - self._start_v)
-            elif self.mode == 'ROTATE':
-                a0 = math.atan2(self._start_v - self._piv_v, self._start_u - self._piv_u)
-                a1 = math.atan2(v - self._piv_v, u - self._piv_u)
-                self.angle = float(a1 - a0)
-            elif self.mode == 'SCALE':
-                d0 = max(math.hypot(self._start_u - self._piv_u, self._start_v - self._piv_v), 0.02)
-                d1 = max(math.hypot(u - self._piv_u, v - self._piv_v), 0.01)
-                s = min(max(d1 / d0, 0.05), 6.0)
-                self.scale_x = s
-                self.scale_y = s
-            self._apply_transform(context)
-            return {'RUNNING_MODAL'}
-
-        if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value in {'PRESS', 'RELEASE'}:
-            context.window.cursor_modal_restore()
-            context.area.header_text_set(None)
-            return {'FINISHED'}
-
-        return {'RUNNING_MODAL'}
-
-
 class IMAGE_OT_tex_paint_2d_color_adjust(Operator):
     """Krita Color Adjustment Dialog (Hue / Saturation / Value, Brightness / Contrast, Gamma & RGB Balance; respects active 2D selection)"""
     bl_idname = "image.tex_paint_2d_color_adjust"
@@ -12072,125 +11835,25 @@ class TEXPAINT_MT_2d_fx(Menu):
 
 
 class IMAGE_PT_2d_canvas_studio(Panel):
-    """Krita / Photoshop 2D Image Editing Studio & 3D Decal/Pattern Workflow Bridge in the Image Editor."""
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = "Tool"
-    bl_label = "2D Canvas Studio & 3D Bridge"
-    bl_order = 1
-
-    @classmethod
-    def poll(cls, context):
-        if context.space_data is None or context.space_data.type != 'IMAGE_EDITOR':
-            return False
-        if context.region and context.region.type in {'TOOL_HEADER', 'HEADER'}:
-            return False
-        return True
+    bl_category = "Image"
+    bl_label = "Document"
 
     def draw(self, context):
         layout = self.layout
-        space = context.space_data
-        ima = getattr(space, "image", None)
-        wm = getattr(context, "window_manager", None)
-        node_2d = tex_paint_node_from_context(context)
-        node_3d = _find_3d_object_tex_paint_node(context)
-        ob = getattr(context, "active_object", None) or getattr(context, "image_paint_object", None)
-
-        # Row 1: Unified Document, Layer Mode & Send-to-3D Header Bar
-        top_row = layout.row(align=True)
-        top_row.menu("TEXPAINT_MT_2d_canvas_new", text="New 2D", icon='ADD')
-        if wm and hasattr(wm, "tex_paint_2d_new_res"):
-            top_row.prop(wm, "tex_paint_2d_new_res", text="")
-
-        if ima is None:
+        image = context.space_data.image
+        layout.menu("TEXPAINT_MT_2d_canvas_new", text="New Canvas", icon='ADD')
+        if image is None:
             return
-
-        if node_2d is None:
-            op_en = top_row.operator("image.tex_paint_2d_layer_mode", text="2D Layers", icon='RENDERLAYERS')
-            op_en.action = 'ENABLE_LAYERS'
-        elif _is_standalone_2d_node(node_2d):
-            op_fl = top_row.operator("image.tex_paint_2d_layer_mode", text="Flatten", icon='TRIA_DOWN_BAR')
-            op_fl.action = 'FLATTEN'
-
-        is_3d_master = (node_3d is not None and node_3d.image == ima)
-        if ob is not None and ob.type == 'MESH' and not is_3d_master:
-            top_row.menu("TEXPAINT_MT_2d_send_to_3d", text="Send to 3D", icon='EXPORT')
-
-        layout.separator(factor=0.25)
-
-        # Row 2: Krita Selection & Magic Wand Toolbar
-        sel_box = layout.box()
-        sel_col = sel_box.column(align=True)
-        sel_row = sel_col.row(align=True)
-        sel_row.operator("image.tex_paint_2d_magic_wand", text="Magic Wand", icon='EYEDROPPER')
-        sel_row.operator("image.tex_paint_2d_marquee_select", text="Box", icon='SELECT_SET').shape = 'BOX'
-        sel_row.operator("image.tex_paint_2d_marquee_select", text="Ellipse", icon='MESH_CIRCLE').shape = 'ELLIPSE'
-        sel_row.operator("image.tex_paint_2d_marquee_select", text="Lasso", icon='GP_SELECT_POINTS').shape = 'LASSO'
-        sel_row.menu("TEXPAINT_MT_2d_select_menu", text="", icon='DOWNARROW_HLT')
-
-        if wm and hasattr(wm, "tex_paint_2d_wand_tolerance"):
-            wand_row = sel_col.row(align=True)
-            wand_row.prop(wm, "tex_paint_2d_wand_tolerance", text="Wand Tol", slider=True)
-            wand_row.prop(wm, "tex_paint_2d_wand_contiguous", text="Contig", toggle=True)
-            wand_row.prop(wm, "tex_paint_2d_wand_merged", text="Merged", toggle=True)
-            wand_row.prop(wm, "tex_paint_2d_sel_feather", text="Feather")
-
-        # Active Selection Quick-Action Bar (appears automatically when a 2D selection is active!)
-        sel_st = _2D_SELECTION_STATE.get(ima.name)
-        if sel_st and sel_st.get("active") and sel_st.get("mask") is not None:
-            act_row = sel_col.row(align=True)
-            act_row.alert = False
-            act_row.operator("image.tex_paint_2d_select_action", text="Fill", icon='COLOR').action = 'FILL_SEL'
-            act_row.operator("image.tex_paint_2d_select_action", text="Erase", icon='TRASH').action = 'DELETE_PIXELS'
-            act_row.operator("image.tex_paint_2d_select_action", text="Crop", icon='PIVOT_BOUNDBOX').action = 'CROP_TO_SEL'
-            act_row.operator("image.tex_paint_2d_select_action", text="To Layer", icon='DUPLICATE').action = 'EXTRACT_LAYER'
-            act_row.operator("image.tex_paint_2d_select_action", text="To Mask", icon='MOD_MASK').action = 'SEL_TO_MASK'
-            act_row.operator("image.tex_paint_2d_select_action", text="Invert", icon='ARROW_LEFTRIGHT').action = 'INVERT_SEL'
-            act_row.operator("image.tex_paint_2d_select_action", text="", icon='X').action = 'DESELECT'
-
-        # Row 3: Krita Image Editing Tools (Paint Bucket, Gradient, Free Transform, Color Adjust)
-        edit_row = layout.row(align=True)
-        op_bkt = edit_row.operator("image.tex_paint_2d_bucket_fill", text="Bucket Fill", icon='SNAP_FACE')
-        op_bkt.erase = False
-        op_era = edit_row.operator("image.tex_paint_2d_bucket_fill", text="Magic Erase", icon='IMAGE_ALPHA')
-        op_era.erase = True
-        edit_row.operator("image.tex_paint_2d_gradient", text="Gradient", icon='IPO_LINEAR')
-        edit_row.operator("image.tex_paint_2d_free_transform", text="Transform", icon='OBJECT_ORIGIN').mode = 'TRANSLATE'
-        edit_row.operator("image.tex_paint_2d_color_adjust", text="HSV/Levels", icon='COLOR')
-
-        # Row 4: Seamless Wrap Toggles + Flip/Rotate Menu on one row
-        wrap_row = layout.row(align=True)
-        ip = getattr(context.tool_settings, "image_paint", None) if context.tool_settings else None
-        if ip is not None:
-            wrap_row.prop(ip, "tile_x", text="Wrap X", toggle=True, icon='MOD_MIRROR')
-            wrap_row.prop(ip, "tile_y", text="Wrap Y", toggle=True, icon='MOD_MIRROR')
-        if hasattr(space, "show_repeat"):
-            wrap_row.prop(space, "show_repeat", text="Repeat", toggle=True, icon='MESH_GRID')
-        wrap_row.menu("TEXPAINT_MT_2d_transform", text="Flip/Rot", icon='ORIENTATION_VIEW')
-        wrap_row.operator("image.tex_paint_2d_edit", text="", icon='FULLSCREEN_ENTER').action = 'WRAP_50'
-
-        layout.separator(factor=0.25)
-
-        # Row 5: 2D Shape & Logo Stamp Dropdown + Inline Parametric Controls
-        sh_col = layout.column(align=True)
-        sh_row = sh_col.row(align=True)
-        sh_row.menu("TEXPAINT_MT_2d_shapes", text="Stamp Shape", icon='MESH_CIRCLE')
-        if wm and hasattr(wm, "tex_paint_2d_shape_radius"):
-            sh_row.prop(wm, "tex_paint_2d_shape_radius", text="Size", slider=True)
-            sh_row.prop(wm, "tex_paint_2d_shape_thickness", text="Outline", slider=True)
-            sh_row.prop(wm, "tex_paint_2d_shape_sides", text="Sides")
-            sh_row.prop(wm, "tex_paint_2d_shape_erase", text="", toggle=True, icon='IMAGE_ALPHA')
-
-        layout.separator(factor=0.2)
-
-        # Row 6: 2D Filters, Outline & Alpha FX Dropdown + Inline Radius/Strength Sliders
-        fx_col = layout.column(align=True)
-        fx_row = fx_col.row(align=True)
-        fx_row.menu("TEXPAINT_MT_2d_fx", text="2D Filters & FX", icon='SHADERFX')
-        if wm and hasattr(wm, "tex_paint_2d_fx_radius"):
-            fx_row.prop(wm, "tex_paint_2d_fx_radius", text="Radius", slider=True)
-            fx_row.prop(wm, "tex_paint_2d_fx_strength", text="Strength", slider=True)
-        fx_row.operator("image.tex_paint_2d_fx", text="", icon='TRASH').effect = 'CLEAR_TRANSPARENT'
+        node = _find_tex_paint_node_for_image(image, context)
+        layout.label(text=f"{image.size[0]} × {image.size[1]}")
+        if node is None:
+            layout.operator("image.tex_paint_2d_layer_mode", text="Enable Layers").action = 'ENABLE_LAYERS'
+        elif _is_standalone_2d_node(node):
+            layout.operator("image.tex_paint_2d_layer_mode", text="Flatten Layers").action = 'FLATTEN'
+        if context.active_object and context.active_object.type == 'MESH':
+            layout.menu("TEXPAINT_MT_2d_send_to_3d", text="Send to 3D")
 
 
 class IMAGE_PT_2d_canvas_studio_popover(Panel):
@@ -12241,14 +11904,14 @@ _FILL_CHANNEL_ITEMS = (
 )
 
 _GRUNGE_BLEND_ITEMS = (
-    ('REPLACE', "Normal (Replace / Reveal)", "For Procedural/Grunge: replace mask; for Paint: reveal White & hide Black", 0),
-    ('MULTIPLY', "Multiply (Break Up)", "Multiply over the mask stack below to break up edges and fills", 1),
-    ('SUBTRACT', "Subtract (Chip Away)", "Subtract from the mask stack below to chip away or erase", 2),
-    ('ADD', "Add (Linear Dodge)", "Add to the mask stack below to accumulate mask regions", 3),
-    ('SCREEN', "Screen (Soft Add)", "Softly accumulate over the mask stack below", 4),
-    ('OVERLAY', "Overlay (Contrast)", "Contrast-blend over the mask stack below", 5),
-    ('MAX', "Max (Lighten)", "Keep the brighter value between this sub-layer and the stack below", 6),
-    ('MIN', "Min (Darken)", "Keep the darker value between this sub-layer and the stack below", 7),
+    ('REPLACE', "Normal", "For Procedural/Grunge: replace mask; for Paint: reveal White & hide Black", 0),
+    ('MULTIPLY', "Multiply", "Multiply over the mask stack below to break up edges and fills", 1),
+    ('SUBTRACT', "Subtract", "Subtract from the mask stack below to chip away or erase", 2),
+    ('ADD', "Add", "Add to the mask stack below to accumulate mask regions", 3),
+    ('SCREEN', "Screen", "Softly accumulate over the mask stack below", 4),
+    ('OVERLAY', "Overlay", "Contrast-blend over the mask stack below", 5),
+    ('MAX', "Lighten", "Keep the brighter value between this sub-layer and the stack below", 6),
+    ('MIN', "Darken", "Keep the darker value between this sub-layer and the stack below", 7),
 )
 
 
@@ -12826,6 +12489,29 @@ def _register_node_grunge_props():
         set=lambda self, val: _save_mesh_maps_state(self, updates={"bake_res": _bake_res_items[val][0]}),
     )
 
+    Node.tex_paint_bake_samples = IntProperty(
+        name="Bake Samples", description="Cycles samples per texel; increase to reduce AO and thickness noise",
+        min=1, max=4096, soft_max=256, default=64,
+        get=lambda self: int(_get_mesh_maps_state(self).get('bake_samples', 64)),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={'bake_samples': int(val)}),
+    )
+    Node.tex_paint_bake_margin = IntProperty(
+        name="UV Margin", description="Extend island borders by this many output pixels to prevent texture seams",
+        min=0, max=128, soft_max=32, default=16,
+        get=lambda self: int(_get_mesh_maps_state(self).get('bake_margin', 16)),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={'bake_margin': int(val)}),
+    )
+    bake_devices = (
+        ('AUTO', "Auto", "Use enabled Cycles GPU devices when available, otherwise CPU"),
+        ('CPU', "CPU", "Bake with Cycles on the CPU"),
+        ('GPU', "GPU", "Use the Cycles GPU devices enabled in Preferences > System"),
+    )
+    Node.tex_paint_bake_device = EnumProperty(
+        name="Bake Device", items=bake_devices,
+        get=lambda self: _enum_idx(bake_devices, _get_mesh_maps_state(self).get('bake_device', 'AUTO'), 0),
+        set=lambda self, val: _save_mesh_maps_state(self, updates={'bake_device': bake_devices[val][0]}),
+    )
+
     Node.tex_paint_bake_apply_normal = BoolProperty(
         name="Auto-Connect Baked Normal to Shader",
         description="Automatically connect the baked Tangent-Space Normal Map to the material's Principled BSDF Normal input",
@@ -13135,6 +12821,9 @@ def _unregister_node_grunge_props():
         "tex_paint_bake_ao_dist",
         "tex_paint_bake_res",
         "tex_paint_bake_apply_normal",
+        "tex_paint_bake_samples",
+        "tex_paint_bake_margin",
+        "tex_paint_bake_device",
         "tex_paint_mesh_map_normal",
         "tex_paint_mesh_map_normal_ws",
         "tex_paint_mesh_map_id_map",
@@ -13198,7 +12887,7 @@ def _mask_paint_sync_timer():
                 if now - ts >= 0.18:
                     _PENDING_HIRES_REFINE.pop(rkey, None)
                     try:
-                        _evaluate_layer_grunge_mask(n_ref, l_ref, force_reproject=True, interactive=False, skip_absorb=True)
+                        _evaluate_layer_grunge_mask(n_ref, l_ref, force_reproject=True, interactive=False)
                     except Exception:
                         pass
 
@@ -13217,28 +12906,27 @@ def _mask_paint_sync_timer():
                 elif cur_target == 'MASK':
                     _save_rgb_brush_color_before_mask(context)
 
-        if node is not None and layer is not None and getattr(layer, "use_mask", False):
+        if (node is not None and layer is not None and getattr(layer, "use_mask", False) and
+                not layer.mask_effects_active):
             key = (node.as_pointer(), _layer_uid(layer))
             if key in _LAST_COMPOSITED_MASK:
                 c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
                 if c_layer.mask_ibuf and c_layer.runtime_dirty:
                     c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
                     w, h = int(c_imb.x), int(c_imb.y)
-                    if w > 0 and h > 0 and c_imb.byte_data:
-                        buf = (ctypes.c_uint8 * (w * h * 4)).from_address(c_imb.byte_data)
-                        cur_u8 = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)[:, 0]
+                    if w > 0 and h > 0 and (c_imb.byte_data or c_imb.float_data):
+                        cur_u8 = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
                         last_u8 = _LAST_COMPOSITED_MASK.get(key)
                         if last_u8 is None or len(last_u8) != w * h:
-                            # Lazily snapshot deferred composited mask once when idle
+                            # Recovery for a legacy mask without an effect-stack baseline.
                             _LAST_COMPOSITED_MASK[key] = cur_u8.copy()
                             step = max(1, (w * h) // 1024)
                             _LAST_MASK_SAMPLE[key] = cur_u8[::step].copy()
                         elif not np.array_equal(cur_u8, last_u8):
                             prev_snap = _PENDING_STROKE_SNAPSHOT.get(key)
-                            cur_hash = hash(cur_u8[::64].tobytes())
-                            if prev_snap != cur_hash:
-                                # Stroke is still in progress; wait one tick for mouse release
-                                _PENDING_STROKE_SNAPSHOT[key] = cur_hash
+                            if prev_snap is None or not np.array_equal(prev_snap, cur_u8):
+                                # Wait for stable pixels, including strokes between sampled rows.
+                                _PENDING_STROKE_SNAPSHOT[key] = cur_u8
                             else:
                                 _PENDING_STROKE_SNAPSHOT.pop(key, None)
                                 _absorb_pending_brush_strokes(node, layer)
@@ -13248,6 +12936,8 @@ def _mask_paint_sync_timer():
 
 
 classes = (
+    TEXPAINT_UL_color_filters,
+    TEXPAINT_MT_add_color_filter,
     NODE_OT_tex_paint_gizmo_mode,
     IMAGE_OT_tex_paint_uv_gizmo_transform,
     IMAGE_OT_tex_paint_focus_uv_gizmo,
@@ -13255,6 +12945,7 @@ classes = (
     NODE_OT_tex_paint_layer_snap_decal,
     NODE_OT_tex_paint_layer_bake_projection,
     NODE_OT_tex_paint_mask_effect_add,
+    NODE_OT_tex_paint_mask_fill_canvas_mapping,
     NODE_OT_tex_paint_mask_effect_remove,
     NODE_OT_tex_paint_mask_effect_move,
     NODE_OT_tex_paint_mask_effect_duplicate,
@@ -13283,9 +12974,12 @@ classes = (
     NODE_OT_tex_paint_reconnect_live_layers,
     NODE_OT_tex_paint_make_material_unique,
     NODE_OT_tex_paint_bake_mesh_maps,
+    NODE_OT_tex_paint_bake_cancel,
     NODE_OT_tex_paint_mesh_map_action,
     NODE_OT_tex_paint_import_mesh_map,
     TEXPAINT_MT_layer_specials,
+    TEXPAINT_MT_preview_mesh_maps,
+    NODE_OT_tex_paint_mesh_map_preview,
     NODE_OT_tex_paint_smart_mask_recipe,
     TEXPAINT_MT_smart_mask_recipes,
     TEXPAINT_MT_add_mask_generator,
@@ -13303,7 +12997,6 @@ classes = (
     IMAGE_OT_tex_paint_2d_select_action,
     IMAGE_OT_tex_paint_2d_bucket_fill,
     IMAGE_OT_tex_paint_2d_gradient,
-    IMAGE_OT_tex_paint_2d_free_transform,
     IMAGE_OT_tex_paint_2d_color_adjust,
     IMAGE_OT_tex_paint_send_to_3d,
     TEXPAINT_MT_2d_canvas_new,
@@ -13339,7 +13032,7 @@ def _register_projection_keymaps():
         ('R', True, 'RESET_ROT'),
         ('S', True, 'RESET_SCALE'),
     )
-    for km_name, space_type in (("Image Paint", 'EMPTY'), ("3D View", 'VIEW_3D')):
+    for km_name, space_type in (("3D View", 'VIEW_3D'),):
         km = kc.keymaps.get(km_name)
         if km is None:
             km = kc.keymaps.new(name=km_name, space_type=space_type)
@@ -13354,30 +13047,6 @@ def _register_projection_keymaps():
             kmi.properties.mode = mode_val
             _PROJECTION_KEYMAPS.append((km, kmi))
 
-    # 2D UV Projection Gizmo direct-handle drag (Left Mouse) + G/R/S shortcuts in Image Editor
-    for km_name, space_type in (("Image", 'IMAGE_EDITOR'), ("Image Paint", 'EMPTY')):
-        km = kc.keymaps.get(km_name)
-        if km is None:
-            km = kc.keymaps.new(name=km_name, space_type=space_type)
-        kmi_lmb = km.keymap_items.new(
-            "image.tex_paint_uv_gizmo_transform",
-            type='LEFTMOUSE',
-            value='PRESS',
-            head=True,
-        )
-        kmi_lmb.properties.mode = 'HIT_TEST'
-        _PROJECTION_KEYMAPS.append((km, kmi_lmb))
-
-        for key_type, use_alt, mode_val in bindings:
-            kmi_uv = km.keymap_items.new(
-                "image.tex_paint_uv_gizmo_transform",
-                type=key_type,
-                value='PRESS',
-                alt=use_alt,
-                head=True,
-            )
-            kmi_uv.properties.mode = mode_val
-            _PROJECTION_KEYMAPS.append((km, kmi_uv))
 
 
 def _unregister_projection_keymaps():
@@ -13391,7 +13060,7 @@ def _unregister_projection_keymaps():
 
 @bpy.app.handlers.persistent
 def _on_blend_save_pre(_dummy):
-    """Ensure all pending hand-painted mask strokes and debounced Mask Stack JSON states are flushed before saving .blend."""
+    """Publish pending edits while native storage owns saved Paint mask pixels."""
     try:
         trees = [m.node_tree for m in bpy.data.materials if m.node_tree] + list(bpy.data.node_groups)
         for ntree in trees:
@@ -13399,8 +13068,51 @@ def _on_blend_save_pre(_dummy):
                 if node.bl_idname == "ShaderNodeTexPaint":
                     n_ptr = node.as_pointer()
                     for layer in node.layers:
-                        _absorb_pending_brush_strokes(node, layer)
                         l_uid = _layer_uid(layer)
+                        st = _RUNTIME_LAYER_STATES.get((n_ptr, l_uid))
+                        if layer.mask_effects_active:
+                            st = _get_layer_grunge_state(node, layer)
+                            # Native strokes are already saved with their owned buffers.
+                            # Only explicit Python edits need publishing; do not create a
+                            # compressed second copy of every Paint effect during save.
+                            published = False
+                            if st and st.get("effects"):
+                                import numpy as np
+                                w, h = int(node.canvas_width), int(node.canvas_height)
+                                for eff in st["effects"]:
+                                    if eff.get('type') != 'PAINT':
+                                        continue
+                                    pbuf = _PAINT_EFFECT_BUFFERS.get((n_ptr, l_uid, int(eff["uid"])))
+                                    if pbuf is None or not pbuf.get("native_dirty", False):
+                                        continue
+                                    native = _native_mask_effect(layer, int(eff["uid"]))
+                                    if native is None or native.type != 1:
+                                        # An unpublished legacy effect still needs its
+                                        # import payload; the serializer keeps this UID.
+                                        _sync_paint_effect_z64(eff, pbuf, publish=False)
+                                        continue
+                                    if (pbuf.get("native_pointer") != native.as_pointer() or
+                                            pbuf.get("native_revision") != native.revision or
+                                            pbuf.get("w") != w or pbuf.get("h") != h):
+                                        # Undo, replacement or a newer native stroke wins
+                                        # over a stale Python snapshot of that buffer.
+                                        pbuf["native_dirty"] = False
+                                        _ensure_paint_effect_buffer(n_ptr, l_uid, eff, w, h)
+                                        continue
+                                    rgba = np.empty((w * h, 4), dtype=np.float32)
+                                    rgba[:, :3] = pbuf["val_u8"][:, None] * (1.0 / 255.0)
+                                    rgba[:, 3] = pbuf["alpha_u8"] * (1.0 / 255.0)
+                                    native.pixels.foreach_set(rgba.ravel())
+                                    pbuf["native_revision"] = native.revision
+                                    pbuf["native_pointer"] = native.as_pointer()
+                                    pbuf["native_dirty"] = False
+                                    published = True
+                                if published:
+                                    layer.mask_stack_evaluate()
+                                    _sync_layer_mask_to_companion_channels(node, layer)
+                                _save_layer_grunge_state(node, layer, st, flush_json=True)
+                            continue
+                        _absorb_pending_brush_strokes(node, layer)
                         st = _RUNTIME_LAYER_STATES.get((n_ptr, l_uid))
                         if st and st.get("effects"):
                             dirty_paint = False
@@ -13408,7 +13120,7 @@ def _on_blend_save_pre(_dummy):
                                 if eff.get("type") == 'PAINT':
                                     pbuf = _PAINT_EFFECT_BUFFERS.get((n_ptr, l_uid, int(eff["uid"])))
                                     if pbuf is not None:
-                                        _sync_paint_effect_z64(eff, pbuf)
+                                        _sync_paint_effect_z64(eff, pbuf, publish=False)
                                         dirty_paint = True
                             if dirty_paint:
                                 _save_layer_grunge_state(node, layer, st, flush_json=True)
@@ -13418,6 +13130,7 @@ def _on_blend_save_pre(_dummy):
 
 
 def _clear_all_runtime_mask_caches(clear_raw_cache=False):
+    _NATIVE_MASK_SOURCES.clear()
     _RUNTIME_LAYER_STATES.clear()
     _NODE_JSON_CACHE.clear()
     _NODE_LAST_JSON_STR.clear()
@@ -13446,8 +13159,31 @@ def _on_blend_load_post(_dummy):
             for node in ntree.nodes:
                 if node.bl_idname == "ShaderNodeTexPaint" and len(node.layers) > 0:
                     node.layers[0].opacity = node.layers[0].opacity
+                    for layer in node.layers:
+                        if layer.use_mask and not layer.mask_effects_active:
+                            st = _get_layer_grunge_state(node, layer)
+                            if st.get("effects"):
+                                _evaluate_layer_grunge_mask(node, layer, skip_absorb=True)
+                    _snapshot_restored_layer_masks(node)
     except Exception:
         pass
+
+
+def _snapshot_restored_layer_masks(node):
+    """Capture loaded masks before any brush input, without re-evaluating generators."""
+    for layer in node.layers:
+        if not layer.use_mask or layer.mask_effects_active:
+            continue
+        c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
+        if not c_layer.mask_ibuf:
+            continue
+        c_imb = _C_ImBuf.from_address(c_layer.mask_ibuf)
+        w, h = int(c_imb.x), int(c_imb.y)
+        if w > 0 and h > 0:
+            key = (node.as_pointer(), _layer_uid(layer))
+            mask = _read_mask_ibuf_r_u8(c_layer.mask_ibuf, w, h)
+            _LAST_COMPOSITED_MASK[key] = mask
+            _LAST_MASK_SAMPLE[key] = mask[::max(1, w * h // 1024)].copy()
 
 
 def _sync_mask_stack_from_restored_mask_ibuf(node, layer):
@@ -13455,6 +13191,8 @@ def _sync_mask_stack_from_restored_mask_ibuf(node, layer):
     to match the restored mask pixels without overwriting layer.mask_ibuf.
     """
     if node is None or layer is None or not getattr(layer, "use_mask", False):
+        return
+    if layer.mask_effects_active:
         return
     c_layer = _C_TexPaintLayer.from_address(layer.as_pointer())
     if not c_layer.mask_ibuf:
@@ -13495,7 +13233,8 @@ def _sync_mask_stack_from_restored_mask_ibuf(node, layer):
                 break
 
     if target_eff is not None:
-        enabled_indices = [i for i, e in enumerate(effects) if e.get("enabled", True)]
+        enabled_indices = [i for i, e in enumerate(effects)
+                           if e.get("enabled", True) and float(e.get("opacity", 1.0)) > 1e-5]
         first_enabled = effects[enabled_indices[0]] if enabled_indices else None
         if first_enabled is None:
             init_val = int(st.get("base_value", 255))
@@ -13559,7 +13298,8 @@ def _on_undo_redo_post(_dummy):
 
                     node.layers[0].opacity = node.layers[0].opacity
 
-                    if act_layer is not None and getattr(act_layer, "use_mask", False):
+                    if (act_layer is not None and getattr(act_layer, "use_mask", False) and
+                            not act_layer.mask_effects_active):
                         if was_stroke_undo:
                             _sync_mask_stack_from_restored_mask_ibuf(node, act_layer)
                         else:
@@ -13568,11 +13308,16 @@ def _on_undo_redo_post(_dummy):
                                 _evaluate_layer_grunge_mask(
                                     node, act_layer, context=bpy.context, force_reproject=False, skip_absorb=True
                                 )
+                    _snapshot_restored_layer_masks(node)
     except Exception:
         pass
 
 
 def register():
+    for handlers in (bpy.app.handlers.load_pre, bpy.app.handlers.save_pre,
+                     bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
+        if _mesh_map_bake_abort not in handlers:
+            handlers.append(_mesh_map_bake_abort)
     global _draw_handler_handle, _draw_handler_image_handle
     from bpy.types import WindowManager
     from bpy.utils import register_class
@@ -13709,6 +13454,11 @@ def register():
 
 
 def unregister():
+    _mesh_map_bake_abort()
+    for handlers in (bpy.app.handlers.load_pre, bpy.app.handlers.save_pre,
+                     bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
+        if _mesh_map_bake_abort in handlers:
+            handlers.remove(_mesh_map_bake_abort)
     global _draw_handler_handle, _draw_handler_image_handle, _PREVIEW_COLLECTION
     from bpy.types import WindowManager
     from bpy.utils import unregister_class

@@ -15,6 +15,7 @@
 #include "DNA_curves_types.h"
 #include "DNA_grease_pencil_types.h"
 #include "DNA_mesh_types.h"
+#include "DNA_node_tex_paint_types.h"
 #include "DNA_object_types.h"
 #include "DNA_pointcloud_types.h"
 #include "DNA_scene_types.h"
@@ -307,6 +308,73 @@ void do_versions_after_linking_503(FileData * /*fd*/, Main *bmain)
         }
       }
     }
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 503, 25)) {
+    FOREACH_NODETREE_BEGIN (bmain, node_tree, id) {
+      for (bNode &node : node_tree->nodes) {
+        if (node.is_type("ShaderNodeTexPaint"_ustr) && node.storage) {
+          NodeTexPaint &data = *static_cast<NodeTexPaint *>(node.storage);
+          data.selection = nullptr;
+          data.selection_size = 0;
+          data.selection_active = 0;
+        }
+      }
+    }
+    FOREACH_NODETREE_END;
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 503, 26)) {
+    FOREACH_NODETREE_BEGIN (bmain, node_tree, id) {
+      for (bNode &node : node_tree->nodes) {
+        if (node.is_type("ShaderNodeTexPaint"_ustr) && node.storage) {
+          NodeTexPaint &data = *static_cast<NodeTexPaint *>(node.storage);
+          for (TexPaintLayer &layer : data.layers) {
+            layer.color_filters.clear_no_delete();
+            layer.active_color_filter_index = 0;
+          }
+        }
+      }
+    }
+    FOREACH_NODETREE_END;
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 503, 27)) {
+    FOREACH_NODETREE_BEGIN (bmain, node_tree, id) {
+      for (bNode &node : node_tree->nodes) {
+        if (node.is_type("ShaderNodeTexPaint"_ustr) && node.storage) {
+          NodeTexPaint &data = *static_cast<NodeTexPaint *>(node.storage);
+          data.selection_transform_source = nullptr;
+          data.selection_transform_mask = nullptr;
+          data.selection_transform_size = 0;
+          data.selection_transform_layer_uid = 0;
+          data.selection_transform_hash = 0;
+        }
+      }
+    }
+    FOREACH_NODETREE_END;
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 503, 28)) {
+    FOREACH_NODETREE_BEGIN (bmain, node_tree, id) {
+      for (bNode &node : node_tree->nodes) {
+        if (node.is_type("ShaderNodeTexPaint"_ustr) && node.storage) {
+          NodeTexPaint &data = *static_cast<NodeTexPaint *>(node.storage);
+          for (TexPaintLayer &layer : data.layers) {
+            /* The authoring JSON and already evaluated mask remain intact. The UI prepares the
+             * native stack from that legacy state on its first evaluation. */
+            layer.mask_effects.clear_no_delete();
+            layer.active_mask_effect_uid = 0;
+            layer.mask_base_value = 255;
+            layer.mask_effects_active = 0;
+            for (TexPaintColorFilter &filter : layer.color_filters) {
+              filter.blur_radius = 4.0f;
+            }
+          }
+        }
+      }
+    }
+    FOREACH_NODETREE_END;
   }
 
   /**
