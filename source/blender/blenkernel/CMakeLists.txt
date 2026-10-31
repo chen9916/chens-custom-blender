@@ -289,6 +289,8 @@ set(SRC
   intern/subdiv_stats.cc
   intern/subdiv_topology.cc
   intern/tex_paint_layer.cc
+  intern/tex_paint_mask.cc
+  intern/tex_paint_edit.cc
   intern/text.cc
   intern/text_suggestions.cc
   intern/texture.cc
@@ -530,6 +532,7 @@ set(SRC
   BKE_subdiv_modifier.hh
   BKE_subdiv_topology.hh
   BKE_tex_paint_layer.hh
+  BKE_tex_paint_mask.hh
   BKE_text.h
   BKE_text_suggestions.h
   BKE_texture.h
@@ -806,7 +809,9 @@ if(WITH_GTESTS)
     intern/scene_test.cc
     intern/sound_reader_cache_test.cc
     intern/subdiv_ccg_test.cc
+    intern/tex_paint_flatten_test.cc
     intern/tex_paint_layer_test.cc
+    intern/tex_paint_mask_test.cc
     intern/tracking_test.cc
     intern/volume_test.cc
   )

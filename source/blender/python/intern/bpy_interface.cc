@@ -129,11 +129,15 @@ static bool bpy_context_set_ex(bContext *C,
                                const bool allow_null_context)
 {
   bool context_set = false;
-  py_call_level++;
 
   if (gilstate) {
     *gilstate = PyGILState_Ensure();
   }
+  BLI_assert(PyGILState_Check());
+
+  /* Render workers can enter while the main thread handles Python UI callbacks.
+   * Protect the shared nesting counter with the GIL before modifying it. */
+  py_call_level++;
 
   if (py_call_level == 1) {
     if (!allow_null_context) {
@@ -174,11 +178,8 @@ bool bpy_context_set_allow_null(bContext *C, PyGILState_STATE *gilstate)
 
 void bpy_context_clear(bContext *C, const PyGILState_STATE *gilstate)
 {
+  BLI_assert(PyGILState_Check());
   py_call_level--;
-
-  if (gilstate) {
-    PyGILState_Release(*gilstate);
-  }
 
   if (py_call_level < 0) {
     fprintf(stderr, "ERROR: Python context internal state bug. this should not happen!\n");
@@ -199,6 +200,11 @@ void bpy_context_clear(bContext *C, const PyGILState_STATE *gilstate)
     bpy_timer_run_tot += BLI_time_now_seconds() - bpy_timer_run;
     bpy_timer_count++;
 #endif
+  }
+
+  /* Keep the zero-level context cleanup in the same critical section as the counter. */
+  if (gilstate) {
+    PyGILState_Release(*gilstate);
   }
 }
 
@@ -819,12 +825,13 @@ void BPY_modules_load_user(bContext *C)
     return;
   }
 
-  /* Update pointers since this can run from a nested script on file load. */
-  if (py_call_level) {
+  const bool context_set = bpy_context_set(C, &gilstate);
+
+  /* Update pointers since this can run from a nested script on file load.
+   * A first-level entry already updated them while acquiring the context. */
+  if (!context_set) {
     BPY_context_update(C);
   }
-
-  bpy_context_set(C, &gilstate);
 
   for (text = bmain->texts.first(); text; text = static_cast<Text *>(text->id.next)) {
     if (text->flags & TXT_ISSCRIPT) {

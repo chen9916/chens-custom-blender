@@ -54,6 +54,7 @@
 #include "DNA_customdata_types.h"
 #include "DNA_defs.h"
 #include "DNA_material_types.h"
+#include "DNA_node_tex_paint_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_node_types.h"
 #include "DNA_object_enums.h"
@@ -449,6 +450,7 @@ struct ProjPaintState {
   bool is_shared_user;
   /** The active layer of a layered Texture Paint node cannot be painted. */
   bool tex_paint_blocked = false;
+  const char *tex_paint_block_reason = nullptr;
 
   ProjPaintImage *projImages;
   /** cavity amount for vertices. */
@@ -536,6 +538,8 @@ struct ProjPixel {
 
   /* for various reasons we may want to mask out painting onto this pixel */
   ushort mask;
+  /** Coverage from geometry/visibility, independent of the current canvas selection. */
+  ushort geometry_mask;
 
   /* Only used when the airbrush is disabled.
    * Store the max mask value to avoid painting over an area with a lower opacity
@@ -2620,7 +2624,11 @@ static ProjPixel *project_paint_uvpixel_init(const ProjPaintState *ps,
   projPixel->x_px = x_px;
   projPixel->y_px = y_px;
 
-  projPixel->mask = ushort(mask * 65535);
+  const float selection = projima->tex_paint_node ?
+                              BKE_tex_paint_selection_value(*projima->tex_paint_node, x_px, y_px) :
+                              1.0f;
+  projPixel->geometry_mask = ushort(mask * 65535);
+  projPixel->mask = ushort(projPixel->geometry_mask * selection);
   if (ps->do_masking) {
     projPixel->mask_accum = projima->maskRect[tile_index] + tile_offset;
   }
@@ -5149,6 +5157,7 @@ static void project_paint_build_proj_ima(ProjPaintState *ps,
       projIma->layer_alpha_lock = BKE_tex_paint_stroke_locks_alpha(*projIma->tex_paint_node);
       projIma->ibuf = BKE_tex_paint_stroke_begin(*projIma->tex_paint_node, projIma->ibuf);
       if (projIma->ibuf == nullptr) {
+        ps->tex_paint_block_reason = BKE_tex_paint_stroke_block_reason(*projIma->tex_paint_node);
         projIma->ibuf = projIma->acquired_ibuf;
         projIma->tex_paint_node = nullptr;
         projIma->layer_alpha_lock = false;
@@ -5953,7 +5962,9 @@ static bool project_image_refresh_tagged(ProjPaintState *ps)
         pr = &(projIma->partRedrawRect[i]);
         if (BLI_rcti_is_valid(&pr->dirty_region)) {
           set_imapaintpartial(pr);
-          imapaint_image_update(projIma->ibuf);
+          if (!projIma->tex_paint_node) {
+            imapaint_image_update(projIma->ibuf);
+          }
           merged_rects[merged_tot++] = pr->dirty_region;
           redraw = true;
         }
@@ -5986,6 +5997,26 @@ static bool project_image_refresh_tagged(ProjPaintState *ps)
           }
         }
 
+        NodeTexPaint &layer_data = *static_cast<NodeTexPaint *>(projIma->tex_paint_node->storage);
+        const TexPaintLayer *active_layer = BKE_tex_paint_layer_active(layer_data);
+        if (layer_data.paint_target == TEXPAINT_TARGET_MASK && active_layer &&
+            active_layer->mask_effects_active)
+        {
+          /* Slope blur can sample arbitrarily distant pixels. Publish its full-canvas
+           * fallback once per dab; local filters retain separate island regions. */
+          for (const TexPaintMaskEffect &effect : active_layer->mask_effects) {
+            if (effect.enabled && effect.opacity > 0.0f &&
+                effect.type == TEXPAINT_MASK_EFFECT_FILTER &&
+                effect.filter_type == TEXPAINT_MASK_FILTER_BLUR_SLOPE)
+            {
+              for (int r = 1; r < merged_tot; r++) {
+                BLI_rcti_union(&merged_rects[0], &merged_rects[r]);
+              }
+              merged_tot = std::min(merged_tot, 1);
+              break;
+            }
+          }
+        }
         for (int r = 0; r < merged_tot; r++) {
           BKE_tex_paint_stroke_update(*projIma->tex_paint_node, projIma->ibuf, merged_rects[r]);
         }
@@ -6455,6 +6486,12 @@ static void project_bucket_rebind_stroke_tiles(const ProjPaintState *ps, const i
     ProjPixel *projPixel = static_cast<ProjPixel *>(node->link);
     const int x_px = projPixel->x_px;
     const int y_px = projPixel->y_px;
+    /* Geometry buckets survive between strokes. Selection coverage does not: refresh it
+     * while rebinding the stroke's undo tiles, without rebuilding projected geometry. */
+    const float selection = projima->tex_paint_node ?
+                                BKE_tex_paint_selection_value(*projima->tex_paint_node, x_px, y_px) :
+                                1.0f;
+    projPixel->mask = ushort(projPixel->geometry_mask * selection);
     const int x_tile = x_px >> ED_IMAGE_UNDO_TILE_BITS;
     const int y_tile = y_px >> ED_IMAGE_UNDO_TILE_BITS;
 
@@ -7320,7 +7357,8 @@ void *paint_proj_new_stroke(bContext *C,
                             Object *ob,
                             const float mouse[2],
                             const BrushStrokeMode mode,
-                            const BrushSwitchMode brush_switch_mode)
+                            const BrushSwitchMode brush_switch_mode,
+                            ReportList *reports)
 {
   ProjStrokeHandle *ps_handle;
   Scene *scene = CTX_data_scene(C);
@@ -7411,6 +7449,9 @@ void *paint_proj_new_stroke(bContext *C,
       goto fail;
     }
     if (ps->tex_paint_blocked) {
+      if (reports && ps->tex_paint_block_reason) {
+        BKE_report(reports, RPT_WARNING, ps->tex_paint_block_reason);
+      }
       project_paint_end(ps);
       goto fail;
     }
@@ -8095,9 +8136,36 @@ static bool proj_paint_add_slot(bContext *C, wmOperator *op)
     /* Create a new node. */
     switch (slot_type) {
       case PAINT_CANVAS_SOURCE_IMAGE: {
-        new_node = bke::node_add_static_node(C, *ntree, SH_NODE_TEX_IMAGE);
-        ima = proj_paint_image_create(op, bmain, is_data);
-        new_node->id = &ima->id;
+        const bool use_tiled = RNA_boolean_get(op->ptr, "tiled");
+        const int gen_type = RNA_enum_get(op->ptr, "generated_type");
+        if (!use_tiled && gen_type == IMA_GENTYPE_BLANK) {
+          char imagename[MAX_ID_NAME - 2] = "Material Base Color";
+          RNA_string_get(op->ptr, "name", imagename);
+          const int width = RNA_int_get(op->ptr, "width");
+          const int height = RNA_int_get(op->ptr, "height");
+          const bool use_float = RNA_boolean_get(op->ptr, "float");
+          float color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+          RNA_float_get_array(op->ptr, "color", color);
+          if (!RNA_boolean_get(op->ptr, "alpha")) {
+            color[3] = 1.0f;
+          }
+          new_node = bke::node_add_static_node(C, *ntree, SH_NODE_TEX_PAINT);
+          STRNCPY_UTF8(new_node->label, DATA_(layer_type_items[type].name));
+          if (BKE_tex_paint_canvas_init(
+                  *bmain, *new_node, imagename, width, height, use_float, color))
+          {
+            ima = reinterpret_cast<Image *>(new_node->id);
+            if (ima && is_data) {
+              STRNCPY_UTF8(ima->colorspace_settings.name,
+                           IMB_colormanagement_role_colorspace_name_get(COLOR_ROLE_DATA));
+            }
+          }
+        }
+        else {
+          new_node = bke::node_add_static_node(C, *ntree, SH_NODE_TEX_IMAGE);
+          ima = proj_paint_image_create(op, bmain, is_data);
+          new_node->id = &ima->id;
+        }
         break;
       }
       case PAINT_CANVAS_SOURCE_COLOR_ATTRIBUTE: {
@@ -8111,7 +8179,6 @@ static bool proj_paint_add_slot(bContext *C, wmOperator *op)
         BLI_assert_unreachable();
         return false;
     }
-    bke::node_set_active(*ntree, *new_node);
 
     /* Connect to first available principled BSDF node. */
     ntree->ensure_topology_cache();
@@ -8163,14 +8230,18 @@ static bool proj_paint_add_slot(bContext *C, wmOperator *op)
         }
       }
 
-      /* Check if the socket in already connected to something */
-      bNodeLink *link = in_sock ? in_sock->link : nullptr;
-      if (in_sock != nullptr && link == nullptr) {
+      /* Connect (or replace existing connection) on the target socket. */
+      if (in_sock != nullptr) {
+        if (in_sock->link != nullptr) {
+          bke::node_remove_socket_links(*ntree, *in_sock);
+        }
         bke::node_add_link(*ntree, *out_node, *out_sock, *in_node, *in_sock);
 
         bke::node_position_relative(*out_node, *in_node, out_sock, *in_sock);
       }
     }
+
+    bke::node_set_active(*ntree, *new_node);
 
     BKE_main_ensure_invariants(*bmain);
     /* In case we added more than one node, position them too. */

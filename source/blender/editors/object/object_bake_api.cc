@@ -127,6 +127,7 @@ struct BakeAPIRender {
   bool *stop;
 
   /* Operator state. */
+  bool success = false;
   ReportList *reports;
   ScrArea *area;
 };
@@ -146,10 +147,11 @@ static void bake_progress_update(void *bjv, float progress)
 }
 
 /** Catch escape key to cancel. */
-static wmOperatorStatus bake_modal(bContext *C, wmOperator * /*op*/, const wmEvent *event)
+static wmOperatorStatus bake_modal(bContext *C, wmOperator *op, const wmEvent *event)
 {
   /* no running blender, remove handler and pass through */
-  if (!WM_jobs_has_running(CTX_wm_manager(C), CTX_data_scene(C), WM_JOB_TYPE_OBJECT_BAKE)) {
+  Scene *scene = static_cast<Scene *>(op->customdata);
+  if (!WM_jobs_has_running(CTX_wm_manager(C), scene, WM_JOB_TYPE_OBJECT_BAKE)) {
     return OPERATOR_FINISHED | OPERATOR_PASS_THROUGH;
   }
 
@@ -1995,6 +1997,8 @@ static void bake_startjob(void *bkv, wmJobWorkerStatus *worker_status)
   bkr->do_update = &worker_status->do_update;
   bkr->progress = &worker_status->progress;
   bkr->stop = &worker_status->stop;
+  /* The job outlives the invoking operator when its window or context changes. */
+  bkr->reports = worker_status->reports;
 
   RE_SetReports(bkr->render, bkr->reports);
 
@@ -2021,13 +2025,14 @@ static void bake_startjob(void *bkv, wmJobWorkerStatus *worker_status)
   }
 
   if (bkr->is_selected_to_active) {
-    bake(bkr, bkr->ob, bkr->selected_objects, bkr->reports);
+    bkr->success = bake(bkr, bkr->ob, bkr->selected_objects, bkr->reports);
   }
   else {
+    bkr->success = true;
     bkr->is_clear = bkr->is_clear && bkr->selected_objects.size() == 1;
     for (const PointerRNA &ptr : bkr->selected_objects) {
       Object *ob_iter = static_cast<Object *>(ptr.data);
-      bake(bkr, ob_iter, {}, bkr->reports);
+      bkr->success &= bake(bkr, ob_iter, {}, bkr->reports);
 
       if (bake_has_been_canceled(bkr)) {
         break;
@@ -2041,7 +2046,9 @@ static void bake_startjob(void *bkv, wmJobWorkerStatus *worker_status)
 static void bake_job_complete(void *bkv)
 {
   BakeAPIRender *bkr = static_cast<BakeAPIRender *>(bkv);
-  BKE_callback_exec_id(bkr->main, &bkr->ob->id, BKE_CB_EVT_OBJECT_BAKE_COMPLETE);
+  BKE_callback_exec_id(bkr->main,
+                      &bkr->ob->id,
+                      bkr->success ? BKE_CB_EVT_OBJECT_BAKE_COMPLETE : BKE_CB_EVT_OBJECT_BAKE_CANCEL);
 }
 static void bake_job_canceled(void *bkv)
 {
@@ -2213,6 +2220,9 @@ static wmOperatorStatus bake_invoke(bContext *C, wmOperator *op, const wmEvent *
   WM_jobs_start(CTX_wm_manager(C), wm_job);
 
   WM_cursor_wait(false);
+
+  /* Keep tracking the job's scene when invoked with a temporary context override. */
+  op->customdata = scene;
 
   /* add modal handler for ESC */
   WM_event_add_modal_handler(C, op);

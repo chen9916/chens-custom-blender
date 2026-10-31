@@ -90,6 +90,10 @@ const EnumPropertyItem rna_enum_window_cursor_items[] = {
 
 #  include "WM_types.hh"
 
+#  ifdef WITH_PYTHON
+#    include "BPY_extern.hh"
+#  endif
+
 namespace blender {
 
 /* Needed since RNA doesn't use `const` in function signatures. */
@@ -723,6 +727,31 @@ static void rna_PieMenuEnd(bContext *C, PointerRNA *handle)
   ui::pie_menu_end(C, static_cast<ui::PieMenu *>(handle->data));
 }
 
+static float rna_WindowManager_object_bake_progress(wmWindowManager *wm, Scene *scene)
+{
+  if (!WM_jobs_has_running(wm, scene, WM_JOB_TYPE_OBJECT_BAKE)) {
+    return -1.0f;
+  }
+  return WM_jobs_progress(wm, scene);
+}
+
+static void rna_WindowManager_object_bake_cancel(wmWindowManager *wm, Scene *scene, bool wait)
+{
+  if (wait) {
+#  ifdef WITH_PYTHON
+    /* The render engine may need Python while the bake thread shuts down. */
+    BPy_BEGIN_ALLOW_THREADS;
+#  endif
+    WM_jobs_kill_type(wm, scene, WM_JOB_TYPE_OBJECT_BAKE);
+#  ifdef WITH_PYTHON
+    BPy_END_ALLOW_THREADS;
+#  endif
+  }
+  else {
+    WM_jobs_stop_type(wm, scene, WM_JOB_TYPE_OBJECT_BAKE);
+  }
+}
+
 static void rna_WindowManager_print_undo_steps(wmWindowManager *wm)
 {
   BKE_undosys_print(wm->runtime->undo_stack);
@@ -1119,6 +1148,20 @@ void RNA_api_wm(StructRNA *srna)
 
   func = RNA_def_function(srna, "progress_end", "rna_progress_end");
   RNA_def_function_ui_description(func, "Terminate progress report");
+
+  func = RNA_def_function(srna, "object_bake_progress", "rna_WindowManager_object_bake_progress");
+  RNA_def_function_ui_description(func,
+                                  "Get native object bake progress, or -1 when no bake is running");
+  parm = RNA_def_pointer(func, "scene", "Scene", "Scene", "Scene owning the bake job");
+  RNA_def_parameter_flags(parm, PROP_NEVER_NULL, PARM_REQUIRED);
+  parm = RNA_def_float(func, "progress", -1.0f, -1.0f, 1.0f, "Progress", "", -1.0f, 1.0f);
+  RNA_def_function_return(func, parm);
+
+  func = RNA_def_function(srna, "object_bake_cancel", "rna_WindowManager_object_bake_cancel");
+  RNA_def_function_ui_description(func, "Stop the native object bake owned by this scene");
+  parm = RNA_def_pointer(func, "scene", "Scene", "Scene", "Scene owning the bake job");
+  RNA_def_parameter_flags(parm, PROP_NEVER_NULL, PARM_REQUIRED);
+  RNA_def_boolean(func, "wait", false, "Wait", "Join the bake worker before returning");
 
   /* invoke functions, for use with python */
   func = RNA_def_function(srna, "invoke_props_popup", "rna_Operator_props_popup");

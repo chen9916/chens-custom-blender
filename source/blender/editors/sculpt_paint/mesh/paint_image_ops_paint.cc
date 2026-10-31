@@ -459,7 +459,8 @@ bool TexturePaintStroke::test_start(wmOperator *op, const float2 mouse)
 
   /* initialize from context */
 
-  stroke_handle_ = paint_proj_new_stroke(evil_C, ob, mouse, mode, brush_switch_mode);
+  stroke_handle_ = paint_proj_new_stroke(
+      evil_C, ob, mouse, mode, brush_switch_mode, op ? op->reports : nullptr);
   if (stroke_handle_ == nullptr) {
     return false;
   }

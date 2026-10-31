@@ -78,6 +78,12 @@ void IMAGE_OT_flip(wmOperatorType *ot);
 void IMAGE_OT_rotate_orthogonal(wmOperatorType *ot);
 void IMAGE_OT_invert(wmOperatorType *ot);
 void IMAGE_OT_resize(wmOperatorType *ot);
+void IMAGE_OT_paint_select_wand(wmOperatorType *ot);
+void IMAGE_OT_paint_select_lasso(wmOperatorType *ot);
+void IMAGE_OT_paint_select_box(wmOperatorType *ot);
+void IMAGE_OT_paint_select_all(wmOperatorType *ot);
+void IMAGE_OT_paint_transform(wmOperatorType *ot);
+void image_paint_edit_draw(const bContext *C, ARegion *region);
 
 void IMAGE_OT_cycle_render_slot(wmOperatorType *ot);
 void IMAGE_OT_clear_render_slot(wmOperatorType *ot);

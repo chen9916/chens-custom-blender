@@ -251,6 +251,11 @@ static void image_operatortypes()
   WM_operatortype_append(IMAGE_OT_rotate_orthogonal);
   WM_operatortype_append(IMAGE_OT_invert);
   WM_operatortype_append(IMAGE_OT_resize);
+  WM_operatortype_append(IMAGE_OT_paint_select_wand);
+  WM_operatortype_append(IMAGE_OT_paint_select_lasso);
+  WM_operatortype_append(IMAGE_OT_paint_select_box);
+  WM_operatortype_append(IMAGE_OT_paint_select_all);
+  WM_operatortype_append(IMAGE_OT_paint_transform);
 
   WM_operatortype_append(IMAGE_OT_cycle_render_slot);
   WM_operatortype_append(IMAGE_OT_clear_render_slot);
@@ -879,6 +884,7 @@ static void image_main_region_draw(const bContext *C, ARegion *region)
     WM_gizmomap_draw(region->runtime->gizmo_map, C, WM_GIZMOMAP_DRAWSTEP_2D);
   }
   draw_image_cache(C, region);
+  image_paint_edit_draw(C, region);
 }
 
 static void image_main_region_listener(const wmRegionListenerParams *params)

@@ -9,6 +9,9 @@
  * the node editor and in the 3D viewport, where the node is found through the active material.
  */
 
+#include <algorithm>
+#include <sstream>
+
 #include "DNA_image_types.h"
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
@@ -19,18 +22,22 @@
 #include "DNA_space_types.h"
 #include "DNA_view3d_types.h"
 
+#include "MEM_guardedalloc.h"
+
 #include "BLI_listbase.hh"
 #include "BLI_math_matrix.hh"
 #include "BLI_math_matrix_c.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_math_vector_c.hh"
 #include "BLI_path_utils.hh"
+#include "BLI_serialize.hh"
 #include "BLI_string_utf8.hh"
 
 #include "BLT_translation.hh"
 
 #include "BKE_callbacks.hh"
 #include "BKE_context.hh"
+#include "BKE_idprop.hh"
 #include "BKE_image.hh"
 #include "BKE_library.hh"
 #include "BKE_main.hh"
@@ -156,10 +163,19 @@ static bNode *tex_paint_node_from_context(bContext *C, bNodeTree **r_ntree)
   if (ma == nullptr || ma->nodetree == nullptr) {
     return nullptr;
   }
-  bNode *node = bke::node_get_active_texture(*ma->nodetree);
-  if (!is_tex_paint_node(node) && ma->texpaintslot && ma->paint_active_slot < ma->tot_slots) {
-    node = BKE_tex_paint_node_find_by_image(*ma->nodetree,
-                                            ma->texpaintslot[ma->paint_active_slot].ima);
+  bNode *node = bke::node_get_active(*ma->nodetree);
+  if (!(is_tex_paint_node(node) && node->id == nullptr)) {
+    node = nullptr;
+    if (ma->texpaintslot && ma->paint_active_slot >= 0 && ma->paint_active_slot < ma->tot_slots) {
+      node = BKE_tex_paint_node_find_by_image(*ma->nodetree,
+                                              ma->texpaintslot[ma->paint_active_slot].ima);
+    }
+  }
+  if (!is_tex_paint_node(node)) {
+    node = bke::node_get_active_paint_canvas(*ma->nodetree);
+  }
+  if (!is_tex_paint_node(node)) {
+    node = bke::node_get_active_texture(*ma->nodetree);
   }
   if (!is_tex_paint_node(node)) {
     node = tex_paint_node_find_any(*ma->nodetree);
@@ -201,11 +217,28 @@ static NodeTexPaint &storage(bNode &node)
 /** Composite after a layer stack change and redraw, without re-evaluating the node tree. */
 static void tex_paint_layers_changed(bContext *C, bNode &node)
 {
-  BKE_tex_paint_cache_invalidate(storage(node));
+  /* Native layer operators modify owned node storage without going through an RNA setter.
+   * Make the node tree and its embedded owner participate in the next memfile undo step. */
+  CTX_data_main(C)->is_memfile_undo_written = false;
+  bNodeTree &tree = node.owner_tree();
+  DEG_id_tag_update(&tree.id, ID_RECALC_TAG_FOR_UNDO);
+  if (tree.owner_id) {
+    DEG_id_tag_update(tree.owner_id, ID_RECALC_TAG_FOR_UNDO);
+  }
+  NodeTexPaint &data = storage(node);
+  BKE_tex_paint_cache_invalidate(data);
   BKE_tex_paint_composite_full(node);
   if (node.id) {
     DEG_id_tag_update(node.id, ID_RECALC_EDITORS);
     WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, node.id);
+  }
+  if (data.pbr_image) {
+    DEG_id_tag_update(&data.pbr_image->id, ID_RECALC_EDITORS);
+    WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, data.pbr_image);
+  }
+  if (data.emission_image) {
+    DEG_id_tag_update(&data.emission_image->id, ID_RECALC_EDITORS);
+    WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, data.emission_image);
   }
   WM_event_add_notifier(C, NC_NODE | NA_EDITED, nullptr);
   WM_event_add_notifier(C, NC_SCENE | ND_OB_ACTIVE, nullptr);
@@ -246,6 +279,14 @@ static wmOperatorStatus tex_paint_canvas_new_exec(bContext *C, wmOperator *op)
 
   char name[MAX_ID_NAME - 2];
   RNA_string_get(op->ptr, "name", name);
+  if (STREQ(name, "Painted Texture") && ob != nullptr) {
+    if (Material *ma = BKE_object_material_get(ob, ob->actcol)) {
+      SNPRINTF_UTF8(name, "%s_Base", ma->id.name + 2);
+      if (node->label[0] == '\0') {
+        STRNCPY_UTF8(node->label, "Base Color");
+      }
+    }
+  }
   const int width = RNA_int_get(op->ptr, "width");
   const int height = RNA_int_get(op->ptr, "height");
   const bool is_float = RNA_boolean_get(op->ptr, "float");
@@ -256,18 +297,52 @@ static wmOperatorStatus tex_paint_canvas_new_exec(bContext *C, wmOperator *op)
     BKE_report(op->reports, RPT_ERROR, "Could not create the layered canvas");
     return OPERATOR_CANCELLED;
   }
+  /* A new canvas owns new layers whose UIDs restart at one. Do not let old authoring records
+   * attach to those UIDs. Companion channel creation must leave its canonical owner intact. */
+  if (IDProperty *authoring = IDP_GetPropertyFromGroup_null(node->prop, "_grunge_layers_json")) {
+    IDP_FreeFromGroup(node->prop, authoring);
+  }
 
-  /* Auto-link Color -> Principled BSDF Base Color when Base Color is unconnected. */
-  ntree->ensure_topology_cache();
-  const Span<bNode *> bsdf_nodes = ntree->nodes_by_type("ShaderNodeBsdfPrincipled"_ustr);
-  if (!bsdf_nodes.is_empty()) {
-    bNode *bsdf = bsdf_nodes.first();
-    bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, "Color"_ustr);
-    bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, "Base Color"_ustr);
-    if (out_sock != nullptr && in_sock != nullptr && in_sock->link == nullptr) {
-      bke::node_add_link(*ntree, *node, *out_sock, *bsdf, *in_sock);
-      bke::node_position_relative(*node, *bsdf, out_sock, *in_sock);
-      bke::node_position_propagate(*node);
+  /* Auto-link all PBR sockets (Color, Roughness, Metallic, Normal, Emission) of the single
+   * Multi-Channel Texture Paint node to Principled BSDF when unconnected. */
+  if (node->label[0] == '\0' || STREQ(node->label, "Base Color") ||
+      STREQ(node->label, "PBR Material"))
+  {
+    bke::node_declaration_ensure(*ntree, *node);
+    ntree->ensure_topology_cache();
+    const Span<bNode *> bsdf_nodes = ntree->nodes_by_type("ShaderNodeBsdfPrincipled"_ustr);
+    if (!bsdf_nodes.is_empty()) {
+      bNode *bsdf = bsdf_nodes.first();
+      auto link_if_free = [&](const UString out_name, const UString in_name) {
+        bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, out_name);
+        bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, in_name);
+        if (out_sock != nullptr && in_sock != nullptr && in_sock->link == nullptr) {
+          bke::node_add_link(*ntree, *node, *out_sock, *bsdf, *in_sock);
+          return true;
+        }
+        return false;
+      };
+      const bool linked_base = link_if_free("Color"_ustr, "Base Color"_ustr);
+      link_if_free("Roughness"_ustr, "Roughness"_ustr);
+      link_if_free("Metallic"_ustr, "Metallic"_ustr);
+      link_if_free("Normal"_ustr, "Normal"_ustr);
+      if (link_if_free("Emission"_ustr, "Emission Color"_ustr)) {
+        if (bNodeSocket *em_str = bke::node_find_socket(*bsdf, SOCK_IN, "Emission Strength"_ustr))
+        {
+          bNodeSocketValueFloat *val = em_str->default_value_typed<bNodeSocketValueFloat>();
+          if (val && val->value <= 0.0f) {
+            val->value = 1.0f;
+          }
+        }
+      }
+      if (linked_base) {
+        bNodeSocket *out_sock = bke::node_find_socket(*node, SOCK_OUT, "Color"_ustr);
+        bNodeSocket *in_sock = bke::node_find_socket(*bsdf, SOCK_IN, "Base Color"_ustr);
+        if (out_sock && in_sock) {
+          bke::node_position_relative(*node, *bsdf, out_sock, *in_sock);
+          bke::node_position_propagate(*node);
+        }
+      }
     }
   }
 
@@ -370,9 +445,49 @@ static wmOperatorStatus tex_paint_layer_add_exec(bContext *C, wmOperator *op)
                      type == TEXPAINT_LAYER_ADJUSTMENT ? DATA_("Adjustment") :
                                                          DATA_("Layer");
   NodeTexPaint &data = storage(*node);
-  BKE_tex_paint_layer_add(data, name, type);
+  const TexPaintLayer *prev_active = BKE_tex_paint_layer_active(data);
+  const int prev_uid = prev_active ? prev_active->uid : 0;
+  TexPaintLayer *new_layer = BKE_tex_paint_layer_add(data, name, type);
   data.paint_target = TEXPAINT_TARGET_COLOR;
   tex_paint_layers_changed(C, *node);
+
+  /* Keep companion PBR channel nodes in the same material tree synchronized with the layer stack. */
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree) && new_layer != nullptr) {
+    const int new_count = BKE_tex_paint_layer_count(data);
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (BKE_tex_paint_layer_find_uid(other_data, new_layer->uid) != nullptr ||
+          BKE_tex_paint_layer_count(other_data) != new_count - 1)
+      {
+        continue;
+      }
+      if (prev_uid > 0) {
+        if (TexPaintLayer *other_prev = BKE_tex_paint_layer_find_uid(other_data, prev_uid)) {
+          BKE_tex_paint_layer_active_set(other_data,
+                                         BLI_findindex(&other_data.layers, other_prev));
+        }
+      }
+      TexPaintLayer *other_layer = BKE_tex_paint_layer_add(other_data, new_layer->name, type);
+      if (other_layer != nullptr) {
+        STRNCPY_UTF8(other_layer->name, new_layer->name);
+        other_layer->uid = new_layer->uid;
+        other_data.next_layer_uid = std::max(other_data.next_layer_uid, new_layer->uid + 1);
+        if (type == TEXPAINT_LAYER_FILL) {
+          /* Companion channels on a new Fill Layer start disabled (alpha = 0) until toggled ON. */
+          other_layer->fill_color[0] = 0.5f;
+          other_layer->fill_color[1] = 0.5f;
+          other_layer->fill_color[2] = 0.5f;
+          other_layer->fill_color[3] = 0.0f;
+        }
+        tex_paint_layers_changed(C, *other_node);
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -407,8 +522,27 @@ static wmOperatorStatus tex_paint_layer_remove_exec(bContext *C, wmOperator *op)
     BKE_report(op->reports, RPT_WARNING, "Cannot remove the last layer");
     return OPERATOR_CANCELLED;
   }
+  const int removed_uid = layer->uid;
   BKE_tex_paint_layer_remove(data, *layer);
   tex_paint_layers_changed(C, *node);
+
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree) && removed_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (BKE_tex_paint_layer_count(other_data) <= 1) {
+        continue;
+      }
+      if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, removed_uid)) {
+        BKE_tex_paint_layer_remove(other_data, *other_layer);
+        tex_paint_layers_changed(C, *other_node);
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -424,7 +558,90 @@ static void NODE_OT_tex_paint_layer_remove(wmOperatorType *ot)
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
 }
 
-static wmOperatorStatus tex_paint_layer_duplicate_exec(bContext *C, wmOperator * /*op*/)
+struct LayerAuthoringUpdate {
+  bNode *node;
+  IDProperty *property;
+  std::string json;
+};
+
+static void tex_paint_layer_authoring_update_apply(const LayerAuthoringUpdate &update)
+{
+  if (update.property) {
+    IDP_AssignString(update.property, update.json.c_str());
+    return;
+  }
+  if (!update.node->prop) {
+    update.node->prop = bke::idprop::create_group("properties").release();
+  }
+  IDP_AddToGroup(update.node->prop, IDP_NewString(update.json.c_str(), "_grunge_layers_json"));
+}
+
+/** Prepare authoring changes before changing the native layer topology. */
+static bool tex_paint_layer_authoring_update_prepare(
+    bNode &node,
+    const int source_uid,
+    const int duplicate_uid,
+    const Span<int> removed_uids,
+    Vector<LayerAuthoringUpdate> &updates,
+    std::shared_ptr<io::serialize::Value> replacement = {})
+{
+  IDProperty *property = IDP_GetPropertyFromGroup_null(node.prop, "_grunge_layers_json");
+  if (!property && !replacement) {
+    return true;
+  }
+  if (property && property->type != IDP_STRING) {
+    return false;
+  }
+  const StringRef json = property ? StringRef(IDP_string_get(property)) : StringRef();
+  if (json.is_empty() && !replacement) {
+    return true;
+  }
+  io::serialize::JsonFormatter formatter;
+  std::istringstream input{std::string(json)};
+  const std::unique_ptr<io::serialize::Value> value =
+      json.is_empty() ? std::make_unique<io::serialize::DictionaryValue>() :
+                        formatter.deserialize(input);
+  const io::serialize::DictionaryValue *dictionary = value ? value->as_dictionary_value() :
+                                                             nullptr;
+  if (!dictionary) {
+    return false;
+  }
+  const std::shared_ptr<io::serialize::Value> *source = nullptr;
+  if (replacement) {
+    source = &replacement;
+  }
+  else if (duplicate_uid > 0) {
+    source = dictionary->lookup(std::to_string(source_uid));
+  }
+  const std::string duplicate_key = std::to_string(duplicate_uid);
+  io::serialize::DictionaryValue duplicate_dictionary;
+  bool changed = false;
+  for (const io::serialize::DictionaryValue::Item &item : dictionary->elements()) {
+    const bool remove = std::any_of(removed_uids.begin(), removed_uids.end(), [&](const int uid) {
+      return item.first == std::to_string(uid);
+    });
+    if (remove || (source && item.first == duplicate_key)) {
+      changed = true;
+    }
+    else {
+      duplicate_dictionary.append(item.first, item.second);
+    }
+  }
+  /* Effect UIDs are local to the layer and were copied intact with the native buffers. */
+  if (source) {
+    duplicate_dictionary.append(duplicate_key, *source);
+    changed = true;
+  }
+  if (!changed) {
+    return true;
+  }
+  std::ostringstream output;
+  formatter.serialize(output, duplicate_dictionary);
+  updates.append({&node, property, output.str()});
+  return true;
+}
+
+static wmOperatorStatus tex_paint_layer_duplicate_exec(bContext *C, wmOperator *op)
 {
   bNodeTree *ntree;
   bNode *node = tex_paint_node_from_context(C, &ntree);
@@ -436,8 +653,54 @@ static wmOperatorStatus tex_paint_layer_duplicate_exec(bContext *C, wmOperator *
   if (layer == nullptr) {
     return OPERATOR_CANCELLED;
   }
-  BKE_tex_paint_layer_duplicate(data, *layer);
+  const int src_uid = layer->uid;
+  Vector<LayerAuthoringUpdate> authoring_updates;
+  if (!tex_paint_layer_authoring_update_prepare(
+          *node, src_uid, data.next_layer_uid, {}, authoring_updates))
+  {
+    BKE_report(op->reports, RPT_WARNING, "The layer's mask authoring data is invalid");
+    return OPERATOR_CANCELLED;
+  }
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree)) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node != node && is_tex_paint_node(other_node) &&
+          BKE_tex_paint_is_initialized(*other_node) &&
+          !tex_paint_layer_authoring_update_prepare(
+              *other_node, src_uid, data.next_layer_uid, {}, authoring_updates))
+      {
+        BKE_report(
+            op->reports, RPT_WARNING, "A companion channel's mask authoring data is invalid");
+        return OPERATOR_CANCELLED;
+      }
+    }
+  }
+  TexPaintLayer *dup_layer = BKE_tex_paint_layer_duplicate(data, *layer);
+  if (!dup_layer) {
+    return OPERATOR_CANCELLED;
+  }
+  for (const LayerAuthoringUpdate &update : authoring_updates) {
+    tex_paint_layer_authoring_update_apply(update);
+  }
   tex_paint_layers_changed(C, *node);
+
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree) && dup_layer != nullptr && src_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (TexPaintLayer *other_src = BKE_tex_paint_layer_find_uid(other_data, src_uid)) {
+        if (TexPaintLayer *other_dup = BKE_tex_paint_layer_duplicate(other_data, *other_src)) {
+          STRNCPY_UTF8(other_dup->name, dup_layer->name);
+          other_dup->uid = dup_layer->uid;
+          other_data.next_layer_uid = std::max(other_data.next_layer_uid, dup_layer->uid + 1);
+          tex_paint_layers_changed(C, *other_node);
+        }
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -466,7 +729,24 @@ static wmOperatorStatus tex_paint_layer_move_exec(bContext *C, wmOperator *op)
   if (layer == nullptr || !BKE_tex_paint_layer_move(data, *layer, direction)) {
     return OPERATOR_CANCELLED;
   }
+  const int moved_uid = layer->uid;
   tex_paint_layers_changed(C, *node);
+
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree) && moved_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || other_node->type_legacy != SH_NODE_TEX_PAINT ||
+          other_node->storage == nullptr || !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(other_data, moved_uid)) {
+        if (BKE_tex_paint_layer_move(other_data, *other_layer, direction)) {
+          tex_paint_layers_changed(C, *other_node);
+        }
+      }
+    }
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -497,11 +777,94 @@ static wmOperatorStatus tex_paint_layer_merge_down_exec(bContext *C, wmOperator 
   if (node == nullptr) {
     return OPERATOR_CANCELLED;
   }
-  if (!BKE_tex_paint_layer_merge_down(storage(*node))) {
+  NodeTexPaint &data = storage(*node);
+  TexPaintLayer *top = BKE_tex_paint_layer_active(data);
+  const TexPaintLayer *below = top ? top->prev : nullptr;
+  if (!below || below->type != TEXPAINT_LAYER_PAINT || (below->flag & TEXPAINT_LAYER_LOCKED)) {
     BKE_report(op->reports, RPT_WARNING, "The layer below must be an unlocked paint layer");
     return OPERATOR_CANCELLED;
   }
-  tex_paint_layers_changed(C, *node);
+  struct MergeChannel {
+    bNode *node;
+    TexPaintLayer *top;
+    int previous_active_uid;
+    std::unique_ptr<TexPaintFlattenResult> prepared;
+    std::string name;
+  };
+  const int top_uid = top->uid;
+  const int below_uid = below->uid;
+  Vector<MergeChannel> channels;
+  channels.append({node, top, top_uid, nullptr, below->name});
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree)) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || !is_tex_paint_node(other_node) ||
+          !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      TexPaintLayer *other_top = BKE_tex_paint_layer_find_uid(other_data, top_uid);
+      TexPaintLayer *other_below = BKE_tex_paint_layer_find_uid(other_data, below_uid);
+      if (!other_top && !other_below) {
+        continue;
+      }
+      /* Check every channel before any layer is flattened or removed. */
+      if (!other_top || !other_below || other_top->prev != other_below ||
+          other_below->type != TEXPAINT_LAYER_PAINT ||
+          (other_below->flag & TEXPAINT_LAYER_LOCKED) || other_data.width != data.width ||
+          other_data.height != data.height)
+      {
+        BKE_report(op->reports,
+                   RPT_WARNING,
+                   "Companion channels need matching canvases and adjacent layers with unlocked "
+                   "paint below");
+        return OPERATOR_CANCELLED;
+      }
+      const TexPaintLayer *other_active = BKE_tex_paint_layer_active(other_data);
+      channels.append({other_node,
+                       other_top,
+                       other_active ? other_active->uid : 0,
+                       nullptr,
+                       other_below->name});
+    }
+  }
+  Vector<LayerAuthoringUpdate> authoring_updates;
+  const int baked_uids[] = {top_uid, below_uid};
+  for (MergeChannel &channel : channels) {
+    NodeTexPaint &channel_data = storage(*channel.node);
+    const int previous_index = channel_data.active_layer_index;
+    channel_data.active_layer_index = BLI_findindex(&channel_data.layers, channel.top);
+    const char *error = nullptr;
+    channel.prepared = BKE_tex_paint_layer_merge_down_prepare(channel_data, &error);
+    channel_data.active_layer_index = previous_index;
+    if (!channel.prepared) {
+      BKE_report(op->reports, RPT_WARNING, error ? error : "Unable to prepare the merged layer");
+      return OPERATOR_CANCELLED;
+    }
+    if (!tex_paint_layer_authoring_update_prepare(
+            *channel.node, 0, 0, Span<int>(baked_uids, 2), authoring_updates))
+    {
+      BKE_report(op->reports, RPT_WARNING, "A channel's mask authoring data is invalid");
+      return OPERATOR_CANCELLED;
+    }
+  }
+  for (MergeChannel &channel : channels) {
+    NodeTexPaint &channel_data = storage(*channel.node);
+    BKE_tex_paint_layers_flatten_commit(
+        channel_data, *channel.prepared, below_uid, channel.name.c_str());
+    TexPaintLayer *restore_active = BKE_tex_paint_layer_find_uid(channel_data,
+                                                                 channel.previous_active_uid);
+    if (restore_active) {
+      BKE_tex_paint_layer_active_set(channel_data,
+                                     BLI_findindex(&channel_data.layers, restore_active));
+    }
+  }
+  for (const LayerAuthoringUpdate &update : authoring_updates) {
+    tex_paint_layer_authoring_update_apply(update);
+  }
+  for (const MergeChannel &channel : channels) {
+    tex_paint_layers_changed(C, *channel.node);
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -515,6 +878,120 @@ static void NODE_OT_tex_paint_layer_merge_down(wmOperatorType *ot)
   ot->poll = tex_paint_canvas_poll;
 
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+}
+
+static wmOperatorStatus tex_paint_layers_flatten_exec(bContext *C, wmOperator *op)
+{
+  bNodeTree *ntree = nullptr;
+  bNode *node = tex_paint_node_from_context(C, &ntree);
+  if (!node) {
+    return OPERATOR_CANCELLED;
+  }
+  NodeTexPaint &data = storage(*node);
+  const bool visible_only = RNA_boolean_get(op->ptr, "visible_only");
+  Vector<int> all_uids;
+  Vector<int> source_uids;
+  Vector<bool> visibility;
+  for (const TexPaintLayer &layer : data.layers) {
+    const bool visible = (layer.flag & TEXPAINT_LAYER_VISIBLE) != 0;
+    all_uids.append(layer.uid);
+    visibility.append(visible);
+    if (!visible_only || visible) {
+      source_uids.append(layer.uid);
+    }
+  }
+  if (source_uids.is_empty()) {
+    BKE_report(op->reports, RPT_WARNING, "There are no visible layers to merge");
+    return OPERATOR_CANCELLED;
+  }
+  struct FlattenChannel {
+    bNode *node;
+    std::unique_ptr<TexPaintFlattenResult> prepared;
+  };
+  Vector<FlattenChannel> channels;
+  channels.append({node, nullptr});
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree)) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || !is_tex_paint_node(other_node) ||
+          !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      NodeTexPaint &other_data = storage(*other_node);
+      if (other_data.width != data.width || other_data.height != data.height ||
+          other_data.layers.count() != all_uids.size())
+      {
+        BKE_report(
+            op->reports, RPT_WARNING, "Companion channels need matching canvases and layer order");
+        return OPERATOR_CANCELLED;
+      }
+      int index = 0;
+      for (const TexPaintLayer &layer : other_data.layers) {
+        if (layer.uid != all_uids[index] ||
+            (visible_only && ((layer.flag & TEXPAINT_LAYER_VISIBLE) != 0) != visibility[index]))
+        {
+          BKE_report(op->reports,
+                     RPT_WARNING,
+                     "Companion channels need matching layer order and visibility before merging "
+                     "visible layers");
+          return OPERATOR_CANCELLED;
+        }
+        index++;
+      }
+      channels.append({other_node, nullptr});
+    }
+  }
+  Vector<LayerAuthoringUpdate> authoring_updates;
+  for (FlattenChannel &channel : channels) {
+    const char *error = nullptr;
+    channel.prepared = BKE_tex_paint_layers_flatten_prepare(
+        storage(*channel.node), source_uids, &error);
+    if (!channel.prepared) {
+      BKE_report(
+          op->reports, RPT_WARNING, error ? error : "Unable to prepare the flattened layer");
+      return OPERATOR_CANCELLED;
+    }
+    if (!tex_paint_layer_authoring_update_prepare(
+            *channel.node, 0, 0, source_uids, authoring_updates))
+    {
+      BKE_report(op->reports, RPT_WARNING, "A channel's mask authoring data is invalid");
+      return OPERATOR_CANCELLED;
+    }
+  }
+  /* All pixel snapshots, representability checks and authoring writes are prepared before the
+   * first source layer is removed. Commit only transfers those owned buffers into the stacks. */
+  const int result_uid = data.next_layer_uid;
+  for (FlattenChannel &channel : channels) {
+    BKE_tex_paint_layers_flatten_commit(storage(*channel.node),
+                                        *channel.prepared,
+                                        result_uid,
+                                        visible_only ? DATA_("Merged Visible") :
+                                                       DATA_("Flattened"));
+  }
+  for (const LayerAuthoringUpdate &update : authoring_updates) {
+    tex_paint_layer_authoring_update_apply(update);
+  }
+  for (const FlattenChannel &channel : channels) {
+    tex_paint_layers_changed(C, *channel.node);
+  }
+  return OPERATOR_FINISHED;
+}
+
+static void NODE_OT_tex_paint_layers_flatten(wmOperatorType *ot)
+{
+  ot->name = "Flatten Paint Layers";
+  ot->description =
+      "Bake the current appearance into a new paint layer across the texture channels";
+  ot->idname = "NODE_OT_tex_paint_layers_flatten";
+  ot->exec = tex_paint_layers_flatten_exec;
+  ot->poll = tex_paint_canvas_poll;
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+  RNA_def_boolean(
+      ot->srna,
+      "visible_only",
+      false,
+      "Visible Layers Only",
+      "Merge visible layers at the bottommost visible position and retain hidden layers in order");
 }
 
 /* -------------------------------------------------------------------- */
@@ -1109,28 +1586,86 @@ static wmOperatorStatus tex_paint_layer_mask_init_exec(bContext *C, wmOperator *
   }
 
   const int mode = RNA_enum_get(op->ptr, "mode");
-  switch (mode) {
-    case TEXPAINT_MASK_INIT_WHITE:
-      BKE_tex_paint_layer_mask_fill(data, *layer, 1.0f);
-      data.paint_target = TEXPAINT_TARGET_MASK;
-      break;
-    case TEXPAINT_MASK_INIT_BLACK:
-      BKE_tex_paint_layer_mask_fill(data, *layer, 0.0f);
-      data.paint_target = TEXPAINT_TARGET_MASK;
-      break;
-    case TEXPAINT_MASK_INIT_INVERT:
-      layer->flag |= TEXPAINT_LAYER_USE_MASK;
-      BKE_tex_paint_layer_mask_invert_pixels(data, *layer);
-      data.paint_target = TEXPAINT_TARGET_MASK;
-      break;
-    case TEXPAINT_MASK_INIT_REMOVE:
-      BKE_tex_paint_layer_mask_remove(data, *layer);
-      break;
-    default:
-      return OPERATOR_CANCELLED;
+  if (!ELEM(mode,
+            TEXPAINT_MASK_INIT_WHITE,
+            TEXPAINT_MASK_INIT_BLACK,
+            TEXPAINT_MASK_INIT_INVERT,
+            TEXPAINT_MASK_INIT_REMOVE))
+  {
+    return OPERATOR_CANCELLED;
   }
-
-  tex_paint_layers_changed(C, *node);
+  const int target_uid = layer->uid;
+  struct MaskChannel {
+    bNode *node;
+    TexPaintLayer *layer;
+  };
+  Vector<MaskChannel> channels = {{node, layer}};
+  if (BKE_tex_paint_tree_shares_channel_layers(ntree) && target_uid > 0) {
+    for (bNode *other_node : ntree->all_nodes()) {
+      if (other_node == node || !is_tex_paint_node(other_node) ||
+          !BKE_tex_paint_is_initialized(*other_node))
+      {
+        continue;
+      }
+      if (TexPaintLayer *other_layer = BKE_tex_paint_layer_find_uid(storage(*other_node),
+                                                                    target_uid))
+      {
+        channels.append({other_node, other_layer});
+      }
+    }
+  }
+  Vector<LayerAuthoringUpdate> authoring_updates;
+  if (mode != TEXPAINT_MASK_INIT_INVERT) {
+    std::shared_ptr<io::serialize::DictionaryValue> reset_state;
+    if (mode != TEXPAINT_MASK_INIT_REMOVE) {
+      reset_state = std::make_shared<io::serialize::DictionaryValue>();
+      reset_state->append_bool("active", false);
+      reset_state->append_array("effects");
+      reset_state->append_int("base_value", mode == TEXPAINT_MASK_INIT_BLACK ? 0 : 255);
+      reset_state->append_int("active_effect_uid", 0);
+      reset_state->append_int("next_effect_uid", 1);
+    }
+    const int removed_uids[] = {target_uid};
+    for (const MaskChannel &channel : channels) {
+      if (!tex_paint_layer_authoring_update_prepare(*channel.node,
+                                                    0,
+                                                    reset_state ? target_uid : 0,
+                                                    Span<int>(removed_uids, 1),
+                                                    authoring_updates,
+                                                    reset_state))
+      {
+        BKE_report(op->reports, RPT_WARNING, "A channel's mask authoring data is invalid");
+        return OPERATOR_CANCELLED;
+      }
+    }
+  }
+  for (const MaskChannel &channel : channels) {
+    NodeTexPaint &channel_data = storage(*channel.node);
+    switch (mode) {
+      case TEXPAINT_MASK_INIT_WHITE:
+        BKE_tex_paint_layer_mask_fill(channel_data, *channel.layer, 1.0f);
+        break;
+      case TEXPAINT_MASK_INIT_BLACK:
+        BKE_tex_paint_layer_mask_fill(channel_data, *channel.layer, 0.0f);
+        break;
+      case TEXPAINT_MASK_INIT_INVERT:
+        channel.layer->flag |= TEXPAINT_LAYER_USE_MASK;
+        BKE_tex_paint_layer_mask_invert_pixels(channel_data, *channel.layer);
+        break;
+      case TEXPAINT_MASK_INIT_REMOVE:
+        BKE_tex_paint_layer_mask_remove(channel_data, *channel.layer);
+        break;
+    }
+  }
+  if (mode != TEXPAINT_MASK_INIT_REMOVE) {
+    data.paint_target = TEXPAINT_TARGET_MASK;
+  }
+  for (const LayerAuthoringUpdate &update : authoring_updates) {
+    tex_paint_layer_authoring_update_apply(update);
+  }
+  for (const MaskChannel &channel : channels) {
+    tex_paint_layers_changed(C, *channel.node);
+  }
   return OPERATOR_FINISHED;
 }
 
@@ -1319,6 +1854,130 @@ static void NODE_OT_tex_paint_layer_generate_mask(wmOperatorType *ot)
 /** \} */
 
 /* -------------------------------------------------------------------- */
+/** \name Non-destructive Color Filters
+ * \{ */
+
+static const EnumPropertyItem color_filter_types[] = {
+    {TEXPAINT_COLOR_FILTER_HSV,
+     "HSV",
+     ICON_COLOR,
+     "Hue / Saturation / Value",
+     "Adjust layer colors"},
+    {TEXPAINT_COLOR_FILTER_BRIGHT_CONTRAST,
+     "BRIGHT_CONTRAST",
+     ICON_MODIFIER,
+     "Brightness / Contrast",
+     "Adjust brightness and contrast"},
+    {TEXPAINT_COLOR_FILTER_LEVELS,
+     "LEVELS",
+     ICON_SEQ_LUMA_WAVEFORM,
+     "Levels / Gamma",
+     "Remap levels and gamma"},
+    {TEXPAINT_COLOR_FILTER_INVERT, "INVERT", ICON_MODIFIER, "Invert", "Invert RGB colors"},
+    {TEXPAINT_COLOR_FILTER_GRAYSCALE,
+     "GRAYSCALE",
+     ICON_MODIFIER,
+     "Grayscale",
+     "Convert RGB to luminance"},
+    {TEXPAINT_COLOR_FILTER_BLUR,
+     "BLUR",
+     ICON_MOD_SMOOTH,
+     "Blur",
+     "Soften layer color and coverage without changing painted pixels"},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
+static bool tex_paint_color_filter_poll(bContext *C)
+{
+  bNodeTree *tree = nullptr;
+  bNode *node = tex_paint_node_from_context(C, &tree);
+  if (!node || !tree || ID_IS_LINKED(tree) || !BKE_tex_paint_is_initialized(*node)) {
+    return false;
+  }
+  NodeTexPaint &data = storage(*node);
+  const TexPaintLayer *layer = BKE_tex_paint_layer_active(data);
+  return layer && ELEM(layer->type, TEXPAINT_LAYER_PAINT, TEXPAINT_LAYER_FILL) &&
+         !(layer->flag & TEXPAINT_LAYER_LOCKED) && data.paint_target == TEXPAINT_TARGET_COLOR;
+}
+
+static wmOperatorStatus tex_paint_color_filter_exec(bContext *C, wmOperator *op)
+{
+  bNodeTree *tree = nullptr;
+  bNode &node = *tex_paint_node_from_context(C, &tree);
+  TexPaintLayer &layer = *BKE_tex_paint_layer_active(storage(node));
+  const int action = RNA_enum_get(op->ptr, "action");
+  TexPaintColorFilter *filter = static_cast<TexPaintColorFilter *>(
+      BLI_findlink(&layer.color_filters, layer.active_color_filter_index));
+  if (action == 0) {
+    filter = MEM_new<TexPaintColorFilter>(__func__);
+    filter->type = RNA_enum_get(op->ptr, "type");
+    for (const EnumPropertyItem *item = color_filter_types; item->identifier; item++) {
+      if (item->value == filter->type) {
+        STRNCPY_UTF8(filter->name, item->name);
+        break;
+      }
+    }
+    BLI_addtail(&layer.color_filters, filter);
+    layer.active_color_filter_index = layer.color_filters.count() - 1;
+  }
+  else if (filter == nullptr) {
+    return OPERATOR_CANCELLED;
+  }
+  else if (action == 1) {
+    BLI_remlink(&layer.color_filters, filter);
+    MEM_delete(filter);
+    layer.active_color_filter_index = std::max(
+        0, std::min(layer.active_color_filter_index, layer.color_filters.count() - 1));
+  }
+  else if (action == 4) {
+    TexPaintColorFilter *copy = MEM_new<TexPaintColorFilter>(__func__, dna::shallow_copy(*filter));
+    copy->next = copy->prev = nullptr;
+    BLI_insertlinkafter(&layer.color_filters, filter, copy);
+    layer.active_color_filter_index++;
+  }
+  else {
+    if (!BLI_listbase_link_move(&layer.color_filters, filter, action == 2 ? -1 : 1)) {
+      return OPERATOR_CANCELLED;
+    }
+    layer.active_color_filter_index = BLI_findindex(&layer.color_filters, filter);
+  }
+  CTX_data_main(C)->is_memfile_undo_written = false;
+  DEG_id_tag_update(&tree->id, ID_RECALC_TAG_FOR_UNDO);
+  if (tree->owner_id) {
+    DEG_id_tag_update(tree->owner_id, ID_RECALC_TAG_FOR_UNDO);
+  }
+  tex_paint_layers_changed(C, node);
+  return OPERATOR_FINISHED;
+}
+
+static void NODE_OT_tex_paint_color_filter(wmOperatorType *ot)
+{
+  static const EnumPropertyItem actions[] = {
+      {0, "ADD", 0, "Add", "Add a non-destructive filter"},
+      {1, "REMOVE", 0, "Remove", "Remove the active filter"},
+      {2, "UP", 0, "Move Up", "Evaluate the active filter earlier"},
+      {3, "DOWN", 0, "Move Down", "Evaluate the active filter later"},
+      {4, "DUPLICATE", 0, "Duplicate", "Duplicate the active filter"},
+      {0, nullptr, 0, nullptr, nullptr},
+  };
+  ot->name = "Paint Layer Filter";
+  ot->description = "Edit non-destructive filters on the active paint or fill layer";
+  ot->idname = "NODE_OT_tex_paint_color_filter";
+  ot->exec = tex_paint_color_filter_exec;
+  ot->poll = tex_paint_color_filter_poll;
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+  RNA_def_enum(ot->srna, "action", actions, 0, "Action", "Filter stack operation");
+  ot->prop = RNA_def_enum(ot->srna,
+                          "type",
+                          color_filter_types,
+                          TEXPAINT_COLOR_FILTER_HSV,
+                          "Filter",
+                          "Color operation");
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Registration
  * \{ */
 
@@ -1349,10 +2008,12 @@ void node_tex_paint_operatortypes()
   WM_operatortype_append(NODE_OT_tex_paint_layer_duplicate);
   WM_operatortype_append(NODE_OT_tex_paint_layer_move);
   WM_operatortype_append(NODE_OT_tex_paint_layer_merge_down);
+  WM_operatortype_append(NODE_OT_tex_paint_layers_flatten);
   WM_operatortype_append(NODE_OT_tex_paint_layer_import_image);
   WM_operatortype_append(NODE_OT_tex_paint_layer_project_image);
   WM_operatortype_append(NODE_OT_tex_paint_layer_mask_init);
   WM_operatortype_append(NODE_OT_tex_paint_layer_generate_mask);
+  WM_operatortype_append(NODE_OT_tex_paint_color_filter);
 
   BKE_callback_add(&tex_paint_load_post_cb, BKE_CB_EVT_LOAD_POST);
   BKE_callback_add(&tex_paint_undo_post_cb, BKE_CB_EVT_UNDO_POST);

@@ -7,16 +7,17 @@ See 'release/text/readme.html' for the end user read-me.
 Chen's Custom Blender
 =====================
 
-A personal Blender 5.3 development fork combining native Substance-style **Multi-Layer Texture Painting & Mask Studio** and **Native 3D Mesh Onion Skins** on `main`.
+A unified Blender 5.3 development fork combining **Native Multi-Layer 3D Texture Painting & Krita 2D Image Studio** and **Native 3D Mesh Onion Skins** on `main`.
 
 Custom Features
 ---------------
 
-### 1. Multi-Layer Texture Painting & Substance Mask Studio (`ShaderNodeTexPaint`)
-- Native C++ multi-layer canvas node (`ShaderNodeTexPaint`) with Paint, Fill, and Adjustment layers, 16 blend modes, Clipping Masks, Alpha Lock, Layer Solo, and grayscale Mask Preview (`Alt`-click style).
-- **Substance-Style Mask Stack**: Non-destructive stack of **Mask Fill (Custom Image / Grunge)**, **Smart 3D Mask Generators** (*Edge Wear*, *Cavity & Dirt*, *Curvature*, *Ambient Occlusion*, *Top-Down Dust*, *Vertical Height*), **Hand-Painted Mask**, and **Levels** sub-layers.
-- **6 Projection Methods**: *UV Projection*, *Triplanar*, *Planar / Decal*, *Warp (Surface-Hugging)*, *Spherical*, and *Cylindrical* with *Repeat (Tile)* and *Clamp (Stamp)* wrap modes.
-- **Interactive 3D & 2D UV Projection Gizmos**: Manipulate projections in the 3D Viewport or directly over UV islands in the 2D Image Editor (`G` / `R` / `S` shortcuts and interactive handles).
+### 1. Multi-Layer 3D Texture Painting, Krita 2D Studio & Substance Mask Stack (`ShaderNodeTexPaint`)
+- **Single-Node Multi-Channel PBR Layer Stack**: Native C++ `ShaderNodeTexPaint` node managing synchronized Base Color, Roughness, Metallic, Height/Bump, Specular, and Emission channels across Paint, Fill, and Adjustment layers, 16 blend modes, Clipping Masks, Alpha Lock, Layer Solo, and non-destructive per-layer Color & Blur Filter stacks.
+- **Native Mask-Effect Stack**: Authoritative C++ per-effect mask evaluation combining **Hand-Painted Masks** (with live `Ctrl`-erase and independent coverage), **Smart 3D Mask Generators** (*Ambient Occlusion*, *Curvature*, *Cavity & Dirt*, *Edge Wear*, *Top-Down Dust*, *Vertical Height*), **Projected Grunge / Stencil Fills** (275 starter maps), **Levels**, and **Spatial Filters** (*Blur*, *Blur Slope*, *Sharpen*, *Grow/Shrink*, *Bevel*, *Threshold*, *Posterize*, *Highpass*).
+- **Cycles Mesh Maps & High-Poly Baker Hub**: Asynchronous 7-map Cycles baker (*Tangent Normal*, *World Normal*, *Color ID*, *Ambient Occlusion*, *Curvature*, *Position*, *Thickness*) with live progress, cancellation, and 1-click preview.
+- **Native 2D Image Editor Selection & Transform Suite**: Native C++ Magic Wand, Lasso, Box/Ellipse selection, marching-ants contour overlay, and stateful `G` / `R` / `S` affine pixel & mask transforms with HDR/alpha preservation and full undo/redo.
+- **Documentation & Tests**: See [doc/paint_image_editing.md](doc/paint_image_editing.md), [doc/tex_paint_mesh_baking.md](doc/tex_paint_mesh_baking.md), [doc/tex_paint_readiness.md](doc/tex_paint_readiness.md), and [tests/image_paint_edit/README.rst](tests/image_paint_edit/README.rst).
 
 ### 2. Native 3D Mesh Onion Skins
 - Native mesh onion skins for a posed armature and its directly skinned meshes.
@@ -25,11 +26,7 @@ Custom Features
 - Screen-pixel or camera-aware scene-distance spacing, with direction reversal.
 - Per-viewport past/future colors, opacity, distance fade, and depth display.
 - Same-frame key replacement that keeps the newest keyed value when keys collide.
-
-Enable **Mesh Onion Skin** from the 3D Viewport header in Pose Mode and use its
-popover to configure sampling and appearance. See the
-[implemented design](doc/onion_skin/DESIGN.md) for supported behavior and limits,
-and the [validation guide](tests/onion_skin/README.rst) for reproducible checks.
+- **Documentation & Tests**: See [doc/onion_skin/DESIGN.md](doc/onion_skin/DESIGN.md) and [tests/onion_skin/README.rst](tests/onion_skin/README.rst).
 
 This repository contains Blender source code. Build instructions and upstream
 project information are linked below.

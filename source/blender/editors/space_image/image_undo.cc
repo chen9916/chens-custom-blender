@@ -52,6 +52,7 @@
 #include "BKE_global.hh"
 #include "BKE_image.hh"
 #include "BKE_image_gpu.hh"
+#include "BKE_lib_id.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_types.hh"
 #include "BKE_tex_paint_layer.hh"
@@ -65,6 +66,7 @@
 #include "ED_util.hh"
 
 #include "WM_api.hh"
+#include "WM_types.hh"
 
 namespace blender {
 
@@ -602,6 +604,21 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
   for (UndoImageHandle &uh : *undo_handles) {
     /* Tiles only added to second set of tiles. */
     Image *image = uh.image_ref.ptr;
+    if (uh.image_ref.name[0] != '\0') {
+      /* A decode can replay neighboring image steps after a MemFile reload. Only the entry
+       * step's references were resolved by the undo system; neighboring pointers may still
+       * be null, or refer to the previous Main. Resolve every restored handle from its saved
+       * name and library. An unencoded handle has no saved name yet and uses its live pointer. */
+      image = reinterpret_cast<Image *>(BKE_libblock_find_name_and_library_filepath(
+          G_MAIN,
+          ID_IM,
+          uh.image_ref.name + 2,
+          uh.image_ref.library_filepath_abs[0] ? uh.image_ref.library_filepath_abs : nullptr));
+    }
+    if (image == nullptr) [[unlikely]] {
+      CLOG_WARN(&LOG, "Unable to restore missing image '%s'", uh.image_ref.name + 2);
+      continue;
+    }
 
     bool changed = false;
     for (UndoImageBuf &ubuf_iter : uh.buffers) {
@@ -620,12 +637,17 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
       }
 
       /* Check if we need to restore all because of modified image dimensions or image
-       * buffer, or if we can do a partial restore and update. */
+       * buffer, or if we can do a partial restore and update.
+       * For layered texture paint buffers, always restore all tiles so that any intermediate
+       * MemFile reload or mask evaluation cannot leave stale tiles outside the partial diff. */
       const bool ibuf_reallocated = ubuf_ensure_compat_ibuf(ubuf, ibuf);
-      const bool restore_all = ibuf_reallocated || !use_partial || ubuf_other == nullptr ||
+      const bool restore_all = is_layer_buf || ibuf_reallocated || !use_partial ||
+                               ubuf_other == nullptr ||
                                ubuf_other->tiles_dims[0] != ubuf->tiles_dims[0] ||
                                ubuf_other->tiles_dims[1] != ubuf->tiles_dims[1];
 
+      rcti layer_dirty_region = {0, 0, 0, 0};
+      bool has_layer_dirty = false;
       int i = 0;
       for (uint y_tile = 0; y_tile < ubuf->tiles_dims[1]; y_tile += 1) {
         for (uint x_tile = 0; x_tile < ubuf->tiles_dims[0]; x_tile += 1) {
@@ -633,7 +655,13 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
             utile_restore(ubuf->tiles[i], x_tile, y_tile, ibuf);
             const rcti region = calc_tile_region(*ibuf, x_tile, y_tile);
             if (tex_paint_node) {
-              BKE_tex_paint_undo_buffer_restored(*tex_paint_node, ibuf, region);
+              if (!has_layer_dirty) {
+                layer_dirty_region = region;
+                has_layer_dirty = true;
+              }
+              else {
+                BLI_rcti_union(&layer_dirty_region, &region);
+              }
             }
             else {
               IMB_partial_update_mark_region(ibuf, region);
@@ -642,6 +670,10 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
           }
           i += 1;
         }
+      }
+
+      if (has_layer_dirty && tex_paint_node) {
+        BKE_tex_paint_undo_buffer_restored(*tex_paint_node, ibuf, layer_dirty_region);
       }
 
       if (changed && !is_layer_buf) {
@@ -653,7 +685,8 @@ static void uhandle_restore_list(ListBaseT<UndoImageHandle> *undo_handles,
     }
 
     if (changed) {
-      DEG_id_tag_update(&image->id, 0);
+      DEG_id_tag_update(&image->id, ID_RECALC_EDITORS);
+      WM_main_add_notifier(NC_IMAGE | NA_EDITED, image);
     }
   }
 }
@@ -827,11 +860,15 @@ static bool image_undosys_step_encode(bContext *C, Main * /*bmain*/, UndoStep *u
 
   if (us->is_encode_init) {
 
-    ImageUndoStep *us_reference = reinterpret_cast<ImageUndoStep *>(
-        ED_undo_stack_get()->step_active);
-    while (us_reference && us_reference->step.type != BKE_UNDOSYS_TYPE_IMAGE) {
-      us_reference = reinterpret_cast<ImageUndoStep *>(us_reference->step.prev);
+    UndoStep *us_ref_step = ED_undo_stack_get()->step_active;
+    while (us_ref_step && us_ref_step->type != BKE_UNDOSYS_TYPE_IMAGE) {
+      if (us_ref_step->type == BKE_UNDOSYS_TYPE_MEMFILE && !us_ref_step->skip) {
+        us_ref_step = nullptr;
+        break;
+      }
+      us_ref_step = us_ref_step->prev;
     }
+    ImageUndoStep *us_reference = reinterpret_cast<ImageUndoStep *>(us_ref_step);
 
     /* Initialize undo tiles from paint-tiles (if they exist). */
     for (PaintTile *ptile : us->paint_tile_map->map.values()) {
@@ -889,25 +926,10 @@ static bool image_undosys_step_encode(bContext *C, Main * /*bmain*/, UndoStep *u
                   const uint x_tile = uint(i) % tiles_dims_x;
                   const uint y_tile = uint(i) / tiles_dims_x;
 
-                  if ((ubuf_reference != nullptr) &&
-                      ((ubuf_pre.tiles[i] == nullptr) ||
-                       /* In this case the paint stroke as has added a tile
-                        * which we have a duplicate reference available. */
-                       (ubuf_pre.tiles[i]->users == 1)))
-                  {
-                    if (ubuf_pre.tiles[i] != nullptr) {
-                      /* If we have a reference, re-use this single use tile for the post state. */
-                      BLI_assert(ubuf_pre.tiles[i]->users == 1);
-                      ubuf_post->tiles[i] = ubuf_pre.tiles[i];
-                      ubuf_pre.tiles[i] = nullptr;
-                      utile_init_from_imbuf(ubuf_post->tiles[i], x_tile, y_tile, ibuf);
-                    }
-                    else {
-                      BLI_assert(ubuf_post->tiles[i] == nullptr);
-                      ubuf_post->tiles[i] = ubuf_reference->tiles[i];
-                      ubuf_post->tiles[i]->users += 1;
-                    }
-                    BLI_assert(ubuf_pre.tiles[i] == nullptr);
+                  if ((ubuf_reference != nullptr) && (ubuf_pre.tiles[i] == nullptr)) {
+                    BLI_assert(ubuf_post->tiles[i] == nullptr);
+                    ubuf_post->tiles[i] = ubuf_reference->tiles[i];
+                    ubuf_post->tiles[i]->users += 1;
                     ubuf_pre.tiles[i] = ubuf_reference->tiles[i];
                     ubuf_pre.tiles[i]->users += 1;
 
@@ -989,6 +1011,27 @@ static void image_undosys_step_decode_undo(ImageUndoStep *us, bool is_final)
       break;
     }
     us_iter = reinterpret_cast<ImageUndoStep *>(us_iter->step.prev);
+  }
+
+  if (is_final && us->step.is_applied) {
+    /* When undoing a MemFile step back onto an ImageUndoStep, undo_system.cc first loads
+     * the preceding MemFile step (resetting G_MAIN to pre-stroke state) and then calls
+     * image_undosys_step_decode_undo(us, true). Re-apply the contiguous applied ImageUndoStep
+     * chain up through `us` so `us`'s post-stroke state is restored onto the reloaded G_MAIN. */
+    ImageUndoStep *us_first = us;
+    while (us_first->step.prev && (us_first->step.prev->type == us->step.type) &&
+           us_first->step.prev->is_applied)
+    {
+      us_first = reinterpret_cast<ImageUndoStep *>(us_first->step.prev);
+    }
+    for (ImageUndoStep *us_step = us_first; us_step != nullptr;
+         us_step = reinterpret_cast<ImageUndoStep *>(us_step->step.next))
+    {
+      uhandle_restore_list(&us_step->handles, false, false);
+      if (us_step == us) {
+        break;
+      }
+    }
   }
 }
 
